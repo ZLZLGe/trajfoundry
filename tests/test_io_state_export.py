@@ -1,0 +1,175 @@
+from pathlib import Path
+
+import orjson
+
+from trajfoundry.export import OutputSet
+from trajfoundry.io import JsonlShardWriter, load_capture, source_partition
+from trajfoundry.models import (
+    AuditTag,
+    Message,
+    Metadata,
+    NormalizationAudit,
+    Snapshot,
+    TrajectoryNode,
+)
+from trajfoundry.quality import enrich_trajectory
+from trajfoundry.state import StateStore
+
+
+def test_capture_loader_drops_sensitive_headers(tmp_path: Path) -> None:
+    path = tmp_path / "v1" / "dt=x" / "partition" / "session" / "one.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(
+        orjson.dumps(
+            {
+                "path": "/v1/responses",
+                "request_headers": {
+                    "authorization": "secret",
+                    "x-forwarded-for": "127.0.0.1",
+                    "x-openai-subagent": "collab_spawn",
+                },
+                "response_headers": {"set-cookie": "secret"},
+            }
+        )
+    )
+    capture = load_capture(path)
+    assert capture["request_headers"] == {"x-openai-subagent": "collab_spawn"}
+    assert "response_headers" not in capture
+    assert source_partition(tmp_path, path) == "v1/dt=x/partition"
+
+
+def test_state_round_trip_compresses_snapshot(tmp_path: Path) -> None:
+    snapshot = Snapshot(
+        source_path="v1/p/s/a.json",
+        source_sha256="a" * 64,
+        source_partition="v1/p",
+        session_id="s",
+        thread_id="t",
+        provider="openai",
+        operation="responses",
+        outcome="success",
+        history=[Message(role="user", content="hello")],
+    )
+    with StateStore(tmp_path / "state.sqlite") as state:
+        state.put_snapshot(snapshot)
+        restored = list(state.iter_snapshots())
+    assert restored == [snapshot]
+
+
+def test_failed_reparse_removes_stale_snapshot(tmp_path: Path) -> None:
+    snapshot = Snapshot(
+        source_path="v1/p/s/a.json",
+        source_sha256="a" * 64,
+        source_partition="v1/p",
+        session_id="s",
+        thread_id="t",
+        provider="openai",
+        operation="responses",
+        outcome="success",
+    )
+    with StateStore(tmp_path / "state.sqlite") as state:
+        state.put_snapshot(snapshot)
+        state.put_failure(snapshot.source_path, "b" * 64, "invalid json")
+        assert state.get_snapshot(snapshot.source_path) is None
+
+
+def test_completed_inventory_removes_deleted_sources(tmp_path: Path) -> None:
+    snapshot = Snapshot(
+        source_path="gone.json",
+        source_sha256="a" * 64,
+        source_partition="p",
+        session_id="s",
+        thread_id="t",
+        provider="openai",
+        operation="responses",
+        outcome="success",
+    )
+    with StateStore(tmp_path / "state.sqlite") as state:
+        state.begin_scan("first")
+        state.put_snapshot(snapshot)
+        state.finish_scan()
+        state.begin_scan("second")
+        state.finish_scan()
+        assert state.capture_count() == 0
+        assert list(state.iter_snapshots()) == []
+
+
+def test_jsonl_writer_shards_without_splitting_lines(tmp_path: Path) -> None:
+    with JsonlShardWriter(tmp_path, "rows", max_bytes=12) as writer:
+        writer.write({"a": 1})
+        writer.write({"b": 2})
+    assert len(list(tmp_path.glob("rows-*.jsonl"))) == 2
+
+
+def test_export_writes_manifest_and_lineage(tmp_path: Path) -> None:
+    node = enrich_trajectory(
+        TrajectoryNode(
+            messages=[
+                Message(role="user", content="hello"),
+                Message(role="assistant", content="hi", reasoning_content=""),
+            ],
+            tools=[],
+            source="a.json",
+            metadata=Metadata(source_file="a.json"),
+            normalization_audit=NormalizationAudit(tag=AuditTag.PASS),
+        )
+    )
+    output = OutputSet(tmp_path)
+    output.stats.input_files = 1
+    output.write_trajectory(node, [{"source_ref": "a.json", "sha256": "a" * 64}])
+    output.close(input_root="/input", config_hash="config")
+    manifest = orjson.loads((tmp_path / "manifest.json").read_bytes())
+    assert manifest["counts"]["accepted"] == 1
+    lineage = next(
+        entry["path"]
+        for entry in manifest["files"]
+        if entry["path"].endswith("/lineage.jsonl")
+    )
+    assert (tmp_path / lineage).is_file()
+
+
+def test_aborted_export_publishes_no_partial_run(tmp_path: Path) -> None:
+    node = enrich_trajectory(
+        TrajectoryNode(
+            messages=[Message(role="assistant", content="done", reasoning_content="")],
+            tools=[],
+            source="a.json",
+            metadata=Metadata(source_file="a.json"),
+        )
+    )
+    output = OutputSet(tmp_path, max_shard_bytes=1)
+    output.write_trajectory(node, [{"source_ref": "a.json", "sha256": "a" * 64}])
+    output.abort()
+
+    assert not (tmp_path / "manifest.json").exists()
+    assert not list(tmp_path.rglob("*.jsonl"))
+    assert not list(tmp_path.glob(".staging-*"))
+
+
+def test_publish_keeps_previous_immutable_generation(tmp_path: Path) -> None:
+    node = enrich_trajectory(
+        TrajectoryNode(
+            messages=[Message(role="assistant", content="done", reasoning_content="")],
+            tools=[],
+            source="a.json",
+            metadata=Metadata(source_file="a.json"),
+        )
+    )
+    first = OutputSet(tmp_path)
+    first.stats.input_files = 1
+    first.write_trajectory(node, [{"source_ref": "a.json", "sha256": "a" * 64}])
+    first.close(input_root="/input", config_hash="config")
+    first_manifest = orjson.loads((tmp_path / "manifest.json").read_bytes())
+    first_paths = {tmp_path / entry["path"] for entry in first_manifest["files"]}
+
+    second = OutputSet(tmp_path)
+    second.stats.input_files = 1
+    second.write_trajectory(node, [{"source_ref": "a.json", "sha256": "a" * 64}])
+    second.close(input_root="/input", config_hash="config")
+    second_manifest = orjson.loads((tmp_path / "manifest.json").read_bytes())
+
+    assert first_manifest["files"] != second_manifest["files"]
+    assert all(path.is_file() for path in first_paths)
+    assert all(
+        entry["path"].startswith("generations/") for entry in second_manifest["files"]
+    )

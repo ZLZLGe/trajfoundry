@@ -1,0 +1,545 @@
+version = 1
+revision = 3
+requires-python = ">=3.11"
+
+[[package]]
+name = "annotated-doc"
+version = "0.0.5"
+source = { registry = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/" }
+sdist = { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/annotated-doc/0.0.5/annotated_doc-0.0.5.tar.gz", hash = "sha256:c7e58ce09192557605d8bbd92836d7e1d520ac9580096042c0bfd197efacf1bb" }
+wheels = [
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/annotated-doc/0.0.5/annotated_doc-0.0.5-py3-none-any.whl", hash = "sha256:117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101" },
+]
+
+[[package]]
+name = "annotated-types"
+version = "0.8.0"
+source = { registry = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/" }
+sdist = { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/annotated-types/0.8.0/annotated_types-0.8.0.tar.gz", hash = "sha256:13b2beaad985e05e2d6407ee4c4f35590b11f8d693a258a561055cac8f64cab7" }
+wheels = [
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/annotated-types/0.8.0/annotated_types-0.8.0-py3-none-any.whl", hash = "sha256:f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0" },
+]
+
+[[package]]
+name = "colorama"
+version = "0.4.6"
+source = { registry = "http://pypi.i.h.pjlab.org.cn/brain/dev/+simple" }
+wheels = [
+    { url = "http://pypi.i.h.pjlab.org.cn/brain/dev/+f/4f1/d9991f5acc0ca/colorama-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6" },
+]
+
+[[package]]
+name = "coverage"
+version = "7.15.4"
+source = { registry = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/" }
+sdist = { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4.tar.gz", hash = "sha256:0548198fff07ccf4faf469520bce1c2eceb1ce3e62891921138dec10907f9d00" }
+wheels = [
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:bbac5abad70df71019988f83f26ac7092ff2642975def4429e98dc7585ef3490" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:357a173465c7ce028d07a95cc2b63b5bf59f50ecdd5ad75c5cbb78ada984048e" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp311-cp311-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:21b803935e2efc3acebe9697197a294fccf5dc4e5382bd6369542ff7a7d2a1d7" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp311-cp311-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:7a2b580774a4786c1053157c0165e04476e03ff293993d7c148eee784a94bae6" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a9464451c4efffe8d47ace5a540b10b0dc10e879066290f8600872b7f54a419d" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp311-cp311-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:de602f34123c2f4af1c1869c6dbbbd60da6d5983bf01937367295d135cccbfce" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp311-cp311-manylinux_2_31_riscv64.manylinux_2_39_riscv64.whl", hash = "sha256:6879ded16a27f3eeca19b900c147e81616e7054db451471a611b2755ee5249f7" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:986be58c3ab54aae8d3496a6225eea74f760fdbe739b38bd442c7e8d133aa53b" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp311-cp311-musllinux_1_2_i686.whl", hash = "sha256:c6103639613fe6c1e989082948419bc77a2d26b6c825c99d7fad25f7d3d87afc" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp311-cp311-musllinux_1_2_ppc64le.whl", hash = "sha256:d3af93dddb5659276c63bc16ac6466ac2033a70ca816097bbc06345b8ccdf571" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp311-cp311-musllinux_1_2_riscv64.whl", hash = "sha256:b10075e5421d04265766a6d1dac809bbeb8a946fbb23c8f82c227409b2190719" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:a67a9f78b2942d87ba8ce3059c642164d2aedd65337377fb52fe9803656bc5c7" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp311-cp311-win32.whl", hash = "sha256:69484d1aca26e322e1c3ce03f09341e84524ababad2d7202161738d83cc9f82e" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp311-cp311-win_amd64.whl", hash = "sha256:63fd6fcd1dd6e158f7eb78606e72933b3f6d01e7b747f99c6c12d764307a0fdc" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp311-cp311-win_arm64.whl", hash = "sha256:ea82116c9893fa89e929b7f197ee5a1950a76e91cc5c85ba503fc02379d04890" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:d4fedd1f7f428f9fe83b1ead5e7cc87a43427be31aadafbac3ac0636dc7abb22" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:37e2f0cdf58e2e1fed4e4d5a8f8786ae2f7eb80b478016876667dc4a01d60a97" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp312-cp312-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:fb55d0e70bb15f2e81477613627286581414693d74ac7963c93a790dd453ca9d" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp312-cp312-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:899b9da30f3c6c336566e3707495bb23e8302d39d862f01fa78c48b99b9437e2" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d15715e8c46552827e5e4f30a35575a2dbcad14454cf3284c54483946bd16931" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp312-cp312-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:002a438859f7b430bc99afeaf01a6d187dad1d0dc907b64cdeffc632a5db8fd8" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp312-cp312-manylinux_2_31_riscv64.manylinux_2_39_riscv64.whl", hash = "sha256:e4193a04b518f7968f3099755f5509ee7cccc6dc2b92a6b14841934d22e222c9" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:e98dcc55d572b38e69d117da7e8e8efb8500f1f5eaf81ecd460a63220790b839" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp312-cp312-musllinux_1_2_i686.whl", hash = "sha256:af6c538498ce66c10d3fd541c2a8d5b03da5850355add34e6cba564210cb9e72" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp312-cp312-musllinux_1_2_ppc64le.whl", hash = "sha256:1d10025d96ea89fc2f73714dbc4cbd433fe012c1ac9e23f895d7728b238b6e52" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp312-cp312-musllinux_1_2_riscv64.whl", hash = "sha256:d802e1947603162ded419bff83ac7489820355d2b856dfb09206574e3a37ac0c" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:c2de40895718f91951b86712b4c5b694acaf9a0a49be13874896f599a1eed3f4" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp312-cp312-win32.whl", hash = "sha256:5c3431b2161279b7db5c2a1aa58ae02e5cb8c3c42d93a5094be3f5537bd5b11b" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp312-cp312-win_amd64.whl", hash = "sha256:6befeab5fb2b51c958ca4ac6c5d141a1e8240f4f76e46350f1911963deda49cd" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp312-cp312-win_arm64.whl", hash = "sha256:67bc345491ab55b837277d76f5775d057e8c7f1ac44d890d8c2c82adde258c6f" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:c705b28feb2775dc82a25f1d473a370bc37ff93f5177f4e29ce2425f560f6921" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:3ff205ab5e3ecc670f6a4dd19d9cbf12ede53dd41cfc1e15716ec961ea6d314e" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp313-cp313-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:5172326e861a38b48b48befca15e0f477a26b283337a33a739c8fed229934e36" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp313-cp313-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:12b59c90084e3234fb11184886bf4a40f4f16a8c8f867be2e087b81f8e8868d4" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:349062d66f00b40fa2c1c222438bad25fabf755631b5d82937fe985c8008615c" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp313-cp313-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:4256ced708e598e05209bc1a8ab4074e04a51dba4c62fb45926a229af675ace7" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp313-cp313-manylinux_2_31_riscv64.manylinux_2_39_riscv64.whl", hash = "sha256:d80f974b20782d9612c8b4c9beeca867074c7cf4079d1419843fa25a26428b25" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:2e179f19bfe1d31f8eeeaa12990194d761c4f62f0759661000bca6cd8729f40b" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp313-cp313-musllinux_1_2_i686.whl", hash = "sha256:8bc16bb47b7679670eceff71d78bfb7d6e5b143f6c2cd117487ec7c75e0d4b78" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp313-cp313-musllinux_1_2_ppc64le.whl", hash = "sha256:1cd685005cd2c4200adfc14cf39a603b9320efab3f18a8f7f156d20c9cc3345f" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp313-cp313-musllinux_1_2_riscv64.whl", hash = "sha256:337399ad2c93b3acd2a937627dae8b3e86b66707cd3d3e856347999aadf1ef8d" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:96e257121228ec5cd2bb919276e94ac11074471bc37d68dbae0e8308cce15fff" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp313-cp313-win32.whl", hash = "sha256:c65a9e0dfc6143491879da4e13b5e30f8be192055de508d737fb14601edbd22c" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp313-cp313-win_amd64.whl", hash = "sha256:2ff8f5e9b8f7a94f0c11c45631eee103dbcb7d63274edd12c56efe1be690b3b4" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp313-cp313-win_arm64.whl", hash = "sha256:6e0a8a5083b096487d6cfced94cdd514d8f5db6f113610fb36c0620edb1028cf" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:770e9325ab5ea6d56f77e59b29ecfe0ac20b57a82a601876f90494a4dda0386f" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:d12b33a3a50a1676b7784dc8d00a0c6d66a9f2add4b85a041c19b6a7e53ef23c" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:5669c8378ebde86f5def7a25d29586631b58acc27ffde04399f678f3dfc6e082" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:ff97a14362eef486483ed44042ca2027ea257df6ff768e62358ee0c9776925ac" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:5a325e815318638aed1655d9c06e6d7c2d3d46c09231ce988070428a8762d734" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:474223409d88eb20d2d6a0d37ea60e8647a65a90cc008dc1f0410af5f64f1e0d" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314-manylinux_2_31_riscv64.manylinux_2_39_riscv64.whl", hash = "sha256:7f2f62ae3cd189dd2e13aece758c57b3eecbd27be070dbd4cbd10936049e5dbf" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:39ece820e29e0a2ba34b3ecb3be83c27e997eed8926f2ba6fe7ce7a0bda5843b" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314-musllinux_1_2_i686.whl", hash = "sha256:f21b56dcace11dfe013014201f577dcd592b2a9b72182d930361b47cf6f73f25" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314-musllinux_1_2_ppc64le.whl", hash = "sha256:93a3a0b662abcc10c73a47cbc72cd60f63618d6989fb2d1286e50eacd974f303" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314-musllinux_1_2_riscv64.whl", hash = "sha256:141fae2cabf5569b782c10afc4c850ce10f618c13f8db54765cba99cc839da1f" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:81294c7e6ab30c5f74c0353b11b2fd6320e72d9bee6ac73b357caa8b916323a5" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314-win32.whl", hash = "sha256:7bbd7d6418e0dab31a206af5203bd43ae36edb8e7fba1940b055d3e9249290d7" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314-win_amd64.whl", hash = "sha256:f0204ed122758782970526057093f448051a39db9d810d4e344bb87a3546f425" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314-win_arm64.whl", hash = "sha256:9e71e7bc71c686a123347ae47a0de33a175e797a85bb57b791492adf4eec8ed8" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314t-macosx_10_15_x86_64.whl", hash = "sha256:7c922735321eef3f87c280a3d39afff6b646723a2880b862cda4ac7a093b8aa8" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:f41c17c4668a655ce96d090d8d5ffdc24ef64b5a02f9753884d08483e8a4a41a" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314t-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:46822e9b6ff1c6a72b518c162c44a8f45a61a1d609c51084bf5b16c023c5037b" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314t-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:3d6f4955b73b5445271379a59e3792b0d978f42d4a01e0cf7a67d9c33a3bb0a5" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:3fc9e047706fb4a9abb54f719d3aa643e80e5bb3818182c40aee01ac0f0247ba" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314t-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:05e491d4f3165d62d4f5c8fd48dfeabf2ae8f42cbbd484319af33ea851b78982" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314t-manylinux_2_31_riscv64.manylinux_2_39_riscv64.whl", hash = "sha256:226c66e80ec0598d3b9b4874123df167ccca342aca8714f77cac6829688ee09c" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:ac41cc14bebda0dbfb0628036b7f75706935c95bcc07fefe9a0f93614aa60a57" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314t-musllinux_1_2_i686.whl", hash = "sha256:8af623e5cd92080acddd02b38f2f406a2c3a0893c38950b211890361448fbf26" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314t-musllinux_1_2_ppc64le.whl", hash = "sha256:07545711d4f0f32852a18f18ad11f76f0109909d09e78b9008b4cfc67e829429" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314t-musllinux_1_2_riscv64.whl", hash = "sha256:a0865421cfdc53654b342d515e5a233187590882d20b95752150e53f65460017" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:460115e32ee40566476db5048f9bec1e842c127ad8e6f8be745aad3ac9cbc839" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314t-win32.whl", hash = "sha256:cbde877ef9dd7baf272b9bfef2b8a25edd45d9170fc326951dd20eb480335e85" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314t-win_amd64.whl", hash = "sha256:3da9e92d1c551fd7563833e9ade686efb0c4b7363ab7681a94283958c950bf5e" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp314-cp314t-win_arm64.whl", hash = "sha256:3a54f5a0d85050c73a38f6793090ee83974531e67fe5e57a1da9bee11398aa5e" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315-macosx_10_15_x86_64.whl", hash = "sha256:2c9872e4d9dc5d3cf616bf4b382f5a00359305a5be666a3dd0b5cdb4e49597f9" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315-macosx_11_0_arm64.whl", hash = "sha256:e101dbb4b9b72f0cddd8cdc8c9c5b47f456766f5e0ac82dbfb75e5c55409b78a" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:7d1abebdb047729e852b9c77a00497dfbeb11eb3a117e037d7dbc3ac8e5f5c54" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:d28a4a899354d0ea6214cc59b4fa19eefbce1b9ff1688ab579acf49e894bd3fb" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ffb3c2aacea411cc7e1d27712490c11108e2de1d39019ae32915493a59a8b9ed" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:a9447978a92f405d301123cfd39ff49895490efb769a758fe2734c7f631bf8ce" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315-manylinux_2_31_riscv64.manylinux_2_39_riscv64.whl", hash = "sha256:050467a7983b8e2fe7dd41a78bb30c3e7f8c0b8cafda14b1c46f8b5e3cf2dd3c" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315-musllinux_1_2_aarch64.whl", hash = "sha256:d003b7a5708ddad5c206c79607a6b92abb6fc13c57d99d8a4468cc03a2941ced" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315-musllinux_1_2_i686.whl", hash = "sha256:c38efe30fd74e5c19e9433f11fb1f5dc9c6522770971b7c6145bbaa413dc8800" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315-musllinux_1_2_ppc64le.whl", hash = "sha256:1f4f826d70f772ab8b0c052329580d7fe8b8abd191e4ce0c8f81aec6614665d3" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315-musllinux_1_2_riscv64.whl", hash = "sha256:4a4bf917c9953f57c957be31c1cd504e3bd2f34d4a352b9d391a3025336f6768" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315-musllinux_1_2_x86_64.whl", hash = "sha256:1c9bf40ebef178a45192c75c4964760bb261b0e6ad725da5fc4c93f674f19753" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315-win32.whl", hash = "sha256:43619d04c3671792d2c4706ae8bf45e265dc87bbd4078189ef8b847ea1e74be2" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315-win_amd64.whl", hash = "sha256:be619439dbcd31a2eab10b32de9fff62c26ed4bab69dc32b8363fdaaa0882809" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315-win_arm64.whl", hash = "sha256:def597967dafc2e8d97c9097ea453c464e0bb8ed38f193a43070f10dc623bb6d" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315t-macosx_10_15_x86_64.whl", hash = "sha256:c7dbc748ac8a1e3e59a2b28bea47675e6e778081dbbf081bde0d75def2fcbe1d" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315t-macosx_11_0_arm64.whl", hash = "sha256:2413074a5ecbb61a01a7888fc72db0ca324d13588c5b38bc0dd8564cdcdfea26" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315t-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:4e6f6f632b7b2f714bf7a1346e8f97b650ee71f3c298aaad42a2ab60f0f07645" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315t-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:8df457da2249d3c75ca2e5e835d59c725abfe92d27fdff6cd99eed85b51d5e9a" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:050f66a08805acb5b8a23c6d4a517b1ecf82c08e81ed0e4bd727df065e5c6624" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315t-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:1587fb771d1ccceef708fdde1e5af8c7ed24b486b61d13a321acb7d8145390aa" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315t-manylinux_2_31_riscv64.manylinux_2_39_riscv64.whl", hash = "sha256:8b4f1c3a69ca580f3fbd6b2046915f536d7f586874f25c1bb23add2a3c88d50f" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315t-musllinux_1_2_aarch64.whl", hash = "sha256:ffb58d7eff5b7f6ecc6fa21d6288ab7f968a212cb67d682c269c09b9eba3b66f" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315t-musllinux_1_2_i686.whl", hash = "sha256:d9df165544774574ee004b953023d1bebada1894a80b1052a43d798b0f676e67" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315t-musllinux_1_2_ppc64le.whl", hash = "sha256:f9de0a24a4079b53e523b5c5e2c5945ec251ab486652659955187cf255a259bc" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315t-musllinux_1_2_riscv64.whl", hash = "sha256:150089274bdc9f940628552cb92844e0223c987f1902ab8efe9f45a2ec758d88" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315t-musllinux_1_2_x86_64.whl", hash = "sha256:a58a94fed5da6997d258e8f7668c1e195fbd04a691d781b7558f1e468f9e68bc" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315t-win32.whl", hash = "sha256:ebd5a6d8466ff30836572f3ba2cae8a5e8f85029b1c6d5e2ed338dc472a5166a" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315t-win_amd64.whl", hash = "sha256:288bde2a2d7ab6b6c2d7252fcde8b524387f2d970bdba9658fc6f8bbcaef0f9b" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-cp315-cp315t-win_arm64.whl", hash = "sha256:68be5e1de60ff13c9095bbec0e5a7fa45b33b101752215b91345ea1f61c4a278" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/coverage/7.15.4/coverage-7.15.4-py3-none-any.whl", hash = "sha256:964730a1e9de9c0cf11be6a1a3c79ce419c34882842abd256086ba4698705e84" },
+]
+
+[package.optional-dependencies]
+toml = [
+    { name = "tomli", marker = "python_full_version <= '3.11'" },
+]
+
+[[package]]
+name = "iniconfig"
+version = "2.3.0"
+source = { registry = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/" }
+sdist = { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/iniconfig/2.3.0/iniconfig-2.3.0.tar.gz", hash = "sha256:c76315c77db068650d49c5b56314774a7804df16fee4402c1f19d6d15d8c4730" }
+wheels = [
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/iniconfig/2.3.0/iniconfig-2.3.0-py3-none-any.whl", hash = "sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12" },
+]
+
+[[package]]
+name = "markdown-it-py"
+version = "4.2.0"
+source = { registry = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/" }
+dependencies = [
+    { name = "mdurl" },
+]
+sdist = { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/markdown-it-py/4.2.0/markdown_it_py-4.2.0.tar.gz", hash = "sha256:04a21681d6fbb623de53f6f364d352309d4094dd4194040a10fd51833e418d49" }
+wheels = [
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/markdown-it-py/4.2.0/markdown_it_py-4.2.0-py3-none-any.whl", hash = "sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a" },
+]
+
+[[package]]
+name = "mdurl"
+version = "0.1.2"
+source = { registry = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/" }
+sdist = { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/mdurl/0.1.2/mdurl-0.1.2.tar.gz", hash = "sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba" }
+wheels = [
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/mdurl/0.1.2/mdurl-0.1.2-py3-none-any.whl", hash = "sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8" },
+]
+
+[[package]]
+name = "orjson"
+version = "3.12.0"
+source = { registry = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/" }
+sdist = { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0.tar.gz", hash = "sha256:d14203fb1aae2ad9b3d52f8a0e82aeb10197ef1c9bc61da7f358bd70b00123d5" }
+wheels = [
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp311-cp311-macosx_10_15_x86_64.macosx_11_0_arm64.macosx_10_15_universal2.whl", hash = "sha256:a94f0f0c6fcbb2b5bd9734c57a489c7584a732bbdf04a39e8c83b861e9d03e92" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp311-cp311-macosx_15_0_arm64.whl", hash = "sha256:a696529ec96a90d9a5f9570207efe403c8b08f8e4aa2783ee3403511e2fdfa10" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp311-cp311-manylinux2014_armv7l.manylinux_2_17_armv7l.whl", hash = "sha256:e4ac5059baab4b3acbd99485de019ff8cda0fdf34b61fa74f7197a53db78bfe8" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp311-cp311-manylinux2014_i686.manylinux_2_17_i686.whl", hash = "sha256:8e29957429c35bbb5a185a119c523aa2428b7bbf1a293724c7b9375ed8f892a3" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:dce0166feb0a737ab84f598c9a338cbc0b764a036617aa686194f53c7eba0c3e" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:9caf3d09f47c3c70c4451ada20ef9bc4a4cdffa26f49862cf0a253b329aae2d5" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:b9dca132b1fda5565088e65a6b6e742285e0aeceb6fae549fa8863e16c7d3998" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:a791f793b287bbc135b8e87c34e35c8bfc693e2a8a620fab1ae682b925f9a32e" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp311-cp311-win32.whl", hash = "sha256:31ed278a36304390adc3eec5d7f6fd593a7c3e99e5a06cd07866396c4b1b4710" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp311-cp311-win_amd64.whl", hash = "sha256:fb2539159dfe8d371914f354360fa50e4a577cc89222a3828b9650a5e5040252" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp311-cp311-win_arm64.whl", hash = "sha256:61318b6de893c7a9d9f3e5ecbadccbfc26a7eb417ccc7bbf0771de3b4d72f868" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp312-cp312-macosx_10_15_x86_64.macosx_11_0_arm64.macosx_10_15_universal2.whl", hash = "sha256:aa3e43a6846e91d7bde3d5a9c66090fcd8744f569a9b6cffc5e1ca38f6a461c0" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp312-cp312-macosx_15_0_arm64.whl", hash = "sha256:11edb4660a6680abee9788a3a9072208a2c96538cc1322bd79542065229d8e54" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp312-cp312-manylinux2014_armv7l.manylinux_2_17_armv7l.whl", hash = "sha256:2d3a9da945a4d96ae758fdaaca56742e6b73b6fd554c5d8876f252a6dad70b83" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp312-cp312-manylinux2014_i686.manylinux_2_17_i686.whl", hash = "sha256:92ffc09e07233a6ab6d4e067f7841edcbcc134cb4812155cf171ea5255a421d7" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:bf44e374aadde77b1f6109f1030be51433eb61984379852766b6f4e187db7b1e" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:1192a7021b6d071aaf909864f6e924d6a2675ca360485b972b8401749311750b" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:53c0c474a9d9aff9aebfc0c88de1f28f843d940e6e3a80729abdf6a20274356f" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:532ff8cd4bd59a327a953a7dcde922c7fc25b85e29721bb8633265430d3a3873" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp312-cp312-win32.whl", hash = "sha256:a6cf4b18e7de173f209f2084ffbd736dd72389a396326ee80a7022168be232e5" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp312-cp312-win_amd64.whl", hash = "sha256:010811c1b69773450a01cef97727a67b223242f350b77d4ca000e59a9ef2155a" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp312-cp312-win_arm64.whl", hash = "sha256:ad29eece0c601737f2a60edc2752a84e7a0785df3efb62e3012834700a5afe0d" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp313-cp313-macosx_10_15_x86_64.macosx_11_0_arm64.macosx_10_15_universal2.whl", hash = "sha256:9a36ec60f1796f9a3f13e3b98390295e17a1c7c10155b448d264098bf9ee5900" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp313-cp313-macosx_15_0_arm64.whl", hash = "sha256:ad0422b92d5195443a39f80c3bcf731cc2e00f153bd32063a47b73b057bd0f03" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp313-cp313-manylinux2014_armv7l.manylinux_2_17_armv7l.whl", hash = "sha256:5a0fdbc216388f653d3752ff310e710f59253bd4ed6a2bfb3f4f06b84714bbd8" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp313-cp313-manylinux2014_i686.manylinux_2_17_i686.whl", hash = "sha256:2eb5c56e534127b2b8fa38d2363c8b1b8190367ee0d1d16c041517d880843b94" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:784106539f4b9d4b930e0b4eb8d45168507dae001945e71b4675a367f1e5e806" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:1c680706fc8396d95e7c4c1f9482563f552137aef91b57237a3ad5aaf64629df" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:83445adc40cba26d6d621185a45128ce455b766af368cad2ab64b970603a7978" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:644d005bc82f917337a95ce270c9f6f92f9834c2bed7b1477572f8db00784222" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp313-cp313-win32.whl", hash = "sha256:d8e78d3d93705e3d27cc17cdb209e44d7a8ea203010cac6ce9c7ffc1ae1996f1" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp313-cp313-win_amd64.whl", hash = "sha256:b85931be5b6763c31283805c9bdaae1ca03ad9f6f12a15f1cbf6745b907932c2" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp313-cp313-win_arm64.whl", hash = "sha256:6a31348d7dfa64cd9c78bd1f510ff44c48fe64d71094e6b90e364dba3b55949e" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp314-cp314-macosx_10_15_x86_64.macosx_11_0_arm64.macosx_10_15_universal2.whl", hash = "sha256:9e6fee342a48760e854d743e7a81534d8e2925a6f46e09f750cf56b50fd1de5d" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp314-cp314-macosx_15_0_arm64.whl", hash = "sha256:8c3bb86dd10f39b3fbf434b7d5dc7cac77d6fc8ac572ae30a10731ede2c4b647" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp314-cp314-manylinux2014_armv7l.manylinux_2_17_armv7l.whl", hash = "sha256:2bb3ce43203936072dd8b4917b01d3aecfc02329bfb42510cb7cfb24708adc9c" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp314-cp314-manylinux2014_i686.manylinux_2_17_i686.whl", hash = "sha256:6a2a79c89984dc719817d388c8709e0efc2a2795a934eaa746b4882eb6045adc" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp314-cp314-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:f06dd838d1e07d9b1de0932ec0485ec92c4d5f5d1ad4817a656268c3e88be1e1" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c6b11be792c3d2c6a4be2af4ebf97a68d0bf5f580aca6e86a418a354f6cc846a" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:477ecaf6b9f88f873341b91fcc736119ca81b5e002a9f7f308ff5b4f2ce2a70e" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:f3c0683136acdc29afdf88a5bc2f7d3d0e34087788d1d63c0144b805a87a196f" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp314-cp314-win32.whl", hash = "sha256:d39f3f5c3927e2dc0913fe5bbc1a2f6b1b9d1bba1de6358340d0ad0d0c00ca92" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp314-cp314-win_amd64.whl", hash = "sha256:0b1ac5bf6609b2716c7954011c5fef6254922df029f45d032ee4ebf5d363cbed" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp314-cp314-win_arm64.whl", hash = "sha256:50fae885cb073eac7556353ff3df93312b0d5137b0a5056b2bb63f97ed9a93c7" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp315-cp315-macosx_10_15_x86_64.macosx_11_0_arm64.macosx_10_15_universal2.whl", hash = "sha256:01efac2074fffb4cb1ea3fab7861e9d0f2a26913854a972f5ac760525dbdaf6e" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp315-cp315-macosx_15_0_arm64.whl", hash = "sha256:ed4ca42bd55955aa34deedcfdfd0e0c31abf51143aae158ae2bc3520b626e517" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp315-cp315-manylinux_2_39_aarch64.whl", hash = "sha256:40f92192227505acca4e2533ce565f8e6b9535f7d0d09b0968452f18b7376b38" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp315-cp315-manylinux_2_39_armv7l.whl", hash = "sha256:33efefcf5d88eaf400b47e2eba02f91f319bb9951be61ca500b7d536d3f2079d" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp315-cp315-manylinux_2_39_i686.whl", hash = "sha256:8e386b0bc0ddd7cd2056f884b5a0af33592bd01ac66a7ca4b42a65a7e7774a13" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp315-cp315-manylinux_2_39_x86_64.whl", hash = "sha256:58c58e1de0006ffb580368d6793c36c7b0b021db066479cf281bf5061e732328" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp315-cp315-musllinux_1_2_aarch64.whl", hash = "sha256:08231552159be266a7269555bd9f7c016aee7d9ad6dab06eb58796c5ccb7101c" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp315-cp315-musllinux_1_2_x86_64.whl", hash = "sha256:a15f9a891bce5f5cc5d210e3ad8614d4d1b489a56448c099d6d2a7168b2d954a" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp315-cp315-win32.whl", hash = "sha256:03091c8a64db4be38746597ceea68f33c238e27acd9bfe99fb59420224ae7a55" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp315-cp315-win_amd64.whl", hash = "sha256:2b7bcefb9f40fa242fa6b06377232c048e655747790829609168c01162f60578" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/orjson/3.12.0/orjson-3.12.0-cp315-cp315-win_arm64.whl", hash = "sha256:859fc4196855890150bb08e649b30d2c93b249b3e3edd0d3bb2231abf8aa8adc" },
+]
+
+[[package]]
+name = "packaging"
+version = "26.3"
+source = { registry = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/" }
+sdist = { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/packaging/26.3/packaging-26.3.tar.gz", hash = "sha256:94edc256424af38762eb31306eed28beb9f0efc50a8837492c9d6fd6004aed79" }
+wheels = [
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/packaging/26.3/packaging-26.3-py3-none-any.whl", hash = "sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c" },
+]
+
+[[package]]
+name = "pluggy"
+version = "1.6.0"
+source = { registry = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/" }
+sdist = { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pluggy/1.6.0/pluggy-1.6.0.tar.gz", hash = "sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3" }
+wheels = [
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pluggy/1.6.0/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746" },
+]
+
+[[package]]
+name = "pydantic"
+version = "2.11.10"
+source = { registry = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/" }
+dependencies = [
+    { name = "annotated-types" },
+    { name = "pydantic-core" },
+    { name = "typing-extensions" },
+    { name = "typing-inspection" },
+]
+sdist = { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic/2.11.10/pydantic-2.11.10.tar.gz", hash = "sha256:dc280f0982fbda6c38fada4e476dc0a4f3aeaf9c6ad4c28df68a666ec3c61423" }
+wheels = [
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic/2.11.10/pydantic-2.11.10-py3-none-any.whl", hash = "sha256:802a655709d49bd004c31e865ef37da30b540786a46bfce02333e0e24b5fe29a" },
+]
+
+[[package]]
+name = "pydantic-core"
+version = "2.33.2"
+source = { registry = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2.tar.gz", hash = "sha256:7cb8bc3605c29176e1b105350d2e6474142d7c1bd1d9327c4a9bdb46bf827acc" }
+wheels = [
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp311-cp311-macosx_10_12_x86_64.whl", hash = "sha256:4c5b0a576fb381edd6d27f0a85915c6daf2f8138dc5c267a57c08a62900758c7" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:e799c050df38a639db758c617ec771fd8fb7a5f8eaaa4b27b101f266b216a246" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:dc46a01bf8d62f227d5ecee74178ffc448ff4e5197c756331f71efcc66dc980f" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp311-cp311-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:a144d4f717285c6d9234a66778059f33a89096dfb9b39117663fd8413d582dcc" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp311-cp311-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:73cf6373c21bc80b2e0dc88444f41ae60b2f070ed02095754eb5a01df12256de" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp311-cp311-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:3dc625f4aa79713512d1976fe9f0bc99f706a9dee21dfd1810b4bbbf228d0e8a" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:881b21b5549499972441da4758d662aeea93f1923f953e9cbaff14b8b9565aef" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp311-cp311-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:bdc25f3681f7b78572699569514036afe3c243bc3059d3942624e936ec93450e" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp311-cp311-musllinux_1_1_aarch64.whl", hash = "sha256:fe5b32187cbc0c862ee201ad66c30cf218e5ed468ec8dc1cf49dec66e160cc4d" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp311-cp311-musllinux_1_1_armv7l.whl", hash = "sha256:bc7aee6f634a6f4a95676fcb5d6559a2c2a390330098dba5e5a5f28a2e4ada30" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp311-cp311-musllinux_1_1_x86_64.whl", hash = "sha256:235f45e5dbcccf6bd99f9f472858849f73d11120d76ea8707115415f8e5ebebf" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp311-cp311-win32.whl", hash = "sha256:6368900c2d3ef09b69cb0b913f9f8263b03786e5b2a387706c5afb66800efd51" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp311-cp311-win_amd64.whl", hash = "sha256:1e063337ef9e9820c77acc768546325ebe04ee38b08703244c1309cccc4f1bab" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp311-cp311-win_arm64.whl", hash = "sha256:6b99022f1d19bc32a4c2a0d544fc9a76e3be90f0b3f4af413f87d38749300e65" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp312-cp312-macosx_10_12_x86_64.whl", hash = "sha256:a7ec89dc587667f22b6a0b6579c249fca9026ce7c333fc142ba42411fa243cdc" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:3c6db6e52c6d70aa0d00d45cdb9b40f0433b96380071ea80b09277dba021ddf7" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:4e61206137cbc65e6d5256e1166f88331d3b6238e082d9f74613b9b765fb9025" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp312-cp312-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:eb8c529b2819c37140eb51b914153063d27ed88e3bdc31b71198a198e921e011" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp312-cp312-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:c52b02ad8b4e2cf14ca7b3d918f3eb0ee91e63b3167c32591e57c4317e134f8f" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp312-cp312-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:96081f1605125ba0855dfda83f6f3df5ec90c61195421ba72223de35ccfb2f88" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:8f57a69461af2a5fa6e6bbd7a5f60d3b7e6cebb687f55106933188e79ad155c1" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp312-cp312-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:572c7e6c8bb4774d2ac88929e3d1f12bc45714ae5ee6d9a788a9fb35e60bb04b" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp312-cp312-musllinux_1_1_aarch64.whl", hash = "sha256:db4b41f9bd95fbe5acd76d89920336ba96f03e149097365afe1cb092fceb89a1" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp312-cp312-musllinux_1_1_armv7l.whl", hash = "sha256:fa854f5cf7e33842a892e5c73f45327760bc7bc516339fda888c75ae60edaeb6" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp312-cp312-musllinux_1_1_x86_64.whl", hash = "sha256:5f483cfb75ff703095c59e365360cb73e00185e01aaea067cd19acffd2ab20ea" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp312-cp312-win32.whl", hash = "sha256:9cb1da0f5a471435a7bc7e439b8a728e8b61e59784b2af70d7c169f8dd8ae290" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp312-cp312-win_amd64.whl", hash = "sha256:f941635f2a3d96b2973e867144fde513665c87f13fe0e193c158ac51bfaaa7b2" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp312-cp312-win_arm64.whl", hash = "sha256:cca3868ddfaccfbc4bfb1d608e2ccaaebe0ae628e1416aeb9c4d88c001bb45ab" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp313-cp313-macosx_10_12_x86_64.whl", hash = "sha256:1082dd3e2d7109ad8b7da48e1d4710c8d06c253cbc4a27c1cff4fbcaa97a9e3f" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:f517ca031dfc037a9c07e748cefd8d96235088b83b4f4ba8939105d20fa1dcd6" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:0a9f2c9dd19656823cb8250b0724ee9c60a82f3cdf68a080979d13092a3b0fef" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp313-cp313-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:2b0a451c263b01acebe51895bfb0e1cc842a5c666efe06cdf13846c7418caa9a" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp313-cp313-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:1ea40a64d23faa25e62a70ad163571c0b342b8bf66d5fa612ac0dec4f069d916" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp313-cp313-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:0fb2d542b4d66f9470e8065c5469ec676978d625a8b7a363f07d9a501a9cb36a" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:9fdac5d6ffa1b5a83bca06ffe7583f5576555e6c8b3a91fbd25ea7780f825f7d" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp313-cp313-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:04a1a413977ab517154eebb2d326da71638271477d6ad87a769102f7c2488c56" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp313-cp313-musllinux_1_1_aarch64.whl", hash = "sha256:c8e7af2f4e0194c22b5b37205bfb293d166a7344a5b0d0eaccebc376546d77d5" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp313-cp313-musllinux_1_1_armv7l.whl", hash = "sha256:5c92edd15cd58b3c2d34873597a1e20f13094f59cf88068adb18947df5455b4e" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp313-cp313-musllinux_1_1_x86_64.whl", hash = "sha256:65132b7b4a1c0beded5e057324b7e16e10910c106d43675d9bd87d4f38dde162" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp313-cp313-win32.whl", hash = "sha256:52fb90784e0a242bb96ec53f42196a17278855b0f31ac7c3cc6f5c1ec4811849" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp313-cp313-win_amd64.whl", hash = "sha256:c083a3bdd5a93dfe480f1125926afcdbf2917ae714bdb80b36d34318b2bec5d9" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp313-cp313-win_arm64.whl", hash = "sha256:e80b087132752f6b3d714f041ccf74403799d3b23a72722ea2e6ba2e892555b9" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp313-cp313t-macosx_11_0_arm64.whl", hash = "sha256:61c18fba8e5e9db3ab908620af374db0ac1baa69f0f32df4f61ae23f15e586ac" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp313-cp313t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:95237e53bb015f67b63c91af7518a62a8660376a6a0db19b89acc77a4d6199f5" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-cp313-cp313t-win_amd64.whl", hash = "sha256:c2fc0a768ef76c15ab9238afa6da7f69895bb5d1ee83aeea2e3509af4472d0b9" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-pp311-pypy311_pp73-macosx_10_12_x86_64.whl", hash = "sha256:dd14041875d09cc0f9308e37a6f8b65f5585cf2598a53aa0123df8b129d481f8" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-pp311-pypy311_pp73-macosx_11_0_arm64.whl", hash = "sha256:d87c561733f66531dced0da6e864f44ebf89a8fba55f31407b00c2f7f9449593" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-pp311-pypy311_pp73-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:2f82865531efd18d6e07a04a17331af02cb7a651583c418df8266f17a63c6612" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-pp311-pypy311_pp73-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:2bfb5112df54209d820d7bf9317c7a6c9025ea52e49f46b6a2060104bba37de7" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-pp311-pypy311_pp73-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:64632ff9d614e5eecfb495796ad51b0ed98c453e447a76bcbeeb69615079fc7e" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-pp311-pypy311_pp73-musllinux_1_1_aarch64.whl", hash = "sha256:f889f7a40498cc077332c7ab6b4608d296d852182211787d4f3ee377aaae66e8" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-pp311-pypy311_pp73-musllinux_1_1_armv7l.whl", hash = "sha256:de4b83bb311557e439b9e186f733f6c645b9417c84e2eb8203f3f820a4b988bf" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-pp311-pypy311_pp73-musllinux_1_1_x86_64.whl", hash = "sha256:82f68293f055f51b51ea42fafc74b6aad03e70e191799430b90c13d643059ebb" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pydantic-core/2.33.2/pydantic_core-2.33.2-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:329467cecfb529c925cf2bbd4d60d2c509bc2fb52a20c1045bf09bb70971a9c1" },
+]
+
+[[package]]
+name = "pygments"
+version = "2.21.0"
+source = { registry = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/" }
+sdist = { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pygments/2.21.0/pygments-2.21.0.tar.gz", hash = "sha256:610ca751c9bc2492b38eb9a38a7fbc93edbbb2d7182edaf34e66ae493dee5c8c" }
+wheels = [
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pygments/2.21.0/pygments-2.21.0-py3-none-any.whl", hash = "sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9" },
+]
+
+[[package]]
+name = "pytest"
+version = "9.1.1"
+source = { registry = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/" }
+dependencies = [
+    { name = "colorama", marker = "sys_platform == 'win32'" },
+    { name = "iniconfig" },
+    { name = "packaging" },
+    { name = "pluggy" },
+    { name = "pygments" },
+]
+sdist = { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pytest/9.1.1/pytest-9.1.1.tar.gz", hash = "sha256:1088fbde8f2b49d95a549a195707afa7a76a3ce9bcadc26b6d71f0ffda5fe313" }
+wheels = [
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pytest/9.1.1/pytest-9.1.1-py3-none-any.whl", hash = "sha256:37a86b45efb9a47a61a36449063e8e18d0cab3161329fc099eb21783169c4f0c" },
+]
+
+[[package]]
+name = "pytest-cov"
+version = "7.1.0"
+source = { registry = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/" }
+dependencies = [
+    { name = "coverage", extra = ["toml"] },
+    { name = "pluggy" },
+    { name = "pytest" },
+]
+sdist = { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pytest-cov/7.1.0/pytest_cov-7.1.0.tar.gz", hash = "sha256:30674f2b5f6351aa09702a9c8c364f6a01c27aae0c1366ae8016160d1efc56b2" }
+wheels = [
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/pytest-cov/7.1.0/pytest_cov-7.1.0-py3-none-any.whl", hash = "sha256:a0461110b7865f9a271aa1b51e516c9a95de9d696734a2f71e3e78f46e1d4678" },
+]
+
+[[package]]
+name = "rich"
+version = "15.0.0"
+source = { registry = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/" }
+dependencies = [
+    { name = "markdown-it-py" },
+    { name = "pygments" },
+]
+sdist = { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/rich/15.0.0/rich-15.0.0.tar.gz", hash = "sha256:edd07a4824c6b40189fb7ac9bc4c52536e9780fbbfbddf6f1e2502c31b068c36" }
+wheels = [
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/rich/15.0.0/rich-15.0.0-py3-none-any.whl", hash = "sha256:33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb" },
+]
+
+[[package]]
+name = "ruff"
+version = "0.16.4"
+source = { registry = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/" }
+sdist = { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/ruff/0.16.4/ruff-0.16.4.tar.gz", hash = "sha256:13171aa9d9af2240ee3504e639de73122c67e74036de5ba2e1d01422cd17e3dc" }
+wheels = [
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/ruff/0.16.4/ruff-0.16.4-py3-none-linux_armv6l.whl", hash = "sha256:df4075f71ddac40b9934af60c3ec8a53047dd5a5fdc43224e6e4e8e9a27cb6f7" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/ruff/0.16.4/ruff-0.16.4-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:0c95538517af68004306b0fb3214ff2f2af67a65092aee77cd9eb86db6656604" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/ruff/0.16.4/ruff-0.16.4-py3-none-macosx_11_0_arm64.whl", hash = "sha256:963f83df8e69e575b64d67dd447ebbc917db41a14bf38d4593a4183e7aaa8255" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/ruff/0.16.4/ruff-0.16.4-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:32a5057c7ff3f6e6480a48fccfb3a412a690f48a3d03ac5cf08177d6c2da3ade" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/ruff/0.16.4/ruff-0.16.4-py3-none-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:b3dce8d9b0c57c265b91885a66a567d8ea1372e8eb4e250fa8e5e3f579e99cff" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/ruff/0.16.4/ruff-0.16.4-py3-none-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:7dc651db49283c69f8e72c834eec4fe5573e4c646856aebece0ce385dceb2a80" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/ruff/0.16.4/ruff-0.16.4-py3-none-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:3817b87dbcabc92f13b05019257c5b89b5b4d51b5fb20f56fb5235ceb723cd07" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/ruff/0.16.4/ruff-0.16.4-py3-none-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:e9fce1499134b2c8c68e5166f95705a5812062bb93aacc5f9873bb1a27084bc7" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/ruff/0.16.4/ruff-0.16.4-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:f2d812e482f5a7e02eee26cd73d2a37ebbdf47d795ea63ba1b89110ae93e9fb3" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/ruff/0.16.4/ruff-0.16.4-py3-none-manylinux_2_31_riscv64.whl", hash = "sha256:6baaf984aa7976edf93d3b627fe2d1d22ee94bbca05fa6f90fc76d73924e3454" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/ruff/0.16.4/ruff-0.16.4-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:bdfcf0b28662eb890372d50f92c283bb94e67e7635ed93c7fd533970acff7b2b" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/ruff/0.16.4/ruff-0.16.4-py3-none-musllinux_1_2_armv7l.whl", hash = "sha256:b66b02cb9b04f537643cadf5768e5f98dc461890d530cb67113d71c8c76e605d" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/ruff/0.16.4/ruff-0.16.4-py3-none-musllinux_1_2_i686.whl", hash = "sha256:8528bf9a4b291a60bf02ea453511e8ce6215bd2b982ee80405b66b008b6c30a0" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/ruff/0.16.4/ruff-0.16.4-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:fbd85d2875fdd67e833213a651f613bbf25303abf6aa822a5121f4531195678d" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/ruff/0.16.4/ruff-0.16.4-py3-none-win32.whl", hash = "sha256:312769988007aaeb8e189b443ccdd03c0e6374489e053467be6d96518ebff76e" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/ruff/0.16.4/ruff-0.16.4-py3-none-win_amd64.whl", hash = "sha256:05d9d27a18c4bcbefada602480ec9e01e0bc949d432e0ced5df77edac195919c" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/ruff/0.16.4/ruff-0.16.4-py3-none-win_arm64.whl", hash = "sha256:a3a61621c9b6f6a89573e938a080e648f1695baa3f58570a3a707bc51ff65a21" },
+]
+
+[[package]]
+name = "shellingham"
+version = "1.5.4"
+source = { registry = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/" }
+sdist = { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/shellingham/1.5.4/shellingham-1.5.4.tar.gz", hash = "sha256:8dbca0739d487e5bd35ab3ca4b36e11c4078f3a234bfce294b0a0291363404de" }
+wheels = [
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/shellingham/1.5.4/shellingham-1.5.4-py2.py3-none-any.whl", hash = "sha256:7ecfff8f2fd72616f7481040475a65b2bf8af90a56c89140852d1120324e8686" },
+]
+
+[[package]]
+name = "tomli"
+version = "2.4.1"
+source = { registry = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/" }
+sdist = { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1.tar.gz", hash = "sha256:7c7e1a961a0b2f2472c1ac5b69affa0ae1132c39adcb67aba98568702b9cc23f" }
+wheels = [
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:f8f0fc26ec2cc2b965b7a3b87cd19c5c6b8c5e5f436b984e85f486d652285c30" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:4ab97e64ccda8756376892c53a72bd1f964e519c77236368527f758fbc36a53a" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:96481a5786729fd470164b47cdb3e0e58062a496f455ee41b4403be77cb5a076" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5a881ab208c0baf688221f8cecc5401bd291d67e38a1ac884d6736cbcd8247e9" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:47149d5bd38761ac8be13a84864bf0b7b70bc051806bc3669ab1cbc56216b23c" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:ec9bfaf3ad2df51ace80688143a6a4ebc09a248f6ff781a9945e51937008fcbc" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp311-cp311-win32.whl", hash = "sha256:ff2983983d34813c1aeb0fa89091e76c3a22889ee83ab27c5eeb45100560c049" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp311-cp311-win_amd64.whl", hash = "sha256:5ee18d9ebdb417e384b58fe414e8d6af9f4e7a0ae761519fb50f721de398dd4e" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp311-cp311-win_arm64.whl", hash = "sha256:c2541745709bad0264b7d4705ad453b76ccd191e64aa6f0fc66b69a293a45ece" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:c742f741d58a28940ce01d58f0ab2ea3ced8b12402f162f4d534dfe18ba1cd6a" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:7f86fd587c4ed9dd76f318225e7d9b29cfc5a9d43de44e5754db8d1128487085" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ff18e6a727ee0ab0388507b89d1bc6a22b138d1e2fa56d1ad494586d61d2eae9" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:136443dbd7e1dee43c68ac2694fde36b2849865fa258d39bf822c10e8068eac5" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:5e262d41726bc187e69af7825504c933b6794dc3fbd5945e41a79bb14c31f585" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:5cb41aa38891e073ee49d55fbc7839cfdb2bc0e600add13874d048c94aadddd1" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp312-cp312-win32.whl", hash = "sha256:da25dc3563bff5965356133435b757a795a17b17d01dbc0f42fb32447ddfd917" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp312-cp312-win_amd64.whl", hash = "sha256:52c8ef851d9a240f11a88c003eacb03c31fc1c9c4ec64a99a0f922b93874fda9" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp312-cp312-win_arm64.whl", hash = "sha256:f758f1b9299d059cc3f6546ae2af89670cb1c4d48ea29c3cacc4fe7de3058257" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:36d2bd2ad5fb9eaddba5226aa02c8ec3fa4f192631e347b3ed28186d43be6b54" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:eb0dc4e38e6a1fd579e5d50369aa2e10acfc9cace504579b2faabb478e76941a" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c7f2c7f2b9ca6bdeef8f0fa897f8e05085923eb091721675170254cbc5b02897" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f3c6818a1a86dd6dca7ddcaaf76947d5ba31aecc28cb1b67009a5877c9a64f3f" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:d312ef37c91508b0ab2cee7da26ec0b3ed2f03ce12bd87a588d771ae15dcf82d" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:51529d40e3ca50046d7606fa99ce3956a617f9b36380da3b7f0dd3dd28e68cb5" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp313-cp313-win32.whl", hash = "sha256:2190f2e9dd7508d2a90ded5ed369255980a1bcdd58e52f7fe24b8162bf9fedbd" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp313-cp313-win_amd64.whl", hash = "sha256:8d65a2fbf9d2f8352685bc1364177ee3923d6baf5e7f43ea4959d7d8bc326a36" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp313-cp313-win_arm64.whl", hash = "sha256:4b605484e43cdc43f0954ddae319fb75f04cc10dd80d830540060ee7cd0243cd" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:fd0409a3653af6c147209d267a0e4243f0ae46b011aa978b1080359fddc9b6cf" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:a120733b01c45e9a0c34aeef92bf0cf1d56cfe81ed9d47d562f9ed591a9828ac" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:559db847dc486944896521f68d8190be1c9e719fced785720d2216fe7022b662" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:01f520d4f53ef97964a240a035ec2a869fe1a37dde002b57ebc4417a27ccd853" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:7f94b27a62cfad8496c8d2513e1a222dd446f095fca8987fceef261225538a15" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:ede3e6487c5ef5d28634ba3f31f989030ad6af71edfb0055cbbd14189ff240ba" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp314-cp314-win32.whl", hash = "sha256:3d48a93ee1c9b79c04bb38772ee1b64dcf18ff43085896ea460ca8dec96f35f6" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp314-cp314-win_amd64.whl", hash = "sha256:88dceee75c2c63af144e456745e10101eb67361050196b0b6af5d717254dddf7" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp314-cp314-win_arm64.whl", hash = "sha256:b8c198f8c1805dc42708689ed6864951fd2494f924149d3e4bce7710f8eb5232" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp314-cp314t-macosx_10_15_x86_64.whl", hash = "sha256:d4d8fe59808a54658fcc0160ecfb1b30f9089906c50b23bcb4c69eddc19ec2b4" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:7008df2e7655c495dd12d2a4ad038ff878d4ca4b81fccaf82b714e07eae4402c" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:1d8591993e228b0c930c4bb0db464bdad97b3289fb981255d6c9a41aedc84b2d" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:734e20b57ba95624ecf1841e72b53f6e186355e216e5412de414e3c51e5e3c41" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:8a650c2dbafa08d42e51ba0b62740dae4ecb9338eefa093aa5c78ceb546fcd5c" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:504aa796fe0569bb43171066009ead363de03675276d2d121ac1a4572397870f" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp314-cp314t-win32.whl", hash = "sha256:b1d22e6e9387bf4739fbe23bfa80e93f6b0373a7f1b96c6227c32bef95a4d7a8" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp314-cp314t-win_amd64.whl", hash = "sha256:2c1c351919aca02858f740c6d33adea0c5deea37f9ecca1cc1ef9e884a619d26" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-cp314-cp314t-win_arm64.whl", hash = "sha256:eab21f45c7f66c13f2a9e0e1535309cee140182a9cdae1e041d02e47291e8396" },
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/tomli/2.4.1/tomli-2.4.1-py3-none-any.whl", hash = "sha256:0d85819802132122da43cb86656f8d1f8c6587d54ae7dcaf30e90533028b49fe" },
+]
+
+[[package]]
+name = "trajfoundry"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "orjson" },
+    { name = "pydantic" },
+    { name = "typer" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "orjson", specifier = ">=3.10.0" },
+    { name = "pydantic", specifier = ">=2.9.0" },
+    { name = "typer", specifier = ">=0.15.0" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=8.3.0" },
+    { name = "pytest-cov", specifier = ">=6.0.0" },
+    { name = "ruff", specifier = ">=0.12.0" },
+]
+
+[[package]]
+name = "typer"
+version = "0.27.1"
+source = { registry = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/" }
+dependencies = [
+    { name = "annotated-doc" },
+    { name = "colorama", marker = "sys_platform == 'win32'" },
+    { name = "rich" },
+    { name = "shellingham" },
+]
+sdist = { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/typer/0.27.1/typer-0.27.1.tar.gz", hash = "sha256:a79bef8469a79c45498e7b814ecf8d603cc7644e9acbd9e19cac0334240b18df" }
+wheels = [
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/typer/0.27.1/typer-0.27.1-py3-none-any.whl", hash = "sha256:53150287edd11baeb4e4722c8e394fcdf8181c0ae89485cba8d25c778d5edd56" },
+]
+
+[[package]]
+name = "typing-extensions"
+version = "4.13.1"
+source = { registry = "http://pypi.i.h.pjlab.org.cn/brain/dev/+simple" }
+wheels = [
+    { url = "http://pypi.i.h.pjlab.org.cn/brain/dev/+f/4b6/cf02909eb5495/typing_extensions-4.13.1-py3-none-any.whl", hash = "sha256:4b6cf02909eb5495cfbc3f6e8fd49217e6cc7944e145cdda8caa3734777f9e69" },
+]
+
+[[package]]
+name = "typing-inspection"
+version = "0.4.2"
+source = { registry = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/simple/" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/typing-inspection/0.4.2/typing_inspection-0.4.2.tar.gz", hash = "sha256:ba561c48a67c5958007083d386c3295464928b01faa735ab8547c5692e87f464" }
+wheels = [
+    { url = "http://mirrors.i.h.pjlab.org.cn/repository/pypi-proxy/packages/typing-inspection/0.4.2/typing_inspection-0.4.2-py3-none-any.whl", hash = "sha256:4ed1cacbdc298c220f1bd249ed5287caa16f34d44ef4e9c3d0cbad5b521545e7" },
+]
