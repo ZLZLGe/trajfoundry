@@ -237,6 +237,451 @@ def _responses_relay_snapshots(
     return event, parent, child
 
 
+def _responses_multi_spawn_snapshots(
+    *,
+    argument_task_names: tuple[str, str] = ("requested-a", "requested-b"),
+    canonical_agent_names: tuple[str, str] = (
+        "/root/child-a",
+        "/root/child-b",
+    ),
+    parent_agent_messages: list[AgentMessageEvidence] | None = None,
+    child_a_agent_messages: list[AgentMessageEvidence] | None = None,
+    child_b_agent_messages: list[AgentMessageEvidence] | None = None,
+    child_a_marker: str = "collab_spawn",
+    child_b_marker: str = "collab_spawn",
+) -> tuple[Snapshot, Snapshot, Snapshot, Snapshot]:
+    calls = [
+        spawn("spawn-a", argument_task_names[0]),
+        spawn("spawn-b", argument_task_names[1]),
+    ]
+    event = snapshot(
+        "parent-event",
+        thread="main-thread",
+        turn="parent-turn",
+        response=[assistant(calls=calls)],
+    )
+    parent = snapshot(
+        "parent-leaf",
+        thread="main-thread",
+        turn="parent-final",
+        history=[
+            assistant(calls=calls),
+            Message(
+                role="tool",
+                content=json.dumps({"task_name": canonical_agent_names[0]}),
+                tool_call_id="spawn-a",
+                name="spawn_agent",
+            ),
+            Message(
+                role="tool",
+                content=json.dumps({"task_name": canonical_agent_names[1]}),
+                tool_call_id="spawn-b",
+                name="spawn_agent",
+            ),
+        ],
+        response=[assistant("done")],
+        agent_messages=parent_agent_messages or [],
+    )
+    child_a = snapshot(
+        "child-a",
+        thread="child-thread-a",
+        turn="child-turn-a",
+        response=[assistant("child a done")],
+        parent_thread="main-thread",
+        parent_turn="parent-turn",
+        forked_from="main-thread",
+        marker=child_a_marker,
+        agent_messages=(
+            child_a_agent_messages
+            if child_a_agent_messages is not None
+            else [
+                agent_message(
+                    "child-input-a",
+                    author="/root",
+                    recipient="/root/child-a",
+                    preceding=[],
+                )
+            ]
+        ),
+    )
+    child_b = snapshot(
+        "child-b",
+        thread="child-thread-b",
+        turn="child-turn-b",
+        response=[assistant("child b done")],
+        parent_thread="main-thread",
+        parent_turn="parent-turn",
+        forked_from="main-thread",
+        marker=child_b_marker,
+        agent_messages=(
+            child_b_agent_messages
+            if child_b_agent_messages is not None
+            else [
+                agent_message(
+                    "child-input-b",
+                    author="/root",
+                    recipient="/root/child-b",
+                    preceding=[],
+                )
+            ]
+        ),
+    )
+    return event, parent, child_a, child_b
+
+
+def test_generic_marker_routes_two_children_by_canonical_recipient_and_relays() -> None:
+    event, parent, child_a, child_b = _responses_multi_spawn_snapshots(
+        parent_agent_messages=[
+            agent_message(
+                "relay-a",
+                author="/root/child-a",
+                recipient="/root",
+                preceding=["spawn-a"],
+            ),
+            agent_message(
+                "relay-b",
+                author="/root/child-b",
+                recipient="/root",
+                preceding=["spawn-a", "spawn-b"],
+                item_index=1,
+            ),
+        ],
+        child_a_agent_messages=[
+            agent_message(
+                "child-input-a-1",
+                author="/root",
+                recipient="/root/child-a",
+                preceding=[],
+            ),
+            agent_message(
+                "child-input-a-2",
+                author="/root",
+                recipient="/root/child-a",
+                preceding=[],
+                item_index=1,
+            ),
+        ],
+    )
+
+    plan = plan_subagent_mounts(
+        [child_b, parent, child_a],
+        all_snapshots=[event, parent, child_a, child_b],
+    )
+
+    assert codes(plan) == set()
+    paths = [leaf.source_path for leaf in plan.leaves]
+    assert {
+        edge.spawn_call_id: (
+            paths[edge.child_index],
+            edge.agent_name,
+            edge.relay_id,
+        )
+        for edge in plan.edges
+    } == {
+        "spawn-a": ("/child-a.json", "/root/child-a", "relay-a"),
+        "spawn-b": ("/child-b.json", "/root/child-b", "relay-b"),
+    }
+
+    result = mount_subagents(
+        [
+            SnapshotTrajectory(child_b, node(child_b)),
+            SnapshotTrajectory(parent, node(parent)),
+            SnapshotTrajectory(child_a, node(child_a)),
+        ],
+        all_snapshots=[event, parent, child_a, child_b],
+    )
+    assert len(result.roots) == 1
+    assert result.roots[0].sub_agent_relay_mounts == {
+        "spawn-a": "relay-a",
+        "spawn-b": "relay-b",
+    }
+
+
+def test_generic_marker_with_multiple_spawns_requires_recipient_identity() -> None:
+    event, parent, child, _ = _responses_multi_spawn_snapshots(
+        child_a_agent_messages=[]
+    )
+
+    plan = plan_subagent_mounts([parent, child], all_snapshots=[event, parent, child])
+
+    assert plan.edges == ()
+    assert "ambiguous_spawn_call" in codes(plan)
+    assert tuple(plan.leaves[index].source_path for index in plan.orphan_indices) == (
+        "/child-a.json",
+    )
+
+
+def test_generic_marker_rejects_conflicting_child_recipient_identities() -> None:
+    event, parent, child, _ = _responses_multi_spawn_snapshots(
+        child_a_agent_messages=[
+            agent_message(
+                "child-input-a",
+                author="/root",
+                recipient="/root/child-a",
+                preceding=[],
+            ),
+            agent_message(
+                "child-input-b",
+                author="/root",
+                recipient="/root/child-b",
+                preceding=[],
+                item_index=1,
+            ),
+        ]
+    )
+
+    plan = plan_subagent_mounts([parent, child], all_snapshots=[event, parent, child])
+
+    assert plan.edges == ()
+    assert "conflicting_child_agent_name" in codes(plan)
+    assert tuple(plan.leaves[index].source_path for index in plan.orphan_indices) == (
+        "/child-a.json",
+    )
+
+
+def test_generic_marker_ignores_non_inbound_recipient_evidence() -> None:
+    response_side = agent_message(
+        "response-side",
+        author="/root",
+        recipient="/root/child-a",
+        preceding=[],
+    ).model_copy(update={"origin": "response"})
+    event, parent, child, _ = _responses_multi_spawn_snapshots(
+        child_a_agent_messages=[
+            response_side,
+            agent_message(
+                "wrong-author",
+                author="/root/other",
+                recipient="/root/child-a",
+                preceding=[],
+                item_index=1,
+            ),
+        ]
+    )
+
+    plan = plan_subagent_mounts([parent, child], all_snapshots=[event, parent, child])
+
+    assert plan.edges == ()
+    assert "ambiguous_spawn_call" in codes(plan)
+
+
+def test_generic_marker_does_not_guess_between_duplicate_canonical_names() -> None:
+    recipient = agent_message(
+        "child-input",
+        author="/root",
+        recipient="/root/shared",
+        preceding=[],
+    )
+    event, parent, child, _ = _responses_multi_spawn_snapshots(
+        canonical_agent_names=("/root/shared", "/root/shared"),
+        child_a_agent_messages=[recipient],
+    )
+
+    plan = plan_subagent_mounts([parent, child], all_snapshots=[event, parent, child])
+
+    assert plan.edges == ()
+    assert "ambiguous_spawn_call" in codes(plan)
+
+
+def test_duplicate_argument_task_names_use_distinct_canonical_result_names() -> None:
+    event, parent, child_a, child_b = _responses_multi_spawn_snapshots(
+        argument_task_names=("duplicate", "duplicate")
+    )
+
+    plan = plan_subagent_mounts(
+        [parent, child_a, child_b],
+        all_snapshots=[event, parent, child_a, child_b],
+    )
+
+    paths = [leaf.source_path for leaf in plan.leaves]
+    assert {edge.spawn_call_id: paths[edge.child_index] for edge in plan.edges} == {
+        "spawn-a": "/child-a.json",
+        "spawn-b": "/child-b.json",
+    }
+    assert plan.orphan_indices == ()
+
+
+def test_canonical_recipient_match_wins_over_nameless_task_fallback() -> None:
+    event, parent, child, _ = _responses_multi_spawn_snapshots(
+        argument_task_names=("unrelated", "child-a"),
+        canonical_agent_names=("/root/child-a", ""),
+    )
+
+    plan = plan_subagent_mounts([parent, child], all_snapshots=[event, parent, child])
+
+    assert len(plan.edges) == 1
+    assert plan.edges[0].spawn_call_id == "spawn-a"
+    assert plan.edges[0].agent_name == "/root/child-a"
+    assert plan.orphan_indices == ()
+
+
+def test_unique_task_basename_fallback_routes_when_canonical_names_are_missing() -> (
+    None
+):
+    event, parent, child, _ = _responses_multi_spawn_snapshots(
+        argument_task_names=("child-a", "child-b"),
+        canonical_agent_names=("", ""),
+    )
+
+    plan = plan_subagent_mounts([parent, child], all_snapshots=[event, parent, child])
+
+    assert len(plan.edges) == 1
+    assert plan.edges[0].spawn_call_id == "spawn-a"
+    assert plan.edges[0].agent_name == ""
+    assert plan.orphan_indices == ()
+
+
+def test_duplicate_task_basename_fallback_remains_ambiguous() -> None:
+    recipient = agent_message(
+        "child-input",
+        author="/root",
+        recipient="/root/shared",
+        preceding=[],
+    )
+    event, parent, child, _ = _responses_multi_spawn_snapshots(
+        argument_task_names=("shared", "shared"),
+        canonical_agent_names=("", ""),
+        child_a_agent_messages=[recipient],
+    )
+
+    plan = plan_subagent_mounts([parent, child], all_snapshots=[event, parent, child])
+
+    assert plan.edges == ()
+    assert "ambiguous_spawn_call" in codes(plan)
+
+
+def test_duplicate_agent_message_id_cannot_disambiguate_multiple_spawns() -> None:
+    duplicate = agent_message(
+        "duplicate-input",
+        author="/root",
+        recipient="/root/child-a",
+        preceding=[],
+    )
+    event, parent, child, _ = _responses_multi_spawn_snapshots(
+        child_a_agent_messages=[duplicate, duplicate]
+    )
+
+    plan = plan_subagent_mounts([parent, child], all_snapshots=[event, parent, child])
+
+    assert plan.edges == ()
+    assert "duplicate_agent_message_id" in codes(plan)
+    assert "ambiguous_spawn_call" in codes(plan)
+
+
+def test_unrelated_duplicate_agent_message_id_does_not_hide_valid_recipient() -> None:
+    duplicate = agent_message(
+        "duplicate-input",
+        author="/root/other",
+        recipient="/root/other/child",
+        preceding=[],
+        item_index=1,
+    )
+    valid = agent_message(
+        "valid-input",
+        author="/root",
+        recipient="/root/child-a",
+        preceding=[],
+    )
+    event, parent, child, _ = _responses_multi_spawn_snapshots(
+        child_a_agent_messages=[valid, duplicate, duplicate]
+    )
+
+    plan = plan_subagent_mounts([parent, child], all_snapshots=[event, parent, child])
+
+    assert len(plan.edges) == 1
+    assert plan.edges[0].spawn_call_id == "spawn-a"
+    assert "duplicate_agent_message_id" in codes(plan)
+    assert "ambiguous_spawn_call" not in codes(plan)
+
+
+def test_generic_marker_recipient_matching_no_spawn_is_a_routing_mismatch() -> None:
+    unknown = agent_message(
+        "child-input",
+        author="/root",
+        recipient="/root/unknown",
+        preceding=[],
+    )
+    event, parent, child, _ = _responses_multi_spawn_snapshots(
+        child_a_agent_messages=[unknown]
+    )
+
+    plan = plan_subagent_mounts([parent, child], all_snapshots=[event, parent, child])
+
+    assert plan.edges == ()
+    assert "spawn_routing_mismatch" in codes(plan)
+
+
+def test_conflicting_canonical_name_does_not_enable_task_fallback() -> None:
+    event, parent, child, _ = _responses_multi_spawn_snapshots(
+        argument_task_names=("child-a", "other"),
+    )
+    conflicting_replay = parent.model_copy(
+        update={
+            "source_path": "/parent-conflicting-name.json",
+            "source_sha256": "parent-conflicting-name",
+            "request_id": "parent-conflicting-name",
+            "history": [
+                parent.history[0],
+                parent.history[1].model_copy(
+                    update={"content": '{"task_name":"/root/other-name"}'}
+                ),
+                parent.history[2],
+            ],
+        },
+        deep=True,
+    )
+
+    plan = plan_subagent_mounts(
+        [parent, child],
+        all_snapshots=[event, conflicting_replay, parent, child],
+    )
+
+    assert plan.edges == ()
+    assert "conflicting_spawn_agent_name" in codes(plan)
+    assert "spawn_routing_mismatch" in codes(plan)
+
+
+def test_explicit_spawn_call_conflicting_with_child_recipient_does_not_mount() -> None:
+    event, parent, child, _ = _responses_multi_spawn_snapshots(
+        child_a_marker=json.dumps({"spawn_call_id": "spawn-a"}),
+        child_a_agent_messages=[
+            agent_message(
+                "child-input",
+                author="/root",
+                recipient="/root/child-b",
+                preceding=[],
+            )
+        ],
+    )
+
+    plan = plan_subagent_mounts([parent, child], all_snapshots=[event, parent, child])
+
+    assert plan.edges == ()
+    assert "spawn_routing_mismatch" in codes(plan)
+    assert tuple(plan.leaves[index].source_path for index in plan.orphan_indices) == (
+        "/child-a.json",
+    )
+
+
+def test_explicit_task_name_conflicting_with_child_recipient_does_not_mount() -> None:
+    event, parent, child, _ = _responses_multi_spawn_snapshots(
+        child_a_marker=json.dumps({"task_name": "requested-a"}),
+        child_a_agent_messages=[
+            agent_message(
+                "child-input",
+                author="/root",
+                recipient="/root/child-b",
+                preceding=[],
+            )
+        ],
+    )
+
+    plan = plan_subagent_mounts([parent, child], all_snapshots=[event, parent, child])
+
+    assert plan.edges == ()
+    assert "spawn_routing_mismatch" in codes(plan)
+
+
 def test_responses_mount_uses_canonical_agent_name_and_unique_ordered_relay() -> None:
     event, parent, child = _responses_relay_snapshots(
         parent_agent_messages=[
@@ -380,6 +825,59 @@ def test_missing_spawn_agent_name_does_not_block_primary_mount() -> None:
     project_trajectory(root)
 
 
+def test_relay_rejects_response_side_or_wrong_author_child_identity() -> None:
+    invalid_identities = [
+        agent_message(
+            "child-response",
+            author="/root",
+            recipient="/root/child",
+            preceding=[],
+        ).model_copy(update={"origin": "response"}),
+        agent_message(
+            "child-wrong-author",
+            author="/root/other",
+            recipient="/root/child",
+            preceding=[],
+        ),
+        agent_message(
+            "child-wrong-type",
+            author="/root",
+            recipient="/root/child",
+            preceding=[],
+        ).model_copy(
+            update={
+                "item": {
+                    "type": "message",
+                    "id": "child-wrong-type",
+                    "author": "/root",
+                    "recipient": "/root/child",
+                }
+            }
+        ),
+    ]
+    for child_identity in invalid_identities:
+        event, parent, child = _responses_relay_snapshots(
+            parent_agent_messages=[
+                agent_message(
+                    "relay-1",
+                    author="/root/child",
+                    recipient="/root",
+                    preceding=["spawn-1"],
+                )
+            ],
+            child_agent_messages=[child_identity],
+        )
+
+        plan = plan_subagent_mounts(
+            [parent, child], all_snapshots=[event, parent, child]
+        )
+
+        assert len(plan.edges) == 1
+        assert plan.edges[0].spawn_call_id == "spawn-1"
+        assert plan.edges[0].relay_id == ""
+        assert "missing_child_agent_name" in codes(plan)
+
+
 def test_absent_parent_relay_candidate_requires_no_child_identity() -> None:
     event, parent, child = _responses_relay_snapshots(
         parent_agent_messages=[],
@@ -434,7 +932,7 @@ def test_conflicting_spawn_agent_names_do_not_remove_primary_spawn_event() -> No
     project_trajectory(root)
 
 
-def test_conflicting_child_agent_names_do_not_orphan_primary_mount() -> None:
+def test_conflicting_child_agent_names_orphan_primary_mount() -> None:
     event, parent, child = _responses_relay_snapshots(
         parent_agent_messages=[
             agent_message(
@@ -463,11 +961,11 @@ def test_conflicting_child_agent_names_do_not_orphan_primary_mount() -> None:
 
     plan = plan_subagent_mounts([parent, child], all_snapshots=[event, parent, child])
 
-    assert len(plan.edges) == 1
-    assert plan.edges[0].relay_id == ""
-    assert plan.orphan_indices == ()
+    assert plan.edges == ()
+    assert tuple(plan.leaves[index].source_path for index in plan.orphan_indices) == (
+        "/child-leaf.json",
+    )
     assert "conflicting_child_agent_name" in codes(plan)
-    assert "unmounted_spawn_call" not in codes(plan)
 
 
 def test_agent_message_before_spawn_completion_is_not_used_as_relay() -> None:

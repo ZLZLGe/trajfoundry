@@ -53,6 +53,7 @@ class SpawnEvidence:
     spawn_call_id: str
     task_name: str
     agent_name: str
+    agent_name_conflicted: bool
     arguments_json: str
     source_path: str
 
@@ -509,6 +510,7 @@ def _extract_spawn_evidence(
                 spawn_call_id=call.id,
                 task_name=task_name,
                 agent_name=agent_name,
+                agent_name_conflicted=len(canonical_names) > 1,
                 arguments_json=_canonical_json(arguments),
                 source_path=snapshot.source_path,
             )
@@ -599,6 +601,55 @@ def _parent_agent_name(agent_name: str) -> str:
     return parent if separator and parent else ""
 
 
+def _child_agent_recipient(
+    records: Sequence[AgentMessageRecord],
+) -> tuple[str, bool]:
+    """Return one trustworthy direct-child recipient and whether it conflicts.
+
+    Only inbound history items can identify the child created by a parent turn.
+    Replayed copies with the same identity collapse naturally.  Provider records
+    with duplicate/conflicting ids are not safe routing evidence, while multiple
+    distinct valid direct-child recipients are contradictory evidence.
+    """
+
+    recipients = {
+        recipient
+        for record in records
+        if record.origin == "history"
+        and record.item.get("type") == "agent_message"
+        and (author := _agent_field(record, "author"))
+        and (recipient := _agent_field(record, "recipient"))
+        and _parent_agent_name(recipient) == author
+    }
+    if len(recipients) > 1:
+        return "", True
+    return next(iter(recipients), ""), False
+
+
+def _filter_spawns_by_recipient(
+    candidates: Sequence[SpawnEvidence], recipient: str
+) -> list[SpawnEvidence]:
+    """Use canonical agent identity first, then a strict task-name fallback."""
+
+    canonical = [
+        event
+        for event in candidates
+        if event.agent_name and event.agent_name == recipient
+    ]
+    if canonical:
+        return canonical
+
+    task_basename = recipient.rsplit("/", 1)[-1]
+    return [
+        event
+        for event in candidates
+        if not event.agent_name
+        and not event.agent_name_conflicted
+        and event.task_name
+        and event.task_name == task_basename
+    ]
+
+
 def _attach_relay_ids(
     edges: Sequence[MountEdge],
     leaves: Sequence[Snapshot],
@@ -641,12 +692,10 @@ def _attach_relay_ids(
                 child.session_id,
                 child.thread_id,
             )
-            child_agent_names = {
-                recipient
-                for record in agent_records_by_thread.get(child_thread_key, ())
-                if (recipient := _agent_field(record, "recipient"))
-            }
-            if len(child_agent_names) > 1:
+            child_agent_name, conflicting_child_agent_name = _child_agent_recipient(
+                agent_records_by_thread.get(child_thread_key, ())
+            )
+            if conflicting_child_agent_name:
                 diagnostics.append(
                     MountDiagnostic(
                         code="conflicting_child_agent_name",
@@ -661,7 +710,6 @@ def _attach_relay_ids(
                     )
                 )
                 continue
-            child_agent_name = next(iter(child_agent_names), "")
             if not child_agent_name:
                 diagnostics.append(
                     MountDiagnostic(
@@ -1100,6 +1148,57 @@ def plan_subagent_mounts(
             )
             invalid_children.add(child_index)
             continue
+
+        child_thread_key = (
+            child.source_partition,
+            child.session_id,
+            child.thread_id,
+        )
+        recipient, conflicting_recipient = _child_agent_recipient(
+            agent_records_by_thread.get(child_thread_key, ())
+        )
+        if conflicting_recipient:
+            diagnostics.append(
+                MountDiagnostic(
+                    code="conflicting_child_agent_name",
+                    detail=(
+                        "sub-agent thread has multiple structured direct-child "
+                        "recipient identities"
+                    ),
+                    leaf_index=child_index,
+                    parent_thread_id=child.parent_thread_id,
+                    parent_turn_id=child.parent_turn_id,
+                    spawn_call_id=marker.spawn_call_id,
+                )
+            )
+            invalid_children.add(child_index)
+            continue
+        # Conflicting canonical-name replays make recipient validation
+        # unavailable, but they do not overturn an otherwise unique primary
+        # spawn edge.  The existing conflict diagnostic still quarantines it.
+        recipient_can_constrain = bool(recipient) and not (
+            len(candidates) == 1 and candidates[0].agent_name_conflicted
+        )
+        if recipient_can_constrain:
+            recipient_matches = _filter_spawns_by_recipient(candidates, recipient)
+            if not recipient_matches:
+                diagnostics.append(
+                    MountDiagnostic(
+                        code="spawn_routing_mismatch",
+                        detail=(
+                            "structured child recipient conflicts with the spawn "
+                            "routing selected on the parent turn"
+                        ),
+                        leaf_index=child_index,
+                        parent_thread_id=child.parent_thread_id,
+                        parent_turn_id=child.parent_turn_id,
+                        spawn_call_id=marker.spawn_call_id,
+                    )
+                )
+                invalid_children.add(child_index)
+                continue
+            candidates = recipient_matches
+
         if len(candidates) > 1:
             diagnostics.append(
                 MountDiagnostic(

@@ -73,8 +73,11 @@ timestamp changes.
   tool messages. Their provider result blocks are preserved verbatim, and a
   missing result is represented explicitly as `"result": null`.
 - Sub-agents mount only from structured parent thread, parent turn, and concrete
-  `spawn_agent`/`Agent` call evidence. Ambiguous or conflicting relationships
-  are diagnosed and never guessed from time or nearby files.
+  `spawn_agent`/`Agent` call evidence. When one parent turn has multiple spawn
+  calls, a unique inbound child `agent_message` may disambiguate them by exact
+  canonical recipient; task-name basename matching is allowed only for a spawn
+  without a canonical result name. Explicit marker/recipient conflicts remain
+  orphaned. Time, file order, and free-form text are never routing signals.
 - Responses relay mounts additionally require the canonical agent name returned
   by `spawn_agent`, a matching child recipient, and one unique parent-side
   `agent_message` after the corresponding call/result pair has completed.
