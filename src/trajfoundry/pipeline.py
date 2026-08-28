@@ -36,8 +36,9 @@ from .quality import enrich_trajectory
 from .state import StateStore
 from .streaming import streaming_prefix_leaves
 from .subagents import SubagentMountPlan, plan_subagent_mounts
+from .tool_names import is_spawn_tool_name
 
-NORMALIZER_REVISION = "2026-08-28.2"
+NORMALIZER_REVISION = "2026-08-28.3"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 
@@ -487,16 +488,20 @@ def _spawn_only_messages(messages: Iterable[Message]) -> list[Message]:
     """Retain structured spawn calls without retaining arbitrary content."""
 
     source = list(messages)
-    spawn_ids = {
-        call.id
+    spawn_names: dict[str, set[str]] = defaultdict(set)
+    for name, call_id in (
+        (call.function.name, call.id)
         for message in source
         if message.role == "assistant"
         for call in (message.tool_calls or ())
-        if call.function.name in {"spawn_agent", "Agent"}
-    }
+        if is_spawn_tool_name(call.function.name)
+    ):
+        spawn_names[call_id].add(name)
     result: list[Message] = []
     for message in source:
-        if message.role == "tool" and message.tool_call_id in spawn_ids:
+        if message.role == "tool" and message.name in spawn_names.get(
+            message.tool_call_id or "", set()
+        ):
             result.append(message.model_copy(deep=True))
             continue
         if message.role != "assistant":
@@ -504,7 +509,7 @@ def _spawn_only_messages(messages: Iterable[Message]) -> list[Message]:
         calls = [
             call
             for call in (message.tool_calls or ())
-            if call.function.name in {"spawn_agent", "Agent"}
+            if is_spawn_tool_name(call.function.name)
         ]
         if not calls:
             continue
@@ -604,7 +609,7 @@ def _flat_semantic_key(snapshot: Snapshot, node: TrajectoryNode) -> str:
         }
         for message in snapshot.response
         for call in (message.tool_calls or ())
-        if call.function.name in {"spawn_agent", "Agent"}
+        if is_spawn_tool_name(call.function.name)
     ]
     payload = {
         "session_id": snapshot.session_id,

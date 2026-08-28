@@ -618,7 +618,7 @@ def test_expressible_orphan_server_result_is_a_quarantined_trajectory(
             turn_id="turn-1",
             request_input=[_message("user", "run"), orphan],
             response_output=[_message("assistant", "done")],
-            tools=[],
+            tools=[{"type": "shell", "environment": {"type": "container_auto"}}],
         ),
     )
 

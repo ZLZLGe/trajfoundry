@@ -27,6 +27,7 @@ from .models import (
     TrajectoryNode,
 )
 from .quality import enrich_trajectory
+from .tool_names import is_spawn_tool_name
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,14 +243,14 @@ def _spawn_calls(messages: Sequence[Message]) -> list[ToolCall]:
         if message.role != "assistant":
             continue
         for call in message.tool_calls or ():
-            if call.function.name in {"spawn_agent", "Agent"}:
+            if is_spawn_tool_name(call.function.name):
                 result.append(call)
     return result
 
 
 def _spawn_agent_result_names(
     snapshots: Sequence[Snapshot],
-) -> dict[tuple[str, str, str], set[str]]:
+) -> dict[tuple[str, str, str, str], set[str]]:
     """Collect canonical agent names from ordered ``spawn_agent`` results.
 
     The tool result is accepted only when its call is present earlier in the
@@ -257,22 +258,20 @@ def _spawn_agent_result_names(
     non-empty string ``task_name``.  No free-form result text is interpreted.
     """
 
-    names: dict[tuple[str, str, str], set[str]] = defaultdict(set)
+    names: dict[tuple[str, str, str, str], set[str]] = defaultdict(set)
     for snapshot in snapshots:
-        seen_spawn_ids: set[str] = set()
+        seen_spawn_names: dict[str, set[str]] = defaultdict(set)
         for message in (*snapshot.history, *snapshot.response):
             if message.role == "assistant":
-                seen_spawn_ids.update(
-                    call.id
-                    for call in (message.tool_calls or ())
-                    if call.function.name == "spawn_agent" and call.id
-                )
+                for call in message.tool_calls or ():
+                    if is_spawn_tool_name(call.function.name) and call.id:
+                        seen_spawn_names[call.id].add(call.function.name)
                 continue
             if (
                 message.role != "tool"
-                or message.name != "spawn_agent"
                 or not message.tool_call_id
-                or message.tool_call_id not in seen_spawn_ids
+                or not message.name
+                or message.name not in seen_spawn_names.get(message.tool_call_id, set())
             ):
                 continue
             try:
@@ -289,6 +288,7 @@ def _spawn_agent_result_names(
                     snapshot.session_id,
                     snapshot.thread_id,
                     message.tool_call_id,
+                    message.name,
                 )
             ].add(task_name)
     return names
@@ -433,7 +433,7 @@ def _extract_spawn_evidence(
     by_key: dict[tuple[str, str, str, str], SpawnEvidence] = {}
     conflicts: set[tuple[str, str, str, str]] = set()
     result_names = _spawn_agent_result_names(snapshots)
-    reported_result_conflicts: set[tuple[str, str, str]] = set()
+    reported_result_conflicts: set[tuple[str, str, str, str]] = set()
 
     for snapshot in sorted(snapshots, key=_leaf_key):
         calls = _spawn_calls(snapshot.response)
@@ -475,6 +475,7 @@ def _extract_spawn_evidence(
                 snapshot.session_id,
                 snapshot.thread_id,
                 call.id,
+                call.function.name,
             )
             canonical_names = result_names.get(result_key, set())
             if len(canonical_names) > 1 and result_key not in reported_result_conflicts:

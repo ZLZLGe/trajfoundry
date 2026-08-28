@@ -9,6 +9,7 @@ from hashlib import sha256
 from typing import Any
 
 from .models import Message, Snapshot
+from .tool_names import is_spawn_tool_name
 
 
 def message_prefix_token(message: Message) -> bytes:
@@ -99,7 +100,7 @@ class StreamingAggregationResult:
 
 def _has_spawn_response(snapshot: Snapshot) -> bool:
     return any(
-        call.function.name in {"spawn_agent", "Agent"}
+        is_spawn_tool_name(call.function.name)
         for message in snapshot.response
         for call in (message.tool_calls or [])
     )
@@ -120,16 +121,20 @@ def _has_agent_messages(snapshot: Snapshot) -> bool:
 
 def _spawn_only_messages(messages: Iterable[Message]) -> list[Message]:
     source = list(messages)
-    spawn_ids = {
-        call.id
+    spawn_names: dict[str, set[str]] = {}
+    for name, call_id in (
+        (call.function.name, call.id)
         for message in source
         if message.role == "assistant"
         for call in (message.tool_calls or ())
-        if call.function.name in {"spawn_agent", "Agent"}
-    }
+        if is_spawn_tool_name(call.function.name)
+    ):
+        spawn_names.setdefault(call_id, set()).add(name)
     result: list[Message] = []
     for message in source:
-        if message.role == "tool" and message.tool_call_id in spawn_ids:
+        if message.role == "tool" and message.name in spawn_names.get(
+            message.tool_call_id or "", set()
+        ):
             result.append(message.model_copy(deep=True))
             continue
         if message.role != "assistant":
@@ -137,7 +142,7 @@ def _spawn_only_messages(messages: Iterable[Message]) -> list[Message]:
         calls = [
             call
             for call in (message.tool_calls or ())
-            if call.function.name in {"spawn_agent", "Agent"}
+            if is_spawn_tool_name(call.function.name)
         ]
         if not calls:
             continue

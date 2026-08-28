@@ -26,14 +26,48 @@ from trajfoundry.models import (
     ToolCall,
     ToolDefinition,
 )
+from trajfoundry.tool_names import is_spawn_tool_name, qualify_tool_name
 
 
 class ResponsesAdapterError(ValueError):
     """Raised when a value is not a Responses capture at all."""
 
 
-_CLIENT_CALL_TYPES = {"function_call", "custom_tool_call"}
-_CLIENT_RESULT_TYPES = {"function_call_output", "custom_tool_call_output"}
+_CLIENT_CALL_TYPES = {
+    "apply_patch_call",
+    "computer_call",
+    "custom_tool_call",
+    "function_call",
+    "local_shell_call",
+}
+_CLIENT_RESULT_TYPES = {
+    "apply_patch_call_output",
+    "computer_call_output",
+    "custom_tool_call_output",
+    "function_call_output",
+    "local_shell_call_output",
+}
+_CLIENT_RESULT_TO_CALL = {
+    "apply_patch_call_output": "apply_patch_call",
+    "computer_call_output": "computer_call",
+    "custom_tool_call_output": "custom_tool_call",
+    "function_call_output": "function_call",
+    "local_shell_call_output": "local_shell_call",
+    "shell_call_output": "shell_call",
+    "tool_search_output": "tool_search_call",
+}
+_CLIENT_CALL_TO_RESULT = {
+    call_type: result_type for result_type, call_type in _CLIENT_RESULT_TO_CALL.items()
+}
+_CLIENT_BUILTIN_NAMES = {
+    "apply_patch_call": "apply_patch",
+    "computer_call": "computer",
+    "local_shell_call": "local_shell",
+    "shell_call": "shell",
+    "tool_search_call": "tool_search",
+}
+_CONDITIONAL_CALL_TYPES = {"shell_call", "tool_search_call"}
+_CONDITIONAL_RESULT_TYPES = {"shell_call_output", "tool_search_output"}
 _TERMINAL_EVENTS = {
     "response.completed",
     "response.incomplete",
@@ -54,8 +88,12 @@ _KNOWN_EVENT_PREFIXES = (
     "response.file_search_call.",
     "response.code_interpreter_call.",
     "response.computer_call.",
+    "response.apply_patch_call.",
     "response.image_generation_call.",
+    "response.local_shell_call.",
     "response.mcp_call.",
+    "response.shell_call.",
+    "response.tool_search_call.",
     "response.audio.",
 )
 _LIFECYCLE_EVENTS = {
@@ -75,13 +113,27 @@ _KNOWN_NON_TEXT_CONTENT = {
 }
 _SERVER_CALL_TYPES = {
     "code_interpreter_call",
-    "computer_call",
     "file_search_call",
     "image_generation_call",
     "mcp_call",
-    "shell_call",
     "web_search_call",
 }
+_SERVER_RESULT_TYPES = {
+    "code_interpreter_call_output",
+    "file_search_call_output",
+    "image_generation_call_output",
+    "mcp_call_output",
+    "web_search_call_output",
+}
+_HOSTED_TOOL_TYPES = {
+    "code_interpreter",
+    "file_search",
+    "image_generation",
+    "mcp",
+    "web_search",
+}
+_EXECUTION_CLIENT = "client"
+_EXECUTION_SERVER = "server"
 
 
 def _json(value: Any) -> str:
@@ -341,6 +393,9 @@ def _server_arguments(item: Mapping[str, Any]) -> Any:
         "call_id",
         "status",
         "name",
+        "namespace",
+        "execution",
+        "environment",
         "result",
         "results",
         "output",
@@ -360,18 +415,86 @@ def _server_inline_result(item: Mapping[str, Any]) -> dict[str, Any] | None:
 
 
 def _is_server_call(item_type: Any) -> bool:
-    return isinstance(item_type, str) and (
-        item_type in _SERVER_CALL_TYPES
-        or (item_type.endswith("_call") and item_type not in _CLIENT_CALL_TYPES)
-    )
+    return isinstance(item_type, str) and item_type in _SERVER_CALL_TYPES
 
 
 def _is_server_result(item_type: Any) -> bool:
-    return (
-        isinstance(item_type, str)
-        and (item_type.endswith("_call_output") or item_type == "tool_search_output")
-        and item_type not in _CLIENT_RESULT_TYPES
-    )
+    return isinstance(item_type, str) and item_type in _SERVER_RESULT_TYPES
+
+
+def _qualified_item_name(item: Mapping[str, Any]) -> str:
+    name = item.get("name")
+    if not isinstance(name, str):
+        return ""
+    namespace = item.get("namespace")
+    if namespace is not None and not isinstance(namespace, str):
+        namespace = None
+    return qualify_tool_name(namespace, name)
+
+
+def _client_call_name(item_type: str, item: Mapping[str, Any]) -> str:
+    builtin = _CLIENT_BUILTIN_NAMES.get(item_type)
+    return builtin if builtin is not None else _qualified_item_name(item)
+
+
+def _client_arguments(
+    item_type: str,
+    item: Mapping[str, Any],
+    *,
+    path: str,
+    issues: list[AuditIssue],
+) -> Any:
+    if item_type == "custom_tool_call":
+        raw_input = item.get("input", "")
+        if not isinstance(raw_input, str):
+            _issue(
+                issues,
+                "invalid_custom_tool_input",
+                f"{path}.input",
+                f"expected string; got {type(raw_input).__name__}",
+            )
+            raw_input = _as_string(raw_input)
+        return {"input": raw_input}
+    if item_type == "function_call":
+        return _parse_arguments(
+            item.get("arguments"),
+            path=f"{path}.arguments",
+            issues=issues,
+        )
+
+    preferred_fields = {
+        "apply_patch_call": ("operation",),
+        "computer_call": ("actions", "action"),
+        "local_shell_call": ("action",),
+        "shell_call": ("action",),
+        "tool_search_call": ("arguments",),
+    }
+    for field in preferred_fields.get(item_type, ()):
+        if field not in item:
+            continue
+        value = item[field]
+        if field == "arguments" and isinstance(value, str):
+            try:
+                return _strict_json_loads(value)
+            except (TypeError, ValueError):
+                return {"raw": value}
+        return deepcopy(value)
+    return deepcopy(_server_arguments(item))
+
+
+def _client_result_content(item_type: str, item: Mapping[str, Any]) -> str:
+    if item_type in {"function_call_output", "custom_tool_call_output"}:
+        output = item.get("output", "")
+        return output if isinstance(output, str) else _json(output)
+
+    # ``status`` is part of the client result itself for built-ins such as
+    # apply_patch (``completed`` versus ``failed``), rather than disposable
+    # provider-envelope metadata.  Preserve it with the result payload.
+    envelope = {"type", "id", "call_id", "name", "namespace", "execution"}
+    payload = {
+        key: deepcopy(value) for key, value in item.items() if key not in envelope
+    }
+    return _json(payload)
 
 
 def _raw_call_id(item: Mapping[str, Any]) -> str | None:
@@ -397,6 +520,185 @@ def _display_item_id(item: Mapping[str, Any], *, origin: str, index: int) -> str
     return _stable_missing_id(origin, index)
 
 
+def _conditional_family(item_type: Any) -> str | None:
+    if item_type in {"tool_search_call", "tool_search_output"}:
+        return "tool_search"
+    if item_type in {"shell_call", "shell_call_output"}:
+        return "shell"
+    return None
+
+
+def _explicit_item_execution(
+    family: str,
+    item: Mapping[str, Any],
+    *,
+    path: str,
+    issues: list[AuditIssue],
+) -> str | None:
+    if family == "tool_search":
+        if "execution" not in item or item.get("execution") is None:
+            return None
+        execution = item.get("execution")
+        if execution in {_EXECUTION_CLIENT, _EXECUTION_SERVER}:
+            return str(execution)
+        _issue(
+            issues,
+            "ambiguous_tool_execution",
+            f"{path}.execution",
+            f"unsupported tool_search execution {execution!r}",
+        )
+        return None
+
+    if "environment" not in item or item.get("environment") is None:
+        return None
+    environment = item.get("environment")
+    if not isinstance(environment, Mapping):
+        _issue(
+            issues,
+            "ambiguous_tool_execution",
+            f"{path}.environment",
+            "shell environment is not an object",
+        )
+        return None
+    environment_type = environment.get("type")
+    if environment_type == "local":
+        return _EXECUTION_CLIENT
+    if environment_type in {"container_auto", "container_reference"}:
+        return _EXECUTION_SERVER
+    _issue(
+        issues,
+        "ambiguous_tool_execution",
+        f"{path}.environment.type",
+        f"unsupported shell environment type {environment_type!r}",
+    )
+    return None
+
+
+def _classify_items(
+    raw_items: Sequence[Any],
+    *,
+    origin: str,
+    issues: list[AuditIssue],
+    path: str,
+    execution_modes: Mapping[str, frozenset[str]],
+) -> dict[int, str]:
+    """Classify provider items by the component that actually executes them."""
+
+    classifications: dict[int, str] = {}
+    conditional_indexes: list[int] = []
+    for index, raw_item in enumerate(raw_items):
+        if not isinstance(raw_item, Mapping):
+            continue
+        item_type = raw_item.get("type")
+        if item_type in _CLIENT_CALL_TYPES:
+            classifications[index] = "client_call"
+        elif item_type in _CLIENT_RESULT_TYPES:
+            classifications[index] = "client_result"
+        elif item_type in _SERVER_CALL_TYPES:
+            classifications[index] = "server_call"
+        elif item_type in _SERVER_RESULT_TYPES:
+            classifications[index] = "server_result"
+        elif _conditional_family(item_type) is not None:
+            conditional_indexes.append(index)
+
+    def group_key(index: int) -> tuple[str, str, Any]:
+        item = raw_items[index]
+        assert isinstance(item, Mapping)
+        item_type = item.get("type")
+        family = _conditional_family(item_type)
+        assert family is not None
+        call_id = _raw_call_id(item)
+        if call_id is not None:
+            return family, "call_id", call_id
+        if family == "tool_search":
+            if item_type == "tool_search_call" and index + 1 < len(raw_items):
+                neighbor = raw_items[index + 1]
+                if (
+                    isinstance(neighbor, Mapping)
+                    and neighbor.get("type") == "tool_search_output"
+                    and _raw_call_id(neighbor) is None
+                ):
+                    return family, "adjacent", index
+            if item_type == "tool_search_output" and index > 0:
+                neighbor = raw_items[index - 1]
+                if (
+                    isinstance(neighbor, Mapping)
+                    and neighbor.get("type") == "tool_search_call"
+                    and _raw_call_id(neighbor) is None
+                ):
+                    return family, "adjacent", index - 1
+        return family, "index", index
+
+    groups: dict[tuple[str, str, Any], list[int]] = {}
+    for index in conditional_indexes:
+        groups.setdefault(group_key(index), []).append(index)
+
+    for (family, _, _), indexes in groups.items():
+        explicit_modes: set[str] = set()
+        for index in indexes:
+            item = raw_items[index]
+            assert isinstance(item, Mapping)
+            explicit = _explicit_item_execution(
+                family,
+                item,
+                path=f"{path}[{index}]",
+                issues=issues,
+            )
+            if explicit is not None:
+                explicit_modes.add(explicit)
+
+        if len(explicit_modes) > 1:
+            _issue(
+                issues,
+                "tool_execution_mismatch",
+                f"{path}[{indexes[0]}]",
+                f"paired {family} items disagree on execution",
+            )
+            continue
+
+        definition_modes = execution_modes.get(family, frozenset())
+        if explicit_modes:
+            mode = next(iter(explicit_modes))
+            if (
+                origin == "response"
+                and len(definition_modes) == 1
+                and mode not in definition_modes
+            ):
+                _issue(
+                    issues,
+                    "tool_execution_mismatch",
+                    f"{path}[{indexes[0]}]",
+                    (
+                        f"{family} item execution {mode!r} conflicts with "
+                        f"the active definition"
+                    ),
+                )
+        elif len(definition_modes) == 1:
+            mode = next(iter(definition_modes))
+        else:
+            detail = (
+                f"multiple active {family} definitions disagree on execution"
+                if definition_modes
+                else f"{family} item has no execution evidence"
+            )
+            _issue(
+                issues,
+                "ambiguous_tool_execution",
+                f"{path}[{indexes[0]}]",
+                detail,
+            )
+            continue
+
+        for index in indexes:
+            item = raw_items[index]
+            assert isinstance(item, Mapping)
+            item_type = item.get("type")
+            is_result = item_type in _CONDITIONAL_RESULT_TYPES
+            classifications[index] = f"{mode}_{'result' if is_result else 'call'}"
+
+    return classifications
+
+
 def _normalize_server_items(
     raw_items: Sequence[tuple[int, Mapping[str, Any], str]],
     *,
@@ -404,7 +706,10 @@ def _normalize_server_items(
     issues: list[AuditIssue],
     path: str,
 ) -> list[ServerToolCall]:
-    """Pair server calls/results losslessly using explicit ``call_id`` only."""
+    """Pair server items by ``call_id`` plus the hosted tool-search exception."""
+
+    def is_result(item_type: str) -> bool:
+        return item_type in _SERVER_RESULT_TYPES | _CONDITIONAL_RESULT_TYPES
 
     call_indexes: dict[str, list[int]] = {}
     result_indexes: dict[str, list[int]] = {}
@@ -412,7 +717,7 @@ def _normalize_server_items(
         call_id = _raw_call_id(item)
         if call_id is None:
             continue
-        target = result_indexes if _is_server_result(item_type) else call_indexes
+        target = result_indexes if is_result(item_type) else call_indexes
         target.setdefault(call_id, []).append(event_index)
 
     for call_id, indexes in call_indexes.items():
@@ -465,11 +770,34 @@ def _normalize_server_items(
         paired_results[call_event_index] = result_event_index
         claimed_results.add(result_event_index)
 
+    # Hosted tool search currently emits ``call_id: null``.  Its immediately
+    # adjacent call/output pair is still one provider-side operation; item IDs
+    # remain display identifiers and are never generalized into linkage keys.
+    null_tool_search_pairs: dict[int, int] = {}
+    for event_index, (source_index, item, item_type) in enumerate(raw_items[:-1]):
+        if item_type != "tool_search_call" or _raw_call_id(item) is not None:
+            continue
+        next_source_index, next_item, next_type = raw_items[event_index + 1]
+        if (
+            next_source_index == source_index + 1
+            and next_type == "tool_search_output"
+            and _raw_call_id(next_item) is None
+        ):
+            null_tool_search_pairs[event_index] = event_index + 1
+            claimed_results.add(event_index + 1)
+
     pending: list[tuple[int, int, dict[str, Any]]] = []
     for event_index, (source_index, item, item_type) in enumerate(raw_items):
         raw_call_id = _raw_call_id(item)
         item_id = item.get("id")
-        if raw_call_id is None and not (isinstance(item_id, str) and item_id):
+        is_null_tool_search_pair = (
+            event_index in null_tool_search_pairs or event_index in claimed_results
+        ) and item_type in {"tool_search_call", "tool_search_output"}
+        if (
+            raw_call_id is None
+            and not is_null_tool_search_pair
+            and not (isinstance(item_id, str) and item_id)
+        ):
             _issue(
                 issues,
                 "missing_server_tool_id",
@@ -477,7 +805,11 @@ def _normalize_server_items(
                 f"{item_type} has no id",
             )
 
-        if _is_server_result(item_type) and raw_call_id is None:
+        if (
+            is_result(item_type)
+            and raw_call_id is None
+            and not is_null_tool_search_pair
+        ):
             display_id = (
                 item_id
                 if isinstance(item_id, str) and item_id
@@ -492,7 +824,7 @@ def _normalize_server_items(
         else:
             display_id = _display_item_id(item, origin=origin, index=source_index)
 
-        if _is_server_result(item_type):
+        if is_result(item_type):
             if event_index in claimed_results:
                 continue
             pending.append(
@@ -512,10 +844,16 @@ def _normalize_server_items(
 
         result = _server_inline_result(item)
         order_index = source_index
-        paired_index = paired_results.get(event_index)
+        paired_index = paired_results.get(
+            event_index, null_tool_search_pairs.get(event_index)
+        )
         if paired_index is not None:
             result_source_index, result_item, _ = raw_items[paired_index]
             order_index = min(order_index, result_source_index)
+            if raw_call_id is None and not (isinstance(item_id, str) and item_id):
+                result_item_id = result_item.get("id")
+                if isinstance(result_item_id, str) and result_item_id:
+                    display_id = result_item_id
             # A standalone server result is itself the provider's result block.
             result = deepcopy(dict(result_item))
         pending.append(
@@ -543,6 +881,7 @@ def _normalize_items(
     origin: str,
     issues: list[AuditIssue],
     path: str,
+    execution_modes: Mapping[str, frozenset[str]],
     prior_completed_spawn_call_ids: Sequence[str] = (),
 ) -> tuple[
     list[Message],
@@ -565,6 +904,14 @@ def _normalize_items(
         )
         return [], [], [], list(dict.fromkeys(prior_completed_spawn_call_ids))
 
+    classifications = _classify_items(
+        raw_items,
+        origin=origin,
+        issues=issues,
+        path=path,
+        execution_modes=execution_modes,
+    )
+
     call_names: dict[tuple[str, str], list[str]] = {}
     call_indexes: dict[str, list[int]] = {}
     result_indexes: dict[str, list[int]] = {}
@@ -576,17 +923,17 @@ def _normalize_items(
         call_id = _raw_call_id(item)
         if call_id is None:
             continue
-        if item_type in _CLIENT_RESULT_TYPES:
+        classification = classifications.get(index)
+        if classification == "client_result":
             result_indexes.setdefault(call_id, []).append(index)
             continue
-        if item_type not in _CLIENT_CALL_TYPES:
+        if classification != "client_call" or not isinstance(item_type, str):
             continue
-        call_type = str(item_type)
-        name = item.get("name")
-        result_key = (f"{call_type}_output", call_id)
-        call_names.setdefault(result_key, []).append(
-            name if isinstance(name, str) else ""
-        )
+        call_type = item_type
+        name = _client_call_name(call_type, item)
+        result_type = _CLIENT_CALL_TO_RESULT.get(call_type)
+        if result_type is not None:
+            call_names.setdefault((result_type, call_id), []).append(name)
         call_indexes.setdefault(call_id, []).append(index)
         call_types_by_id.setdefault(call_id, set()).add(call_type)
 
@@ -616,6 +963,7 @@ def _normalize_items(
             continue
         item = dict(raw_item)
         item_type = item.get("type")
+        classification = classifications.get(index)
 
         if item_type == "agent_message":
             flush_assistant()
@@ -684,11 +1032,10 @@ def _normalize_items(
             current.reasoning = deepcopy(item)
             continue
 
-        if item_type in _CLIENT_CALL_TYPES:
+        if classification == "client_call" and isinstance(item_type, str):
             raw_call_id = _raw_call_id(item)
-            name_value = item.get("name")
             call_id = raw_call_id or _stable_missing_id(origin, index)
-            name = name_value if isinstance(name_value, str) else ""
+            name = _client_call_name(item_type, item)
             if raw_call_id is None:
                 _issue(
                     issues,
@@ -703,23 +1050,12 @@ def _normalize_items(
                     item_path,
                     f"{item_type} has no name",
                 )
-            if item_type == "custom_tool_call":
-                raw_input = item.get("input", "")
-                if not isinstance(raw_input, str):
-                    _issue(
-                        issues,
-                        "invalid_custom_tool_input",
-                        f"{item_path}.input",
-                        f"expected string; got {type(raw_input).__name__}",
-                    )
-                    raw_input = _as_string(raw_input)
-                arguments: Any = {"input": raw_input}
-            else:
-                arguments = _parse_arguments(
-                    item.get("arguments"),
-                    path=f"{item_path}.arguments",
-                    issues=issues,
-                )
+            arguments = _client_arguments(
+                item_type,
+                item,
+                path=item_path,
+                issues=issues,
+            )
             current.tool_calls.append(
                 ToolCall(
                     id=call_id,
@@ -728,7 +1064,7 @@ def _normalize_items(
             )
             continue
 
-        if item_type in _CLIENT_RESULT_TYPES:
+        if classification == "client_result" and isinstance(item_type, str):
             flush_assistant()
             raw_call_id = _raw_call_id(item)
             call_id = raw_call_id or _stable_missing_id(origin, index)
@@ -756,7 +1092,10 @@ def _normalize_items(
                     f"{item_type} does not match client call type(s) {actual_types}",
                 )
             else:
-                name = raw_name if isinstance(raw_name, str) else ""
+                result_call_type = _CLIENT_RESULT_TO_CALL.get(item_type)
+                name = _CLIENT_BUILTIN_NAMES.get(result_call_type or "", "")
+                if not name and isinstance(raw_name, str):
+                    name = _qualified_item_name(item)
             if not linked and not (raw_call_id and raw_call_id in call_types_by_id):
                 _issue(
                     issues,
@@ -791,7 +1130,7 @@ def _normalize_items(
             messages.append(
                 Message(
                     role="tool",
-                    content=output if isinstance(output, str) else _json(output),
+                    content=_client_result_content(item_type, item),
                     tool_call_id=call_id,
                     name=name,
                 )
@@ -799,7 +1138,7 @@ def _normalize_items(
             if (
                 raw_call_id is not None
                 and linked
-                and name == "spawn_agent"
+                and is_spawn_tool_name(name)
                 and len(call_indexes.get(raw_call_id, ())) == 1
                 and len(result_indexes.get(raw_call_id, ())) == 1
                 and call_indexes[raw_call_id][0] < index
@@ -809,8 +1148,14 @@ def _normalize_items(
                 completed_spawn_call_ids.append(raw_call_id)
             continue
 
-        if _is_server_call(item_type) or _is_server_result(item_type):
+        if classification in {"server_call", "server_result"}:
             server_items.append((index, item, str(item_type)))
+            continue
+
+        if _conditional_family(item_type) is not None:
+            # Classification already emitted the precise ambiguity/conflict.
+            # Preserve message boundaries around an unprojectable tool item.
+            flush_assistant()
             continue
 
         if item_type == "additional_tools":
@@ -852,9 +1197,15 @@ def _custom_parameters(tool: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _normalize_tools(
-    request: Mapping[str, Any], issues: list[AuditIssue]
-) -> list[ToolDefinition]:
-    candidates: list[tuple[Mapping[str, Any], str, str]] = []
+    request: Mapping[str, Any],
+    response_items: Sequence[Mapping[str, Any]],
+    issues: list[AuditIssue],
+) -> tuple[list[ToolDefinition], dict[str, frozenset[str]]]:
+    candidates: list[tuple[Mapping[str, Any], str | None, str, str | None]] = []
+    execution_modes: dict[str, set[str]] = {
+        "shell": set(),
+        "tool_search": set(),
+    }
     request_tools = request.get("tools", [])
     if request_tools is None:
         request_tools = []
@@ -869,6 +1220,11 @@ def _normalize_tools(
         )
         request_tools = []
 
+    def add_builtin_candidate(
+        tool: Mapping[str, Any], path: str, canonical_name: str
+    ) -> None:
+        candidates.append((tool, None, path, canonical_name))
+
     def add_candidates(tools: Iterable[Any], base_path: str) -> None:
         for index, raw_tool in enumerate(tools):
             if not isinstance(raw_tool, Mapping):
@@ -881,7 +1237,15 @@ def _normalize_tools(
                 continue
             tool_type = raw_tool.get("type")
             if tool_type in {"function", "custom"}:
-                candidates.append((raw_tool, "", f"{base_path}[{index}]"))
+                namespace = raw_tool.get("namespace")
+                candidates.append(
+                    (
+                        raw_tool,
+                        namespace if isinstance(namespace, str) else None,
+                        f"{base_path}[{index}]",
+                        None,
+                    )
+                )
             elif tool_type == "namespace":
                 namespace = raw_tool.get("name")
                 nested = raw_tool.get("tools", [])
@@ -911,8 +1275,9 @@ def _normalize_tools(
                         candidates.append(
                             (
                                 nested_tool,
-                                f"{namespace}.",
+                                namespace,
                                 f"{base_path}[{index}].tools[{nested_index}]",
+                                None,
                             )
                         )
                     else:
@@ -922,39 +1287,102 @@ def _normalize_tools(
                             f"{base_path}[{index}].tools[{nested_index}]",
                             "namespace member is not a function/custom tool",
                         )
-            # Hosted/server tool definitions intentionally do not enter tools.
+            elif tool_type == "tool_search":
+                if "execution" not in raw_tool:
+                    execution = _EXECUTION_SERVER
+                else:
+                    raw_execution = raw_tool.get("execution")
+                    execution = (
+                        str(raw_execution)
+                        if raw_execution in {_EXECUTION_CLIENT, _EXECUTION_SERVER}
+                        else None
+                    )
+                    if execution is None:
+                        _issue(
+                            issues,
+                            "ambiguous_tool_execution",
+                            f"{base_path}[{index}].execution",
+                            f"unsupported tool_search execution {raw_execution!r}",
+                        )
+                if execution is not None:
+                    execution_modes["tool_search"].add(execution)
+                    if execution == _EXECUTION_CLIENT:
+                        add_builtin_candidate(
+                            raw_tool, f"{base_path}[{index}]", "tool_search"
+                        )
+            elif tool_type == "shell":
+                environment = raw_tool.get("environment")
+                environment_type = (
+                    environment.get("type")
+                    if isinstance(environment, Mapping)
+                    else None
+                )
+                if environment_type == "local":
+                    execution_modes["shell"].add(_EXECUTION_CLIENT)
+                    add_builtin_candidate(raw_tool, f"{base_path}[{index}]", "shell")
+                elif environment_type in {"container_auto", "container_reference"}:
+                    execution_modes["shell"].add(_EXECUTION_SERVER)
+                else:
+                    _issue(
+                        issues,
+                        "ambiguous_tool_execution",
+                        f"{base_path}[{index}].environment",
+                        f"unsupported shell environment type {environment_type!r}",
+                    )
+            elif tool_type in {"computer", "computer_use_preview"}:
+                add_builtin_candidate(raw_tool, f"{base_path}[{index}]", "computer")
+            elif tool_type == "apply_patch":
+                add_builtin_candidate(raw_tool, f"{base_path}[{index}]", "apply_patch")
+            elif tool_type == "local_shell":
+                add_builtin_candidate(raw_tool, f"{base_path}[{index}]", "local_shell")
+            elif tool_type in _HOSTED_TOOL_TYPES:
+                # Provider-hosted definitions do not enter the client tool set.
+                continue
 
     add_candidates(request_tools, "request_body.tools")
-    request_input = request.get("input")
-    if isinstance(request_input, Sequence) and not isinstance(
-        request_input, (str, bytes, bytearray)
-    ):
-        for index, item in enumerate(request_input):
-            if not isinstance(item, Mapping) or item.get("type") != "additional_tools":
+
+    def add_item_tools(items: Any, base_path: str) -> None:
+        if not isinstance(items, Sequence) or isinstance(
+            items, (str, bytes, bytearray)
+        ):
+            return
+        for index, item in enumerate(items):
+            if not isinstance(item, Mapping) or item.get("type") not in {
+                "additional_tools",
+                "tool_search_output",
+            }:
                 continue
             additional = item.get("tools", [])
             if isinstance(additional, Sequence) and not isinstance(
                 additional, (str, bytes, bytearray)
             ):
-                add_candidates(additional, f"request_body.input[{index}].tools")
+                add_candidates(additional, f"{base_path}[{index}].tools")
             else:
+                issue_code = (
+                    "invalid_additional_tools"
+                    if item.get("type") == "additional_tools"
+                    else "invalid_tool_search_output"
+                )
                 _issue(
                     issues,
-                    "invalid_additional_tools",
-                    f"request_body.input[{index}].tools",
-                    "additional_tools.tools is not an array",
+                    issue_code,
+                    f"{base_path}[{index}].tools",
+                    f"{item.get('type')}.tools is not an array",
                 )
+
+    add_item_tools(request.get("input"), "request_body.input")
+    add_item_tools(response_items, "response.output")
 
     definitions: list[ToolDefinition] = []
     seen: set[str] = set()
-    for tool, namespace_prefix, tool_path in candidates:
-        name = tool.get("name")
+    for tool, namespace, tool_path, canonical_name in candidates:
+        name = canonical_name if canonical_name is not None else tool.get("name")
         if not isinstance(name, str) or not name:
             _issue(
                 issues, "missing_tool_definition_name", tool_path, "tool has no name"
             )
             continue
-        name = f"{namespace_prefix}{name}"
+        name = qualify_tool_name(namespace, name)
         description = tool.get("description", "")
         if not isinstance(description, str):
             _issue(
@@ -987,7 +1415,9 @@ def _normalize_tools(
         if signature not in seen:
             seen.add(signature)
             definitions.append(definition)
-    return definitions
+    return definitions, {
+        family: frozenset(modes) for family, modes in execution_modes.items()
+    }
 
 
 def _decode_event_data(
@@ -1696,18 +2126,6 @@ def parse_responses_capture(
         )
 
     request_input = request.get("input", [])
-    (
-        history,
-        history_server_tools,
-        history_agent_messages,
-        history_completed_spawn_ids,
-    ) = _normalize_items(
-        request_input,
-        origin="history",
-        issues=issues,
-        path="request_body.input",
-    )
-
     status_code_raw = capture.get("status_code")
     status_code = (
         status_code_raw
@@ -1736,6 +2154,19 @@ def parse_responses_capture(
         status_code=status_code,
         issues=issues,
     )
+    tools, execution_modes = _normalize_tools(request, response_items, issues)
+    (
+        history,
+        history_server_tools,
+        history_agent_messages,
+        history_completed_spawn_ids,
+    ) = _normalize_items(
+        request_input,
+        origin="history",
+        issues=issues,
+        path="request_body.input",
+        execution_modes=execution_modes,
+    )
     (
         response,
         response_server_tools,
@@ -1746,6 +2177,7 @@ def parse_responses_capture(
         origin="response",
         issues=issues,
         path="response.output",
+        execution_modes=execution_modes,
         prior_completed_spawn_call_ids=history_completed_spawn_ids,
     )
 
@@ -1809,7 +2241,6 @@ def parse_responses_capture(
     if not thread_id:
         _issue(issues, "missing_thread_id", "request_body", "capture has no thread id")
 
-    tools = _normalize_tools(request, issues)
     if transport_error:
         outcome = "transport_error"
         wire_complete = False

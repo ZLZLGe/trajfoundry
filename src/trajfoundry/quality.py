@@ -25,8 +25,8 @@ from .models import (
     TrajectoryNode,
     TypeMismatch,
 )
+from .tool_names import is_spawn_tool_name
 
-_SPAWN_NAMES = {"spawn_agent", "Agent"}
 _TOKEN_PATTERN = re.compile(r"[\u3400-\u9fff]|[A-Za-z0-9_]+|[^\w\s]", re.UNICODE)
 
 
@@ -278,7 +278,7 @@ def _spawn_call_ids(messages: list[Message]) -> list[str]:
         call.id
         for message in messages
         for call in (message.tool_calls or [])
-        if call.function.name in _SPAWN_NAMES
+        if is_spawn_tool_name(call.function.name)
     ]
 
 

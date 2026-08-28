@@ -21,6 +21,7 @@ from .models import (
     TrajectoryNode,
     TypeMismatch,
 )
+from .tool_names import is_spawn_tool_name
 
 
 class OutputContractError(ValueError):
@@ -418,7 +419,7 @@ def _message_completeness(
         for call in message.get("tool_calls", []):
             call_id = call["id"]
             call_name = call["function"]["name"]
-            if call_name in {"spawn_agent", "Agent"}:
+            if is_spawn_tool_name(call_name):
                 spawn_ids.append(call_id)
             if call_id in calls:
                 pairing_clean = False

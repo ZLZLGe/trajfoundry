@@ -1026,7 +1026,7 @@ def test_server_results_are_lossless_and_link_only_by_call_id() -> None:
                 "action": {"type": "search", "query": "missing id"},
             },
         ],
-        "tools": [],
+        "tools": [{"type": "shell", "environment": {"type": "container_auto"}}],
     }
 
     snapshot = _parse(
@@ -1085,7 +1085,7 @@ def test_orphan_server_result_does_not_infer_name_from_result_type() -> None:
             request_body={
                 "model": "gpt-test",
                 "input": [unnamed, explicitly_named],
-                "tools": [],
+                "tools": [{"type": "shell", "environment": {"type": "container_auto"}}],
             },
             response_body={"status": "completed", "output": []},
         )
@@ -1127,7 +1127,7 @@ def test_ambiguous_server_result_does_not_infer_name_from_result_type() -> None:
                     },
                     result,
                 ],
-                "tools": [],
+                "tools": [{"type": "shell", "environment": {"type": "container_auto"}}],
             },
             response_body={"status": "completed", "output": []},
         )
@@ -1149,7 +1149,7 @@ def test_missing_server_result_id_contains_origin_and_json_path() -> None:
             request_body={
                 "model": "gpt-test",
                 "input": [{"type": "shell_call_output", "output": "lost"}],
-                "tools": [],
+                "tools": [{"type": "shell", "environment": {"type": "container_auto"}}],
             },
             response_body={"status": "completed", "output": []},
         )
@@ -1518,7 +1518,11 @@ def test_nonstandard_json_constants_in_client_and_server_arguments_are_raw(
 ) -> None:
     snapshot = _parse(
         _capture(
-            request_body={"model": "gpt-test", "input": [], "tools": []},
+            request_body={
+                "model": "gpt-test",
+                "input": [],
+                "tools": [{"type": "shell", "environment": {"type": "container_auto"}}],
+            },
             response_body={
                 "status": "completed",
                 "output": [
