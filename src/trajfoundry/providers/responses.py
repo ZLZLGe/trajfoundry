@@ -2012,7 +2012,8 @@ def _identity_metadata(
         saw_codex_metadata = True
 
     # The encoded copies rank below explicit body values but above header-only
-    # aliases.  Conflicts are still surfaced regardless of priority.
+    # aliases.  Conflicts in trajectory identity fields are still surfaced
+    # regardless of priority.
     all_sources = [*direct_body_sources, *encoded_sources, *header_sources]
 
     aliases: dict[str, tuple[str, ...]] = {
@@ -2056,24 +2057,16 @@ def _identity_metadata(
                 f"conflicting {field}: {detail}",
             )
 
-    # A specific subagent kind (for example ``guardian``) is more useful than
-    # the generic thread_source value ``subagent``.
-    kind_candidates = values_for(
-        ("subagent_marker", "subagent_kind", "x-openai-subagent")
-    )
-    if kind_candidates:
-        identity["subagent_marker"] = kind_candidates[0][1]
-        distinct_kinds = {value for _, value in kind_candidates}
-        if len(distinct_kinds) > 1:
-            detail = "; ".join(
-                f"{source}={value!r}" for source, value in kind_candidates
-            )
-            _issue(
-                issues,
-                "metadata_conflict",
-                "subagent_marker",
-                f"conflicting subagent kinds: {detail}",
-            )
+    # These labels describe different aspects of sub-agent execution and may
+    # legitimately use different vocabularies.  Their transport copies are
+    # advisory, so select deterministically without comparing them or turning
+    # disagreement into a capture-level integrity failure.
+    explicit_markers = values_for(("subagent_marker",))
+    transport_markers = values_for(("x-openai-subagent",))
+    subagent_kinds = values_for(("subagent_kind",))
+    selected_markers = explicit_markers or transport_markers or subagent_kinds
+    if selected_markers:
+        identity["subagent_marker"] = selected_markers[0][1]
     else:
         thread_sources = values_for(("thread_source", "threadSource"))
         if thread_sources and thread_sources[0][1] not in {"user", "main"}:

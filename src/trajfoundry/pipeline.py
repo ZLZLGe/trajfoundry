@@ -38,7 +38,7 @@ from .streaming import streaming_prefix_leaves
 from .subagents import SubagentMountPlan, plan_subagent_mounts
 from .tool_names import is_spawn_tool_name
 
-NORMALIZER_REVISION = "2026-08-28.3"
+NORMALIZER_REVISION = "2026-08-28.4"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 

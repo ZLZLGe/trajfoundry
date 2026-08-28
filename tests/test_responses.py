@@ -1369,7 +1369,147 @@ def test_non_string_instructions_are_quarantinable_without_string_coercion() -> 
     assert snapshot.outcome == "capture_invalid"
 
 
-def test_whitelisted_headers_fill_identity_and_conflicts_are_reported() -> None:
+def test_distinct_subagent_labels_from_real_request_shape_do_not_conflict() -> None:
+    turn_metadata = {
+        "session_id": "session-1",
+        "thread_id": "child-thread",
+        "turn_id": "turn-1",
+        "parent_thread_id": "parent-thread",
+        "parent_turn_id": "parent-turn",
+        "subagent_kind": "thread_spawn",
+        "thread_source": "subagent",
+    }
+    capture = _capture(
+        request_body={
+            "model": "gpt-test",
+            "client_metadata": {
+                "session_id": "session-1",
+                "thread_id": "child-thread",
+                "turn_id": "turn-1",
+                "x-openai-subagent": "collab_spawn",
+                "x-codex-turn-metadata": json.dumps(turn_metadata),
+            },
+            "input": [],
+            "tools": [],
+        },
+        response_body={"status": "completed", "output": []},
+    )
+    capture["request_headers"] = {
+        "X-Codex-Turn-Metadata": json.dumps(turn_metadata),
+        "x-openai-subagent": "collab_spawn",
+    }
+
+    snapshot = _parse(capture)
+
+    assert snapshot.subagent_marker == "collab_spawn"
+    assert snapshot.outcome == "success"
+    assert snapshot.wire_complete is True
+    assert snapshot.issues == []
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["subagent_marker", "x-openai-subagent", "subagent_kind", "thread_source"],
+)
+def test_subagent_label_copies_use_source_priority_without_conflict(
+    field: str,
+) -> None:
+    body_turn_metadata = {
+        "session_id": "session-1",
+        "thread_id": "child-thread",
+        "turn_id": "turn-1",
+        field: "body-encoded",
+    }
+    header_turn_metadata = {
+        "session_id": "session-1",
+        "thread_id": "child-thread",
+        "turn_id": "turn-1",
+        field: "header-encoded",
+    }
+    capture = _capture(
+        request_body={
+            "model": "gpt-test",
+            "client_metadata": {
+                "session_id": "session-1",
+                "thread_id": "child-thread",
+                "turn_id": "turn-1",
+                field: "body-direct",
+                "x-codex-turn-metadata": json.dumps(body_turn_metadata),
+            },
+            "input": [],
+            "tools": [],
+        },
+        response_body={"status": "completed", "output": []},
+    )
+    capture["request_headers"] = {
+        "X-Codex-Turn-Metadata": json.dumps(header_turn_metadata)
+    }
+    if field == "x-openai-subagent":
+        capture["request_headers"][field] = "header-direct"
+
+    snapshot = _parse(capture)
+
+    assert snapshot.subagent_marker == "body-direct"
+    assert snapshot.outcome == "success"
+    assert snapshot.wire_complete is True
+    assert snapshot.issues == []
+
+
+@pytest.mark.parametrize(
+    ("labels", "expected"),
+    [
+        (
+            {
+                "subagent_marker": "explicit_spawn",
+                "x-openai-subagent": "collab_spawn",
+                "subagent_kind": "thread_spawn",
+                "thread_source": "subagent",
+            },
+            "explicit_spawn",
+        ),
+        (
+            {
+                "x-openai-subagent": "collab_spawn",
+                "subagent_kind": "thread_spawn",
+                "thread_source": "subagent",
+            },
+            "collab_spawn",
+        ),
+        (
+            {"subagent_kind": "thread_spawn", "thread_source": "subagent"},
+            "thread_spawn",
+        ),
+        ({"thread_source": "subagent"}, "subagent"),
+        ({"thread_source": "user"}, ""),
+        ({"thread_source": "main"}, ""),
+    ],
+)
+def test_subagent_marker_uses_field_priority(
+    labels: dict[str, str], expected: str
+) -> None:
+    snapshot = _parse(
+        _capture(
+            request_body={
+                "model": "gpt-test",
+                "client_metadata": {
+                    "session_id": "session-1",
+                    "thread_id": "thread-1",
+                    **labels,
+                },
+                "input": [],
+                "tools": [],
+            },
+            response_body={"status": "completed", "output": []},
+        )
+    )
+
+    assert snapshot.subagent_marker == expected
+    assert snapshot.outcome == "success"
+    assert snapshot.wire_complete is True
+    assert snapshot.issues == []
+
+
+def test_whitelisted_headers_fill_identity_and_report_thread_id_conflict() -> None:
     request = {
         "model": "gpt-test",
         "client_metadata": {
@@ -1405,7 +1545,12 @@ def test_whitelisted_headers_fill_identity_and_conflicts_are_reported() -> None:
     assert snapshot.parent_thread_id == "parent-1"
     assert snapshot.forked_from_thread_id == "fork-1"
     assert snapshot.subagent_marker == "guardian"
-    assert "metadata_conflict" in {issue.code for issue in snapshot.issues}
+    conflicts = [
+        issue for issue in snapshot.issues if issue.code == "metadata_conflict"
+    ]
+    assert len(conflicts) == 1
+    assert conflicts[0].path == "thread_id"
+    assert conflicts[0].severity == Severity.ERROR
     assert snapshot.outcome == "capture_invalid"
     assert "must-not-survive" not in snapshot.model_dump_json()
 
