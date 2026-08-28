@@ -5,7 +5,13 @@ import json
 import pytest
 
 from trajfoundry.audit_codes import RESPONSES_UNSUPPORTED_CALL_EVIDENCE
-from trajfoundry.models import AuditTag, Metadata, NormalizationAudit, TrajectoryNode
+from trajfoundry.models import (
+    AuditTag,
+    Metadata,
+    NormalizationAudit,
+    Severity,
+    TrajectoryNode,
+)
 from trajfoundry.providers.anthropic import (
     AnthropicCaptureError,
     parse_anthropic_capture,
@@ -41,7 +47,6 @@ def _parse(capture: dict):
         capture,
         source_path="/captures/example.json",
         source_sha256="a" * 64,
-        source_partition="dt=2026-08-16",
     )
 
 
@@ -802,3 +807,34 @@ def test_count_tokens_is_marked_as_non_trajectory_operation() -> None:
 def test_unknown_endpoint_is_rejected() -> None:
     with pytest.raises(AnthropicCaptureError):
         _parse(_capture(path="/v1/complete", response_body={}))
+
+
+def test_subagent_without_explicit_thread_id_ignores_session_header_fallback() -> None:
+    snapshot = _parse(
+        _capture(
+            request_body={
+                "model": "claude-test",
+                "metadata": {
+                    "parent_thread_id": "main-thread",
+                    "parent_turn_id": "turn-1",
+                    "subagent_marker": "collab_spawn",
+                },
+                "messages": [],
+            },
+            response_body={
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-test",
+                "stop_reason": "end_turn",
+                "content": [],
+            },
+        )
+    )
+
+    assert snapshot.thread_id == "__isolated_subagent__:/captures/example.json"
+    warning = next(
+        issue
+        for issue in snapshot.issues
+        if issue.code == "isolated_subagent_missing_thread_id"
+    )
+    assert warning.severity == Severity.WARNING

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from trajfoundry.aggregate import aggregate_snapshots
-from trajfoundry.models import Message, Snapshot
+from trajfoundry.models import FunctionCall, Message, Snapshot, ToolCall
 
 
 def user(content: str) -> Message:
@@ -17,7 +17,6 @@ def snapshot(
     history: list[Message],
     response: list[Message],
     *,
-    partition: str = "p",
     session: str = "s",
     thread: str = "t",
     provider: str = "openai",
@@ -28,7 +27,6 @@ def snapshot(
     return Snapshot(
         source_path=f"/{name}.json",
         source_sha256=name,
-        source_partition=partition,
         session_id=session,
         thread_id=thread,
         turn_id=name,
@@ -73,13 +71,23 @@ def test_real_branches_are_all_preserved() -> None:
     assert result.intermediate == (first,)
 
 
-def test_prefix_never_crosses_primary_group_or_semantic_configuration() -> None:
+def test_prefix_never_crosses_session_or_thread() -> None:
     q1, a1, q2 = user("q1"), assistant("a1"), user("q2")
     base = snapshot("base", [q1], [a1])
     variants = [
-        snapshot("partition", [q1, a1, q2], [assistant("a2")], partition="p2"),
         snapshot("session", [q1, a1, q2], [assistant("a2")], session="s2"),
         snapshot("thread", [q1, a1, q2], [assistant("a2")], thread="t2"),
+    ]
+
+    result = aggregate_snapshots([base, *variants])
+
+    assert len(result.leaves) == 1 + len(variants)
+    assert result.intermediate == ()
+
+
+def test_semantic_request_settings_do_not_block_proven_prefix() -> None:
+    q1, a1, q2 = user("q1"), assistant("a1"), user("q2")
+    variants = [
         snapshot(
             "provider",
             [q1, a1, q2],
@@ -96,10 +104,65 @@ def test_prefix_never_crosses_primary_group_or_semantic_configuration() -> None:
         ),
     ]
 
-    result = aggregate_snapshots([base, *variants])
+    for variant in variants:
+        base = snapshot("base", [q1], [a1])
+        result = aggregate_snapshots([base, variant])
+        assert result.leaves == (variant,)
+        assert result.intermediate == (base,)
 
-    assert len(result.leaves) == 1 + len(variants)
-    assert result.intermediate == ()
+
+def test_reasoning_differences_are_ignored_but_tool_results_are_not() -> None:
+    q1 = user("q1")
+    call = ToolCall(
+        id="call-1",
+        function=FunctionCall(name="exec", arguments={"cmd": "pwd"}),
+    )
+    response_form = Message(
+        role="assistant",
+        content="",
+        reasoning_content="summary",
+        reasoning={"type": "reasoning", "metadata": {"response_only": True}},
+        tool_calls=[call],
+    )
+    replay_form = response_form.model_copy(
+        update={
+            "reasoning_content": "",
+            "reasoning": {"type": "reasoning"},
+        }
+    )
+    short = snapshot("short", [q1], [response_form])
+    matching = snapshot(
+        "matching",
+        [
+            q1,
+            replay_form,
+            Message(role="tool", content="{}", tool_call_id="call-1", name="exec"),
+        ],
+        [assistant("done")],
+    )
+
+    assert aggregate_snapshots([short, matching]).intermediate == (short,)
+
+    completed = snapshot(
+        "completed",
+        [q1, replay_form],
+        [Message(role="tool", content="one", tool_call_id="call-1", name="exec")],
+    )
+    different_result = snapshot(
+        "different-result",
+        [
+            q1,
+            replay_form,
+            Message(role="tool", content="two", tool_call_id="call-1", name="exec"),
+            user("next"),
+        ],
+        [assistant("done")],
+    )
+    result = aggregate_snapshots([completed, different_result])
+    assert {item.source_path for item in result.leaves} == {
+        completed.source_path,
+        different_result.source_path,
+    }
 
 
 def test_complete_snapshot_must_prefix_later_history_not_later_response() -> None:

@@ -1,9 +1,10 @@
+import sqlite3
 from pathlib import Path
 
 import orjson
 
 from trajfoundry.export import OutputSet
-from trajfoundry.io import JsonlShardWriter, load_capture, source_partition
+from trajfoundry.io import JsonlShardWriter, load_capture
 from trajfoundry.models import (
     AuditTag,
     Message,
@@ -35,14 +36,12 @@ def test_capture_loader_drops_sensitive_headers(tmp_path: Path) -> None:
     capture = load_capture(path)
     assert capture["request_headers"] == {"x-openai-subagent": "collab_spawn"}
     assert "response_headers" not in capture
-    assert source_partition(tmp_path, path) == "v1/dt=x/partition"
 
 
 def test_state_round_trip_compresses_snapshot(tmp_path: Path) -> None:
     snapshot = Snapshot(
         source_path="v1/p/s/a.json",
         source_sha256="a" * 64,
-        source_partition="v1/p",
         session_id="s",
         thread_id="t",
         provider="openai",
@@ -60,7 +59,6 @@ def test_failed_reparse_removes_stale_snapshot(tmp_path: Path) -> None:
     snapshot = Snapshot(
         source_path="v1/p/s/a.json",
         source_sha256="a" * 64,
-        source_partition="v1/p",
         session_id="s",
         thread_id="t",
         provider="openai",
@@ -77,7 +75,6 @@ def test_completed_inventory_removes_deleted_sources(tmp_path: Path) -> None:
     snapshot = Snapshot(
         source_path="gone.json",
         source_sha256="a" * 64,
-        source_partition="p",
         session_id="s",
         thread_id="t",
         provider="openai",
@@ -90,6 +87,69 @@ def test_completed_inventory_removes_deleted_sources(tmp_path: Path) -> None:
         state.finish_scan()
         state.begin_scan("second")
         state.finish_scan()
+        assert state.capture_count() == 0
+        assert list(state.iter_snapshots()) == []
+
+
+def test_old_partitioned_state_is_rebuilt_before_resume(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE captures (
+                source_path TEXT PRIMARY KEY,
+                sha256 TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                endpoint TEXT NOT NULL DEFAULT '',
+                captured_at TEXT NOT NULL DEFAULT '',
+                scan_id TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE snapshots (
+                source_path TEXT PRIMARY KEY,
+                source_partition TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                captured_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE trajectories (
+                trajectory_id TEXT PRIMARY KEY,
+                disposition TEXT NOT NULL,
+                representative_key TEXT NOT NULL,
+                payload BLOB NOT NULL
+            );
+            CREATE TABLE trajectory_origins (
+                trajectory_id TEXT NOT NULL,
+                source_ref TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                captured_at TEXT NOT NULL,
+                disposition TEXT NOT NULL,
+                reason_codes TEXT NOT NULL,
+                PRIMARY KEY(trajectory_id,source_ref,sha256)
+            );
+            INSERT INTO captures(source_path,sha256,status)
+            VALUES('old.json','deadbeef','parsed');
+            INSERT INTO snapshots(
+                source_path,source_partition,session_id,thread_id,captured_at,payload
+            ) VALUES('old.json','old-partition','s','t','','not-a-current-snapshot');
+            """
+        )
+
+    with StateStore(path) as state:
+        columns = tuple(
+            row[1] for row in state.connection.execute("PRAGMA table_info(snapshots)")
+        )
+        version = state.connection.execute("PRAGMA user_version").fetchone()[0]
+        assert columns == (
+            "source_path",
+            "session_id",
+            "thread_id",
+            "captured_at",
+            "payload",
+        )
+        assert version == 1
         assert state.capture_count() == 0
         assert list(state.iter_snapshots()) == []
 

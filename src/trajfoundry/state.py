@@ -16,6 +16,15 @@ from .models import Snapshot, TrajectoryNode
 from .output_contract import parse_trajectory_record, project_trajectory
 from .quality import validate_derived_fields
 
+STATE_SCHEMA_VERSION = 1
+_SNAPSHOT_COLUMNS = (
+    "source_path",
+    "session_id",
+    "thread_id",
+    "captured_at",
+    "payload",
+)
+
 
 class StateStore:
     def __init__(self, path: Path):
@@ -23,6 +32,31 @@ class StateStore:
         self.connection = sqlite3.connect(path)
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=NORMAL")
+        stored_version = int(
+            self.connection.execute("PRAGMA user_version").fetchone()[0]
+        )
+        if stored_version > STATE_SCHEMA_VERSION:
+            self.connection.close()
+            raise RuntimeError(
+                "state database schema is newer than this TrajFoundry version: "
+                f"{stored_version} > {STATE_SCHEMA_VERSION}"
+            )
+        existing_tables = {
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        snapshot_columns = self._table_columns("snapshots")
+        had_cached_state = bool(
+            existing_tables
+            & {"captures", "snapshots", "trajectories", "trajectory_origins"}
+        )
+        if had_cached_state and (
+            stored_version != STATE_SCHEMA_VERSION
+            or snapshot_columns != _SNAPSHOT_COLUMNS
+        ):
+            self._rebuild_cached_state(existing_tables)
         self.connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS meta (
@@ -40,14 +74,13 @@ class StateStore:
             );
             CREATE TABLE IF NOT EXISTS snapshots (
                 source_path TEXT PRIMARY KEY,
-                source_partition TEXT NOT NULL,
                 session_id TEXT NOT NULL,
                 thread_id TEXT NOT NULL,
                 captured_at TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_snapshots_group
-            ON snapshots(source_partition, session_id, thread_id, captured_at, source_path);
+            ON snapshots(session_id, thread_id, captured_at, source_path);
             CREATE TABLE IF NOT EXISTS trajectories (
                 trajectory_id TEXT PRIMARY KEY,
                 disposition TEXT NOT NULL,
@@ -68,7 +101,30 @@ class StateStore:
         self._ensure_column("captures", "endpoint", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("captures", "captured_at", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("captures", "scan_id", "TEXT NOT NULL DEFAULT ''")
+        self.connection.execute(f"PRAGMA user_version={STATE_SCHEMA_VERSION}")
+        self.connection.commit()
         self._scan_id: str | None = None
+
+    def _table_columns(self, table: str) -> tuple[str, ...]:
+        return tuple(
+            str(row[1])
+            for row in self.connection.execute(f"PRAGMA table_info({table})")
+        )
+
+    def _rebuild_cached_state(self, existing_tables: set[str]) -> None:
+        """Discard caches whose payload/schema cannot satisfy the current model.
+
+        ``captures`` must be cleared together with ``snapshots``.  Otherwise a
+        resumed scan would trust the old ``parsed`` marker and never recreate
+        the snapshot that was removed during the schema transition.
+        """
+
+        with self.connection:
+            self.connection.execute("DROP INDEX IF EXISTS idx_snapshots_group")
+            self.connection.execute("DROP TABLE IF EXISTS snapshots")
+            for table in ("trajectory_origins", "trajectories", "captures"):
+                if table in existing_tables:
+                    self.connection.execute(f"DELETE FROM {table}")
 
     def _ensure_column(self, table: str, column: str, declaration: str) -> None:
         columns = {
@@ -143,10 +199,9 @@ class StateStore:
             self.connection.execute(
                 """
                 INSERT INTO snapshots(
-                    source_path,source_partition,session_id,thread_id,captured_at,payload
-                ) VALUES(?,?,?,?,?,?)
+                    source_path,session_id,thread_id,captured_at,payload
+                ) VALUES(?,?,?,?,?)
                 ON CONFLICT(source_path) DO UPDATE SET
-                    source_partition=excluded.source_partition,
                     session_id=excluded.session_id,
                     thread_id=excluded.thread_id,
                     captured_at=excluded.captured_at,
@@ -154,7 +209,6 @@ class StateStore:
                 """,
                 (
                     snapshot.source_path,
-                    snapshot.source_partition,
                     snapshot.session_id,
                     snapshot.thread_id,
                     snapshot.captured_at,
@@ -219,23 +273,24 @@ class StateStore:
                 ),
             )
 
-    def groups(self) -> Iterator[tuple[str, str, str]]:
+    def groups(self) -> Iterator[tuple[str, str]]:
         rows = self.connection.execute(
             """
-            SELECT DISTINCT source_partition,session_id,thread_id FROM snapshots
-            ORDER BY source_partition,session_id,thread_id
+            SELECT DISTINCT session_id,thread_id FROM snapshots
+            ORDER BY session_id,thread_id
             """
         )
         yield from rows
 
-    def sessions(self) -> Iterator[tuple[str, str]]:
+    def sessions(self) -> Iterator[str]:
         rows = self.connection.execute(
             """
-            SELECT DISTINCT source_partition,session_id FROM snapshots
-            ORDER BY source_partition,session_id
+            SELECT DISTINCT session_id FROM snapshots
+            ORDER BY session_id
             """
         )
-        yield from rows
+        for (session_id,) in rows:
+            yield session_id
 
     @staticmethod
     def _decode_snapshot(payload: str | bytes) -> Snapshot:
@@ -243,44 +298,40 @@ class StateStore:
             return Snapshot.model_validate_json(payload)
         return Snapshot.model_validate_json(zlib.decompress(payload))
 
-    def snapshots_for_session(
-        self, source_partition: str, session_id: str
-    ) -> Iterator[Snapshot]:
+    def snapshots_for_session(self, session_id: str) -> Iterator[Snapshot]:
         rows = self.connection.execute(
             """
             SELECT payload FROM snapshots
-            WHERE source_partition=? AND session_id=?
+            WHERE session_id=?
             ORDER BY thread_id,captured_at,source_path
             """,
-            (source_partition, session_id),
+            (session_id,),
         )
         for (payload,) in rows:
             yield self._decode_snapshot(payload)
 
-    def threads_for_session(
-        self, source_partition: str, session_id: str
-    ) -> Iterator[str]:
+    def threads_for_session(self, session_id: str) -> Iterator[str]:
         rows = self.connection.execute(
             """
             SELECT DISTINCT thread_id FROM snapshots
-            WHERE source_partition=? AND session_id=? AND thread_id != ''
+            WHERE session_id=? AND thread_id != ''
             ORDER BY thread_id
             """,
-            (source_partition, session_id),
+            (session_id,),
         )
         for (thread_id,) in rows:
             yield thread_id
 
     def snapshots_for_thread(
-        self, source_partition: str, session_id: str, thread_id: str
+        self, session_id: str, thread_id: str
     ) -> Iterator[Snapshot]:
         rows = self.connection.execute(
             """
             SELECT payload FROM snapshots
-            WHERE source_partition=? AND session_id=? AND thread_id=?
+            WHERE session_id=? AND thread_id=?
             ORDER BY captured_at,source_path
             """,
-            (source_partition, session_id, thread_id),
+            (session_id, thread_id),
         )
         for (payload,) in rows:
             yield self._decode_snapshot(payload)
@@ -478,7 +529,8 @@ class StateStore:
 
     def iter_snapshots(self) -> Iterator[Snapshot]:
         rows = self.connection.execute(
-            "SELECT payload FROM snapshots ORDER BY source_partition,session_id,thread_id,captured_at,source_path"
+            "SELECT payload FROM snapshots "
+            "ORDER BY session_id,thread_id,captured_at,source_path"
         )
         for (payload,) in rows:
             yield self._decode_snapshot(payload)

@@ -46,7 +46,6 @@ def _parse(capture: dict):
         capture,
         source_path="/captures/one.json",
         source_sha256="abc123",
-        source_partition="dt=2026-08-27",
     )
 
 
@@ -1355,3 +1354,41 @@ def test_nonstandard_json_constants_in_client_and_server_arguments_are_raw(
     assert snapshot.response[0].tool_calls
     assert snapshot.response[0].tool_calls[0].function.arguments == {"raw": constant}
     assert snapshot.server_tool_calls[0].arguments == {"raw": constant}
+
+
+def test_subagent_without_explicit_thread_id_is_isolated() -> None:
+    snapshot = _parse(
+        _capture(
+            request_body={
+                "model": "gpt-test",
+                "client_metadata": {
+                    "session_id": "session-1",
+                    "parent_thread_id": "main-thread",
+                    "parent_turn_id": "turn-1",
+                    "subagent_marker": "collab_spawn",
+                },
+                "input": [],
+                "tools": [],
+            },
+            response_body={"status": "completed", "output": []},
+        )
+    )
+
+    assert snapshot.thread_id == "__isolated_subagent__:/captures/one.json"
+    issue = next(
+        issue
+        for issue in snapshot.issues
+        if issue.code == "isolated_subagent_missing_thread_id"
+    )
+    assert issue.severity == Severity.WARNING
+
+
+def test_main_thread_without_explicit_thread_id_uses_session_id() -> None:
+    snapshot = _parse(
+        _capture(
+            request_body={"model": "gpt-test", "input": [], "tools": []},
+            response_body={"status": "completed", "output": []},
+        )
+    )
+
+    assert snapshot.thread_id == "capture-session"

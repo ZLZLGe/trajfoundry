@@ -54,12 +54,24 @@ timestamp changes.
 - Only a successful, structurally complete terminal response has
   `wire_complete=true`. API errors, transport failures, SSE gaps, truncation,
   and invalid captures are quarantined.
-- Cumulative snapshots are isolated by
-  `(source_partition, session_id, thread_id)` and semantic request settings.
-  A snapshot is suppressed only when its complete transcript is an exact prefix
-  of a later request history. Every divergent maximal leaf is retained.
-- Prefix aggregation uses an exact-message trie. Memory grows with the unique
-  transcript and active branches, not with all repeated cumulative histories.
+- `--input` defines the dataset boundary. Cumulative snapshots are grouped only
+  by `(session_id, thread_id)`; storage directories are provenance, not
+  trajectory identity. A snapshot is suppressed only when its complete
+  transcript is an exact prefix of a later request history. Every divergent
+  maximal leaf is retained.
+- Prefix matching compares stable conversational fields: role and content for
+  system/developer/user messages; role, content, and tool calls for assistant
+  messages; and role, call ID, name, and content for tool results. Reasoning
+  payloads are preserved in output but deliberately excluded from prefix
+  identity because response and replay envelopes can differ.
+- Prefix aggregation uses a canonical-message trie. SHA-256 is only a lookup
+  accelerator; canonical token bytes remain the equality authority. Memory
+  grows with the unique transcript and active branches, not with all repeated
+  cumulative histories.
+- Final messages, instructions, model, harness, and termination are taken from
+  the selected leaf capture. Prefix contributors never backfill or rewrite the
+  leaf conversation; only tool definitions, server-tool records, agent-message
+  evidence, audit issues, and lineage are merged.
 - Equal terminal retransmissions are merged only when their complete flat
   semantics and routing identity match; their lineage is unioned, while tool,
   termination, and linkage variants remain separate.
@@ -67,8 +79,7 @@ timestamp changes.
   richer compatible definition wins deterministically; incompatible same-name
   schemas quarantine the trajectory.
 - Cross-`session_id` tool-definition aggregation is intentionally deferred;
-  the current aggregation boundary remains
-  `(source_partition, session_id, thread_id)`.
+  the current aggregation boundary remains `(session_id, thread_id)`.
 - Server tools remain in `server_tool_calls` and never become client tools or
   tool messages. Their provider result blocks are preserved verbatim, and a
   missing result is represented explicitly as `"result": null`.
@@ -140,7 +151,12 @@ python -m compileall -q src tests
 The implementation has also been smoke-tested on 56 real captures (43
 Anthropic and 13 Responses), including successful SSE, API failures,
 `count_tokens`, prefix aggregation, validation, and byte-stable resume output.
-This smoke test is not a substitute for the first full production run.
+The prefix rules were additionally checked on the first five complete session
+directories in deterministic path order: 599 captures parsed successfully,
+545 intermediate snapshots collapsed to 24 leaves, validation passed, and a
+resume run reproduced byte-identical trajectory and lineage shards. This
+acceptance run is not a substitute for rerunning the earlier 5,000-capture
+audit or for a full production run.
 
 ## Project ledger
 

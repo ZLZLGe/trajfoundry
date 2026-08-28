@@ -1655,7 +1655,6 @@ def parse_responses_capture(
     *,
     source_path: str,
     source_sha256: str,
-    source_partition: str,
 ) -> Snapshot:
     """Parse one freerouter ``/v1/responses`` capture.
 
@@ -1761,12 +1760,32 @@ def parse_responses_capture(
             "session_id",
             "capture session_id conflicts with request metadata session_id",
         )
-    thread_id = identity.get("thread_id", "") or session_id
     turn_id = identity.get("turn_id", "")
     parent_thread_id = identity.get("parent_thread_id", "")
     parent_turn_id = identity.get("parent_turn_id", "")
     forked_from_thread_id = identity.get("forked_from_thread_id", "")
     subagent_marker = identity.get("subagent_marker", "")
+    explicit_thread_id = identity.get("thread_id", "")
+    has_subagent_linkage = bool(
+        subagent_marker or parent_thread_id or parent_turn_id or forked_from_thread_id
+    )
+    if explicit_thread_id:
+        thread_id = explicit_thread_id
+    elif has_subagent_linkage:
+        # A session id identifies the whole run, not a particular child.  A
+        # per-capture namespace is intentionally conservative: without a real
+        # child thread id we may retain multiple orphans, but can never merge a
+        # child into the main transcript or into an unrelated child.
+        thread_id = f"__isolated_subagent__:{source_path}"
+        _issue(
+            issues,
+            "isolated_subagent_missing_thread_id",
+            "request_body",
+            "sub-agent linkage has no explicit thread id; capture was isolated",
+            severity=Severity.WARNING,
+        )
+    else:
+        thread_id = session_id
 
     request_model = request.get("model")
     model = request_model if isinstance(request_model, str) else response_model
@@ -1797,7 +1816,6 @@ def parse_responses_capture(
     return Snapshot(
         source_path=source_path,
         source_sha256=source_sha256,
-        source_partition=source_partition,
         session_id=session_id,
         thread_id=thread_id,
         turn_id=turn_id,

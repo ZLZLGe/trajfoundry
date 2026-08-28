@@ -15,7 +15,7 @@ from typing import Any, BinaryIO
 
 from .canonical import canonical_json, semantic_payload, trajectory_id
 from .export import SCHEMA_VERSION, OutputSet
-from .io import decode_capture, discover_captures, read_capture_bytes, source_partition
+from .io import decode_capture, discover_captures, read_capture_bytes
 from .models import (
     AgentMessageRecord,
     AuditIssue,
@@ -37,7 +37,7 @@ from .state import StateStore
 from .streaming import streaming_prefix_leaves
 from .subagents import SubagentMountPlan, plan_subagent_mounts
 
-NORMALIZER_REVISION = "2026-08-27.6"
+NORMALIZER_REVISION = "2026-08-28.1"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 
@@ -148,7 +148,13 @@ def config_hash(config: PipelineConfig) -> str:
     value = {
         "normalizer_revision": NORMALIZER_REVISION,
         "schema_version": SCHEMA_VERSION,
-        "aggregation_scope": ["source_partition", "session_id", "thread_id"],
+        "aggregation_scope": ["session_id", "thread_id"],
+        "prefix_message_fields": {
+            "system_developer_user": ["role", "content"],
+            "assistant": ["role", "content", "tool_calls"],
+            "tool": ["role", "tool_call_id", "name", "content"],
+        },
+        "leaf_messages": "request_history_plus_response_without_contributor_backfill",
         "developer_messages": "preserve",
         "instructions": "trajectory_field",
         "strict_wire_completion": True,
@@ -163,7 +169,6 @@ def parse_capture(
     *,
     source_path: str,
     source_sha256: str,
-    partition: str,
 ) -> Snapshot:
     endpoint_value = capture.get("path")
     endpoint = (
@@ -174,7 +179,6 @@ def parse_capture(
     arguments = {
         "source_path": source_path,
         "source_sha256": source_sha256,
-        "source_partition": partition,
     }
     if endpoint in {"/v1/responses", "/responses"}:
         return parse_responses_capture(capture, **arguments)
@@ -249,16 +253,33 @@ def _finish_tools(
 
 def _merge_contributor_metadata(
     snapshots: Iterable[Snapshot],
-) -> tuple[list[ToolDefinition], list[ServerToolCall], list[AuditIssue]]:
+) -> tuple[
+    list[ToolDefinition],
+    list[ServerToolCall],
+    list[AgentMessageRecord],
+    list[AuditIssue],
+]:
     tool_candidates: dict[str, list[ToolDefinition]] = defaultdict(list)
     server_calls: list[ServerToolCall] = []
     server_slots: dict[tuple[str, int], int] = {}
     server_variants: set[tuple[str, int, bytes]] = set()
     server_issues: list[AuditIssue] = []
+    agent_messages: dict[bytes, AgentMessageRecord] = {}
+    contributor_issues: dict[bytes, AuditIssue] = {}
     for snapshot in snapshots:
         for definition in snapshot.tools:
             if definition not in tool_candidates[definition.name]:
                 tool_candidates[definition.name].append(definition)
+        for record in snapshot.agent_messages:
+            projected = AgentMessageRecord(
+                origin=record.origin,
+                item_index=record.item_index,
+                item=record.item,
+            )
+            key = canonical_json(projected.model_dump(mode="json", exclude_none=False))
+            agent_messages.setdefault(key, projected)
+        for issue in snapshot.issues:
+            contributor_issues.setdefault(_issue_key(issue), issue)
         occurrences: dict[str, int] = defaultdict(int)
         for call in snapshot.server_tool_calls:
             ordinal = occurrences[call.id]
@@ -322,7 +343,40 @@ def _merge_contributor_metadata(
                 server_variants.add(variant)
                 server_calls.append(call.model_copy(deep=True))
     tools, tool_issues = _finish_tools(tool_candidates)
-    return tools, server_calls, [*tool_issues, *server_issues]
+    return (
+        tools,
+        server_calls,
+        [agent_messages[key] for key in sorted(agent_messages)],
+        [
+            *[contributor_issues[key] for key in sorted(contributor_issues)],
+            *tool_issues,
+            *server_issues,
+        ],
+    )
+
+
+def _contributor_leaf_warnings(
+    leaf: Snapshot, contributors: Iterable[Snapshot]
+) -> list[AuditIssue]:
+    warnings: list[AuditIssue] = []
+    for field in ("instructions", "model", "harness", "termination"):
+        leaf_value = getattr(leaf, field)
+        variants = {getattr(snapshot, field) for snapshot in contributors}
+        if variants <= {leaf_value}:
+            continue
+        warnings.append(
+            AuditIssue(
+                code=f"contributor_{field}_changed",
+                stage="aggregation",
+                severity=Severity.WARNING,
+                path=f"/{field}",
+                detail=(
+                    f"prefix contributors contain {field} values different "
+                    "from the leaf; the leaf value was retained"
+                ),
+            )
+        )
+    return warnings
 
 
 def _initial_audit(issues: Sequence[AuditIssue]) -> NormalizationAudit:
@@ -339,20 +393,22 @@ def _initial_audit(issues: Sequence[AuditIssue]) -> NormalizationAudit:
 def _trajectory_from_leaf(
     leaf: Snapshot, contributors: Iterable[Snapshot]
 ) -> TrajectoryNode:
-    tools, server_calls, contributor_issues = _merge_contributor_metadata(contributors)
-    issues = [*leaf.issues, *contributor_issues]
+    contributor_list = list(contributors)
+    if not any(item.source_path == leaf.source_path for item in contributor_list):
+        contributor_list.append(leaf)
+    tools, server_calls, agent_messages, contributor_issues = (
+        _merge_contributor_metadata(contributor_list)
+    )
+    issues = _merged_issues(
+        leaf.issues,
+        contributor_issues,
+        _contributor_leaf_warnings(leaf, contributor_list),
+    )
     basename = Path(leaf.source_path).name
     return TrajectoryNode(
         messages=[*leaf.history, *leaf.response],
         tools=tools,
-        agent_messages=[
-            AgentMessageRecord(
-                origin=record.origin,
-                item_index=record.item_index,
-                item=record.item,
-            )
-            for record in leaf.agent_messages
-        ],
+        agent_messages=agent_messages,
         instructions=leaf.instructions,
         termination=leaf.termination,
         harness=leaf.harness,
@@ -370,7 +426,6 @@ def _trajectory_from_leaf(
 
 def _snapshot_identity(snapshot: Snapshot) -> tuple[str, ...]:
     return (
-        snapshot.source_partition,
         snapshot.session_id,
         snapshot.thread_id,
         snapshot.turn_id,
@@ -552,7 +607,6 @@ def _flat_semantic_key(snapshot: Snapshot, node: TrajectoryNode) -> str:
         if call.function.name in {"spawn_agent", "Agent"}
     ]
     payload = {
-        "source_partition": snapshot.source_partition,
         "session_id": snapshot.session_id,
         "thread_id": snapshot.thread_id,
         "parent_thread_id": snapshot.parent_thread_id,
@@ -708,16 +762,14 @@ def _materialize_tree(
 
 def _build_trajectories(state: StateStore, stats: PipelineStats) -> None:
     state.clear_trajectories()
-    for partition, session_id in state.sessions():
+    for session_id in state.sessions():
         stats.sessions += 1
         flat_leaves: dict[str, _FlatLeaf] = {}
         evidence_by_path: dict[str, Snapshot] = {}
-        for thread_id in state.threads_for_session(partition, session_id):
+        for thread_id in state.threads_for_session(session_id):
             eligible = (
                 snapshot
-                for snapshot in state.snapshots_for_thread(
-                    partition, session_id, thread_id
-                )
+                for snapshot in state.snapshots_for_thread(session_id, thread_id)
                 if _eligible(snapshot)
             )
             result = streaming_prefix_leaves(eligible)
@@ -966,7 +1018,6 @@ def normalize(config: PipelineConfig) -> PipelineStats:
                     capture,
                     source_path=source_ref,
                     source_sha256=digest,
-                    partition=source_partition(input_root, path),
                 )
                 state.put_snapshot(snapshot, endpoint=endpoint)
                 stats.parsed += 1

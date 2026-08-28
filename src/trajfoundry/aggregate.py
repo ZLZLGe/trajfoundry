@@ -9,15 +9,14 @@ prefix relationship.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 
-from .models import Message, Snapshot
+from .models import Snapshot
+from .streaming import message_prefix_token
 
-GroupKey = tuple[str, str, str]
-CompatibilityKey = tuple[str, str, str, str]
+GroupKey = tuple[str, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,21 +58,6 @@ class AggregationResult(Sequence[Snapshot]):
         return self.leaves[index]
 
 
-def _message_token(message: Message) -> bytes:
-    """Return a stable structural representation of one canonical message."""
-
-    # sort_keys is important for arbitrary JSON objects in function arguments
-    # and reasoning details.  Python/Pydantic equality treats object key order
-    # as immaterial, so the prefix index must do the same.
-    value = message.model_dump(mode="json", exclude_none=False)
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-
-
 def _advance_digest(state: object, token: bytes) -> object:
     # ``hashlib`` hash objects intentionally have no useful public protocol
     # type before Python 3.12.  Keeping this tiny helper local avoids a runtime
@@ -91,20 +75,8 @@ def _sequence_digest(tokens: Sequence[bytes]) -> bytes:
     return state.digest()
 
 
-def _compatibility_key(snapshot: Snapshot) -> CompatibilityKey:
-    # These are semantic inputs to a trajectory.  A change in any one starts a
-    # new trajectory even when the messages happen to be identical.
-    return (
-        snapshot.provider,
-        snapshot.model,
-        snapshot.harness,
-        snapshot.instructions,
-    )
-
-
 def _group_key(snapshot: Snapshot) -> GroupKey:
     return (
-        snapshot.source_partition,
         snapshot.session_id,
         snapshot.thread_id,
     )
@@ -116,7 +88,6 @@ def _stable_snapshot_key(
     """Order outputs independently of discovery/worker completion order."""
 
     return (
-        snapshot.source_partition,
         snapshot.session_id,
         snapshot.thread_id,
         snapshot.captured_at,
@@ -133,8 +104,7 @@ def aggregate_snapshots(snapshots: Sequence[Snapshot]) -> AggregationResult:
 
     ``A`` is suppressed only when all of the following are true:
 
-    * ``A`` and ``B`` have the same ``(partition, session, thread)``;
-    * provider, model, harness, and instructions are exactly equal;
+    * ``A`` and ``B`` have the same ``(session, thread)``;
     * ``A.history + A.response`` equals the beginning of ``B.history``;
     * ``B`` has a strictly longer complete transcript.
 
@@ -152,21 +122,19 @@ def aggregate_snapshots(snapshots: Sequence[Snapshot]) -> AggregationResult:
     full_tokens: list[tuple[bytes, ...]] = []
     full_digests: list[bytes] = []
     for snapshot in items:
-        history = tuple(_message_token(message) for message in snapshot.history)
-        response = tuple(_message_token(message) for message in snapshot.response)
+        history = tuple(message_prefix_token(message) for message in snapshot.history)
+        response = tuple(message_prefix_token(message) for message in snapshot.response)
         full = history + response
         history_tokens.append(history)
         full_tokens.append(full)
         full_digests.append(_sequence_digest(full))
 
-    # Full transcripts are indexed once.  The primary group and compatibility
-    # tuple are part of the key, making cross-thread/config matching impossible
-    # by construction.
-    index: dict[tuple[GroupKey, CompatibilityKey, int, bytes], list[int]] = {}
+    # Full transcripts are indexed once. The session/thread group is part of
+    # the key, making cross-thread matching impossible by construction.
+    index: dict[tuple[GroupKey, int, bytes], list[int]] = {}
     for input_index, snapshot in enumerate(items):
         key = (
             _group_key(snapshot),
-            _compatibility_key(snapshot),
             len(full_tokens[input_index]),
             full_digests[input_index],
         )
@@ -197,7 +165,6 @@ def aggregate_snapshots(snapshots: Sequence[Snapshot]) -> AggregationResult:
         # leaf if upstream sends an empty first response.
         empty_key = (
             _group_key(snapshot),
-            _compatibility_key(snapshot),
             0,
             state.digest(),
         )
@@ -212,7 +179,6 @@ def aggregate_snapshots(snapshots: Sequence[Snapshot]) -> AggregationResult:
                 continue
             lookup_key = (
                 _group_key(snapshot),
-                _compatibility_key(snapshot),
                 prefix_length,
                 state.digest(),
             )
@@ -259,7 +225,6 @@ def maximal_prefix_leaves(snapshots: Sequence[Snapshot]) -> tuple[Snapshot, ...]
 
 __all__ = [
     "AggregationResult",
-    "CompatibilityKey",
     "GroupKey",
     "PrefixLink",
     "aggregate_snapshots",

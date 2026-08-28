@@ -65,7 +65,6 @@ def snapshot(
     return Snapshot(
         source_path=f"/{name}.json",
         source_sha256=name,
-        source_partition="p",
         session_id="s",
         thread_id=thread,
         turn_id=turn,

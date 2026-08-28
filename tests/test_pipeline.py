@@ -8,10 +8,12 @@ import pytest
 
 from trajfoundry.models import (
     AgentMessageEvidence,
+    AuditIssue,
     AuditTag,
     FunctionCall,
     Message,
     ServerToolCall,
+    Severity,
     Snapshot,
     ToolCall,
     ToolDefinition,
@@ -132,7 +134,11 @@ def test_end_to_end_prefix_tool_union_resume_and_deleted_input(tmp_path: Path) -
         },
     }
     first_path = session / "a.json"
-    second_path = session / "b.json"
+    # The same logical session can be physically split below different storage
+    # parents.  Input location is provenance, not an aggregation boundary.
+    second_path = (
+        input_root / "v1" / "dt=2026-08-27" / "other-partition" / "session" / "b.json"
+    )
     _write(
         first_path,
         _capture(
@@ -388,7 +394,6 @@ def test_server_tool_duplicate_results_survive_contributor_merge() -> None:
     snapshot = Snapshot(
         source_path="one.json",
         source_sha256="a" * 64,
-        source_partition="partition",
         session_id="session",
         thread_id="thread",
         provider="anthropic",
@@ -412,7 +417,7 @@ def test_server_tool_duplicate_results_survive_contributor_merge() -> None:
         ],
     )
 
-    _, server_calls, _ = _merge_contributor_metadata([snapshot])
+    _, server_calls, _, _ = _merge_contributor_metadata([snapshot])
 
     assert [call.result for call in server_calls] == [
         {"type": "web_search_tool_result", "content": ["first"]},
@@ -424,7 +429,6 @@ def test_conflicting_replayed_server_results_are_preserved_and_quarantined() -> 
     base = Snapshot(
         source_path="first.json",
         source_sha256="a" * 64,
-        source_partition="partition",
         session_id="session",
         thread_id="thread",
         provider="anthropic",
@@ -457,10 +461,111 @@ def test_conflicting_replayed_server_results_are_preserved_and_quarantined() -> 
         }
     )
 
-    _, server_calls, issues = _merge_contributor_metadata([base, replay])
+    _, server_calls, _, issues = _merge_contributor_metadata([base, replay])
 
     assert len(server_calls) == 2
     assert {issue.code for issue in issues} == {"duplicate_server_tool_result"}
+
+
+def test_leaf_messages_stay_exact_while_contributor_evidence_is_unioned() -> None:
+    question = Message(role="user", content="q")
+    earlier_assistant = Message(
+        role="assistant",
+        content="",
+        reasoning_content="summary",
+        reasoning={
+            "type": "reasoning",
+            "id": "rs-1",
+            "encrypted_content": "opaque",
+            "metadata": {"response_only": True},
+        },
+    )
+    replayed_assistant = earlier_assistant.model_copy(
+        update={
+            "reasoning_content": "",
+            "reasoning": {
+                "type": "reasoning",
+                "id": "rs-1",
+                "encrypted_content": "opaque",
+            },
+        }
+    )
+    contributor = Snapshot(
+        source_path="old/short.json",
+        source_sha256="a" * 64,
+        session_id="session",
+        thread_id="thread",
+        provider="openai",
+        operation="responses",
+        outcome="success",
+        model="old-model",
+        harness="old-harness",
+        instructions="old instructions",
+        termination="old termination",
+        history=[question],
+        response=[earlier_assistant],
+        tools=[ToolDefinition(name="old-tool")],
+        agent_messages=[
+            AgentMessageEvidence(
+                origin="response",
+                item_index=1,
+                item={"type": "agent_message", "id": "old-message"},
+            )
+        ],
+        issues=[
+            AuditIssue(
+                code="contributor_evidence",
+                stage="test",
+                severity=Severity.WARNING,
+            )
+        ],
+    )
+    leaf = contributor.model_copy(
+        update={
+            "source_path": "new/leaf.json",
+            "source_sha256": "b" * 64,
+            "model": "leaf-model",
+            "harness": "leaf-harness",
+            "instructions": "leaf instructions",
+            "termination": "leaf termination",
+            "history": [question, replayed_assistant],
+            "response": [
+                Message(role="assistant", content="done", reasoning_content="")
+            ],
+            "tools": [ToolDefinition(name="leaf-tool")],
+            "agent_messages": [
+                AgentMessageEvidence(
+                    origin="history",
+                    item_index=2,
+                    item={"type": "agent_message", "id": "leaf-message"},
+                )
+            ],
+            "issues": [],
+        }
+    )
+
+    node = _trajectory_from_leaf(leaf, [contributor, leaf])
+
+    assert node.messages == [*leaf.history, *leaf.response]
+    assert node.messages[1].reasoning == replayed_assistant.reasoning
+    assert {tool.name for tool in node.tools} == {"old-tool", "leaf-tool"}
+    assert {record.item["id"] for record in node.agent_messages} == {
+        "old-message",
+        "leaf-message",
+    }
+    assert node.instructions == "leaf instructions"
+    assert node.model == "leaf-model"
+    assert node.harness == "leaf-harness"
+    assert node.termination == "leaf termination"
+    assert node.normalization_audit is not None
+    assert {issue.code for issue in node.normalization_audit.issues} >= {
+        "contributor_evidence",
+        "contributor_instructions_changed",
+        "contributor_model_changed",
+        "contributor_harness_changed",
+        "contributor_termination_changed",
+    }
+    assert node.normalization_audit.tag == AuditTag.PASS
 
 
 def test_output_may_not_be_nested_under_input(tmp_path: Path) -> None:
@@ -680,7 +785,6 @@ def test_duplicate_child_leaf_is_merged_before_mounting(tmp_path: Path) -> None:
         return Snapshot(
             source_path=f"/input/{name}.json",
             source_sha256=name,
-            source_partition="partition",
             session_id="session",
             thread_id=thread_id,
             turn_id=turn_id,

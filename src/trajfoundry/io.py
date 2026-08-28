@@ -30,15 +30,6 @@ def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
-def source_partition(root: Path, path: Path) -> str:
-    """Return the path namespace above the session directory."""
-
-    relative = path.relative_to(root)
-    if len(relative.parts) < 3:
-        return str(relative.parent)
-    return str(Path(*relative.parts[:-2]))
-
-
 def read_capture_bytes(path: Path) -> tuple[bytes, str]:
     """Read and hash one stable file descriptor exactly once."""
 

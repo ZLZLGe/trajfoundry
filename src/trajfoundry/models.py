@@ -292,7 +292,6 @@ class TrajectoryNode(StrictModel):
 class Snapshot(StrictModel):
     source_path: str
     source_sha256: str
-    source_partition: str
     session_id: str
     thread_id: str
     turn_id: str = ""

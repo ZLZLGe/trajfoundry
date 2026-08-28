@@ -1,4 +1,10 @@
-from trajfoundry.models import AgentMessageEvidence, Message, Snapshot
+from trajfoundry.models import (
+    AgentMessageEvidence,
+    FunctionCall,
+    Message,
+    Snapshot,
+    ToolCall,
+)
 from trajfoundry.streaming import streaming_prefix_leaves
 
 
@@ -12,7 +18,6 @@ def snap(
     return Snapshot(
         source_path=path,
         source_sha256=path,
-        source_partition="partition",
         session_id="session",
         thread_id="thread",
         provider="openai",
@@ -42,7 +47,7 @@ def test_streaming_keeps_all_divergent_leaves() -> None:
     assert result.contributor_paths["c"] == ("a", "c")
 
 
-def test_instructions_split_prefix_chains() -> None:
+def test_instructions_do_not_split_proven_prefix_chains() -> None:
     q = Message(role="user", content="q")
     a = Message(role="assistant", content="a", reasoning_content="")
     q2 = Message(role="user", content="q2")
@@ -53,7 +58,167 @@ def test_instructions_split_prefix_chains() -> None:
             snap("b", [q, a, q2], [b], instructions="two"),
         ]
     )
-    assert {leaf.source_path for leaf in result.leaves} == {"a", "b"}
+    assert [leaf.source_path for leaf in result.leaves] == ["b"]
+    assert result.contributor_paths["b"] == ("a", "b")
+
+
+def test_reasoning_envelope_differences_do_not_split_prefix() -> None:
+    question = Message(role="user", content="q")
+    response_assistant = Message(
+        role="assistant",
+        content="",
+        reasoning_content="visible summary",
+        reasoning={
+            "type": "reasoning",
+            "id": "rs-1",
+            "summary": [{"type": "summary_text", "text": "visible summary"}],
+            "content": [],
+            "encrypted_content": "opaque",
+            "metadata": {"response_only": True},
+        },
+        tool_calls=[
+            ToolCall(
+                id="call-1",
+                function=FunctionCall(name="exec", arguments={"cmd": "pwd"}),
+            )
+        ],
+    )
+    replay_assistant = response_assistant.model_copy(
+        update={
+            "reasoning_content": "different visible replay",
+            "reasoning": {
+                "type": "reasoning",
+                "id": "rs-1",
+                "summary": [],
+                "encrypted_content": "opaque",
+            },
+        }
+    )
+    tool_result = Message(role="tool", content="{}", tool_call_id="call-1", name="exec")
+    leaf_answer = Message(role="assistant", content="done", reasoning_content="")
+
+    short = snap("old/short", [question], [response_assistant])
+    leaf = snap(
+        "new/leaf",
+        [question, replay_assistant, tool_result],
+        [leaf_answer],
+    )
+    result = streaming_prefix_leaves([short, leaf])
+
+    assert result.leaves == (leaf,)
+    assert result.contributor_paths["new/leaf"] == ("new/leaf", "old/short")
+    assert result.leaves[0].history[1] == replay_assistant
+
+
+def test_content_and_tool_call_differences_still_branch() -> None:
+    question = Message(role="user", content="q")
+    call_a = ToolCall(
+        id="call-a", function=FunctionCall(name="exec", arguments={"cmd": "a"})
+    )
+    call_b = ToolCall(
+        id="call-b", function=FunctionCall(name="exec", arguments={"cmd": "b"})
+    )
+    short_content = snap(
+        "content-short",
+        [question],
+        [Message(role="assistant", content="a", reasoning_content="")],
+    )
+    long_content = snap(
+        "content-long",
+        [
+            question,
+            Message(role="assistant", content="b", reasoning_content="different"),
+            Message(role="user", content="next"),
+        ],
+        [Message(role="assistant", content="done", reasoning_content="")],
+    )
+    short_call = snap(
+        "call-short",
+        [question],
+        [
+            Message(
+                role="assistant",
+                content="",
+                reasoning_content="x",
+                tool_calls=[call_a],
+            )
+        ],
+    )
+    long_call = snap(
+        "call-long",
+        [
+            question,
+            Message(
+                role="assistant",
+                content="",
+                reasoning_content="y",
+                tool_calls=[call_b],
+            ),
+            Message(role="tool", content="{}", tool_call_id="call-b", name="exec"),
+        ],
+        [Message(role="assistant", content="done", reasoning_content="")],
+    )
+
+    content_result = streaming_prefix_leaves([short_content, long_content])
+    call_result = streaming_prefix_leaves([short_call, long_call])
+
+    assert {leaf.source_path for leaf in content_result.leaves} == {
+        "content-short",
+        "content-long",
+    }
+    assert {leaf.source_path for leaf in call_result.leaves} == {
+        "call-short",
+        "call-long",
+    }
+
+    shared_call_message = Message(
+        role="assistant",
+        content="",
+        reasoning_content="",
+        tool_calls=[call_a],
+    )
+    completed_result = snap(
+        "result-short",
+        [question, shared_call_message],
+        [Message(role="tool", content="one", tool_call_id="call-a", name="exec")],
+    )
+    different_result = snap(
+        "result-long",
+        [
+            question,
+            shared_call_message,
+            Message(role="tool", content="two", tool_call_id="call-a", name="exec"),
+            Message(role="user", content="next"),
+        ],
+        [Message(role="assistant", content="done", reasoning_content="")],
+    )
+    result_result = streaming_prefix_leaves([completed_result, different_result])
+    assert {leaf.source_path for leaf in result_result.leaves} == {
+        "result-short",
+        "result-long",
+    }
+
+
+def test_prefix_never_crosses_session_or_thread() -> None:
+    question = Message(role="user", content="q")
+    answer = Message(role="assistant", content="a", reasoning_content="")
+    next_question = Message(role="user", content="next")
+    final = Message(role="assistant", content="done", reasoning_content="")
+    base = snap("base", [question], [answer])
+
+    for different in (
+        snap("session", [question, answer, next_question], [final]).model_copy(
+            update={"session_id": "other-session"}
+        ),
+        snap("thread", [question, answer, next_question], [final]).model_copy(
+            update={"thread_id": "other-thread"}
+        ),
+    ):
+        result = streaming_prefix_leaves([base, different])
+        assert {leaf.source_path for leaf in result.leaves} == {
+            "base",
+            different.source_path,
+        }
 
 
 def test_late_shorter_snapshot_is_still_intermediate() -> None:

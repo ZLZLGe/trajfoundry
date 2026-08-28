@@ -11,9 +11,37 @@ from typing import Any
 from .models import Message, Snapshot
 
 
-def _token(message: Message) -> bytes:
+def message_prefix_token(message: Message) -> bytes:
+    """Return the stable conversational fields used for prefix matching.
+
+    Reasoning payloads are intentionally excluded.  Providers can replay the
+    same assistant turn with a reduced reasoning envelope (for example without
+    response-only metadata), while the model-visible conversation and tool
+    call remain identical.
+    """
+
+    if message.role == "assistant":
+        value: dict[str, Any] = {
+            "role": message.role,
+            "content": message.content,
+            "tool_calls": [
+                call.model_dump(mode="json", exclude_none=False)
+                for call in message.tool_calls or ()
+            ]
+            if message.tool_calls is not None
+            else None,
+        }
+    elif message.role == "tool":
+        value = {
+            "role": message.role,
+            "tool_call_id": message.tool_call_id,
+            "name": message.name,
+            "content": message.content,
+        }
+    else:
+        value = {"role": message.role, "content": message.content}
     return json.dumps(
-        message.model_dump(mode="json", exclude_none=False),
+        value,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -22,13 +50,8 @@ def _token(message: Message) -> bytes:
 
 def _compatibility(snapshot: Snapshot) -> tuple[str, ...]:
     return (
-        snapshot.source_partition,
         snapshot.session_id,
         snapshot.thread_id,
-        snapshot.provider,
-        snapshot.model,
-        snapshot.harness,
-        snapshot.instructions,
     )
 
 
@@ -167,12 +190,13 @@ def _evidence_copy(snapshot: Snapshot) -> Snapshot:
     )
 
 
-def _strict_history_prefix(prefix: list[Message], candidate: Snapshot) -> bool:
+def _strict_history_prefix(prefix: list[bytes], candidate: Snapshot) -> bool:
     complete_length = len(candidate.history) + len(candidate.response)
+    candidate_history = [message_prefix_token(message) for message in candidate.history]
     return (
         len(prefix) < complete_length
         and len(prefix) <= len(candidate.history)
-        and candidate.history[: len(prefix)] == prefix
+        and candidate_history[: len(prefix)] == prefix
     )
 
 
@@ -207,6 +231,7 @@ def streaming_prefix_leaves(
         compatibility = _compatibility(snapshot)
         trie = tries.setdefault(compatibility, _TranscriptTrie())
         full_messages = [*snapshot.history, *snapshot.response]
+        full_tokens = [message_prefix_token(message) for message in full_messages]
         inherited: set[str] = set()
 
         node_index = 0
@@ -216,7 +241,7 @@ def streaming_prefix_leaves(
             for ancestor in removed:
                 contributors.pop(ancestor.source_path, None)
         for depth, message in enumerate(snapshot.history, start=1):
-            node_index = trie.advance(node_index, _token(message))
+            node_index = trie.advance(node_index, message_prefix_token(message))
             if depth < len(full_messages):
                 inherited.update(trie.nodes[node_index].ending_paths)
                 removed = active.pop((compatibility, node_index), ())
@@ -224,7 +249,7 @@ def streaming_prefix_leaves(
                     contributors.pop(ancestor.source_path, None)
 
         for message in snapshot.response:
-            node_index = trie.advance(node_index, _token(message))
+            node_index = trie.advance(node_index, message_prefix_token(message))
         full_node = trie.nodes[node_index]
         inherited.add(snapshot.source_path)
         full_node.ending_paths.add(snapshot.source_path)
@@ -235,7 +260,7 @@ def streaming_prefix_leaves(
             for key, candidates in active.items()
             if key[0] == compatibility
             for candidate in candidates
-            if _strict_history_prefix(full_messages, candidate)
+            if _strict_history_prefix(full_tokens, candidate)
         ]
         if descendants:
             for candidate in descendants:
@@ -261,4 +286,8 @@ def streaming_prefix_leaves(
     )
 
 
-__all__ = ["StreamingAggregationResult", "streaming_prefix_leaves"]
+__all__ = [
+    "StreamingAggregationResult",
+    "message_prefix_token",
+    "streaming_prefix_leaves",
+]

@@ -1406,7 +1406,6 @@ def _snapshot_base(
     *,
     source_path: str,
     source_sha256: str,
-    source_partition: str,
     operation: str,
     request: dict[str, Any],
 ) -> dict[str, Any]:
@@ -1419,11 +1418,8 @@ def _snapshot_base(
         or _text(capture.get("session_id"))
         or _text(headers.get("x-claude-code-session-id"))
     )
-    thread_id = (
-        _text(metadata.get("thread_id"))
-        or _text(capture.get("thread_id"))
-        or _text(headers.get("x-claude-code-session-id"))
-        or session_id
+    explicit_thread_id = _text(metadata.get("thread_id")) or _text(
+        capture.get("thread_id")
     )
     marker = (
         _text(metadata.get("subagent_marker"))
@@ -1432,6 +1428,24 @@ def _snapshot_base(
     )
     if marker in {"main", "user"}:
         marker = ""
+    parent_thread_id = _text(metadata.get("parent_thread_id")) or _text(
+        capture.get("parent_thread_id")
+    )
+    parent_turn_id = _text(metadata.get("parent_turn_id")) or _text(
+        capture.get("parent_turn_id")
+    )
+    forked_from_thread_id = _text(metadata.get("forked_from_thread_id")) or _text(
+        capture.get("forked_from_thread_id")
+    )
+    has_subagent_linkage = bool(
+        marker or parent_thread_id or parent_turn_id or forked_from_thread_id
+    )
+    if explicit_thread_id:
+        thread_id = explicit_thread_id
+    elif has_subagent_linkage:
+        thread_id = f"__isolated_subagent__:{source_path}"
+    else:
+        thread_id = _text(headers.get("x-claude-code-session-id")) or session_id
     explicit_harness = _text(capture.get("harness")) or _text(metadata.get("harness"))
     harness = explicit_harness or (
         "claude-code" if _text(headers.get("x-claude-code-session-id")) else "unknown"
@@ -1439,16 +1453,12 @@ def _snapshot_base(
     return {
         "source_path": source_path,
         "source_sha256": source_sha256,
-        "source_partition": source_partition,
         "session_id": session_id,
         "thread_id": thread_id,
         "turn_id": _text(metadata.get("turn_id")) or _text(capture.get("turn_id")),
-        "parent_thread_id": _text(metadata.get("parent_thread_id"))
-        or _text(capture.get("parent_thread_id")),
-        "parent_turn_id": _text(metadata.get("parent_turn_id"))
-        or _text(capture.get("parent_turn_id")),
-        "forked_from_thread_id": _text(metadata.get("forked_from_thread_id"))
-        or _text(capture.get("forked_from_thread_id")),
+        "parent_thread_id": parent_thread_id,
+        "parent_turn_id": parent_turn_id,
+        "forked_from_thread_id": forked_from_thread_id,
         "subagent_marker": marker,
         "provider": "anthropic",
         "operation": operation,
@@ -1470,7 +1480,6 @@ def parse_anthropic_capture(
     *,
     source_path: str,
     source_sha256: str,
-    source_partition: str,
 ) -> Snapshot:
     """Parse one freerouter Anthropic capture.
 
@@ -1503,7 +1512,6 @@ def parse_anthropic_capture(
         capture,
         source_path=source_path,
         source_sha256=source_sha256,
-        source_partition=source_partition,
         operation=operation,
         request=request,
     )
@@ -1562,6 +1570,15 @@ def parse_anthropic_capture(
     if not base["thread_id"]:
         context.issues.append(
             _issue("missing_thread_id", "capture has no thread id", path="request_body")
+        )
+    elif str(base["thread_id"]).startswith("__isolated_subagent__:"):
+        context.issues.append(
+            _issue(
+                "isolated_subagent_missing_thread_id",
+                "sub-agent linkage has no explicit thread id; capture was isolated",
+                path="request_body",
+                severity=Severity.WARNING,
+            )
         )
     history = _parse_history(request, context)
     tools = _parse_tools(request, context.issues)

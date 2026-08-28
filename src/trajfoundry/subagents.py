@@ -46,7 +46,6 @@ class MountDiagnostic:
 class SpawnEvidence:
     """A turn-bound ``spawn_agent`` call found in a provider response."""
 
-    source_partition: str
     session_id: str
     parent_thread_id: str
     parent_turn_id: str
@@ -58,9 +57,8 @@ class SpawnEvidence:
     source_path: str
 
     @property
-    def key(self) -> tuple[str, str, str, str, str]:
+    def key(self) -> tuple[str, str, str, str]:
         return (
-            self.source_partition,
             self.session_id,
             self.parent_thread_id,
             self.parent_turn_id,
@@ -138,7 +136,6 @@ def _leaf_key(snapshot: Snapshot) -> tuple[str, ...]:
         for message in (*snapshot.history, *snapshot.response)
     ]
     return (
-        snapshot.source_partition,
         snapshot.session_id,
         snapshot.thread_id,
         snapshot.captured_at,
@@ -252,7 +249,7 @@ def _spawn_calls(messages: Sequence[Message]) -> list[ToolCall]:
 
 def _spawn_agent_result_names(
     snapshots: Sequence[Snapshot],
-) -> dict[tuple[str, str, str, str], set[str]]:
+) -> dict[tuple[str, str, str], set[str]]:
     """Collect canonical agent names from ordered ``spawn_agent`` results.
 
     The tool result is accepted only when its call is present earlier in the
@@ -260,7 +257,7 @@ def _spawn_agent_result_names(
     non-empty string ``task_name``.  No free-form result text is interpreted.
     """
 
-    names: dict[tuple[str, str, str, str], set[str]] = defaultdict(set)
+    names: dict[tuple[str, str, str], set[str]] = defaultdict(set)
     for snapshot in snapshots:
         seen_spawn_ids: set[str] = set()
         for message in (*snapshot.history, *snapshot.response):
@@ -289,7 +286,6 @@ def _spawn_agent_result_names(
                 continue
             names[
                 (
-                    snapshot.source_partition,
                     snapshot.session_id,
                     snapshot.thread_id,
                     message.tool_call_id,
@@ -318,17 +314,16 @@ def _agent_message_index(
     canonical_leaves: Sequence[Snapshot],
     evidence_source: Sequence[Snapshot],
 ) -> tuple[
-    dict[tuple[str, str, str], tuple[Any, ...]],
-    set[tuple[str, str, str, str]],
+    dict[tuple[str, str], tuple[Any, ...]],
+    set[tuple[str, str, str]],
     list[MountDiagnostic],
 ]:
     """Deduplicate cumulative replays and reject ambiguous message ids."""
 
-    variants: dict[tuple[str, str, str, str], dict[str, Any]] = defaultdict(dict)
-    duplicate_ids: set[tuple[str, str, str, str]] = set()
+    variants: dict[tuple[str, str, str], dict[str, Any]] = defaultdict(dict)
+    duplicate_ids: set[tuple[str, str, str]] = set()
     for snapshot in sorted(evidence_source, key=_leaf_key):
         thread_key = (
-            snapshot.source_partition,
             snapshot.session_id,
             snapshot.thread_id,
         )
@@ -348,22 +343,21 @@ def _agent_message_index(
 
     conflict_ids = {key for key, values in variants.items() if len(values) > 1}
     blocked_ids = duplicate_ids | conflict_ids
-    records_by_thread: dict[tuple[str, str, str], list[Any]] = defaultdict(list)
+    records_by_thread: dict[tuple[str, str], list[Any]] = defaultdict(list)
     for key, values in variants.items():
         if key in blocked_ids:
             continue
-        records_by_thread[key[:3]].append(next(iter(values.values())))
+        records_by_thread[key[:2]].append(next(iter(values.values())))
     for records in records_by_thread.values():
         records.sort(key=lambda record: (record.origin, record.item_index))
 
     diagnostics: list[MountDiagnostic] = []
     for key in sorted(duplicate_ids):
-        partition, session_id, thread_id, message_id = key
+        session_id, thread_id, message_id = key
         targets = [
             index
             for index, leaf in enumerate(canonical_leaves)
-            if (leaf.source_partition, leaf.session_id, leaf.thread_id)
-            == (partition, session_id, thread_id)
+            if (leaf.session_id, leaf.thread_id) == (session_id, thread_id)
         ]
         diagnostics.append(
             MountDiagnostic(
@@ -375,12 +369,11 @@ def _agent_message_index(
             )
         )
     for key in sorted(conflict_ids):
-        partition, session_id, thread_id, message_id = key
+        session_id, thread_id, message_id = key
         targets = [
             index
             for index, leaf in enumerate(canonical_leaves)
-            if (leaf.source_partition, leaf.session_id, leaf.thread_id)
-            == (partition, session_id, thread_id)
+            if (leaf.session_id, leaf.thread_id) == (session_id, thread_id)
         ]
         diagnostics.append(
             MountDiagnostic(
@@ -437,10 +430,10 @@ def _extract_spawn_evidence(
     snapshots: Sequence[Snapshot],
 ) -> tuple[tuple[SpawnEvidence, ...], list[MountDiagnostic]]:
     diagnostics: list[MountDiagnostic] = []
-    by_key: dict[tuple[str, str, str, str, str], SpawnEvidence] = {}
-    conflicts: set[tuple[str, str, str, str, str]] = set()
+    by_key: dict[tuple[str, str, str, str], SpawnEvidence] = {}
+    conflicts: set[tuple[str, str, str, str]] = set()
     result_names = _spawn_agent_result_names(snapshots)
-    reported_result_conflicts: set[tuple[str, str, str, str]] = set()
+    reported_result_conflicts: set[tuple[str, str, str]] = set()
 
     for snapshot in sorted(snapshots, key=_leaf_key):
         calls = _spawn_calls(snapshot.response)
@@ -479,7 +472,6 @@ def _extract_spawn_evidence(
             task_value = arguments.get("task_name")
             task_name = task_value if isinstance(task_value, str) else ""
             result_key = (
-                snapshot.source_partition,
                 snapshot.session_id,
                 snapshot.thread_id,
                 call.id,
@@ -503,7 +495,6 @@ def _extract_spawn_evidence(
                 next(iter(canonical_names), "") if len(canonical_names) == 1 else ""
             )
             event = SpawnEvidence(
-                source_partition=snapshot.source_partition,
                 session_id=snapshot.session_id,
                 parent_thread_id=snapshot.thread_id,
                 parent_turn_id=snapshot.turn_id,
@@ -538,7 +529,6 @@ def _extract_spawn_evidence(
         sorted(
             by_key.values(),
             key=lambda event: (
-                event.source_partition,
                 event.session_id,
                 event.parent_thread_id,
                 event.parent_turn_id,
@@ -653,9 +643,7 @@ def _filter_spawns_by_recipient(
 def _attach_relay_ids(
     edges: Sequence[MountEdge],
     leaves: Sequence[Snapshot],
-    agent_records_by_thread: Mapping[
-        tuple[str, str, str], Sequence[AgentMessageRecord]
-    ],
+    agent_records_by_thread: Mapping[tuple[str, str], Sequence[AgentMessageRecord]],
 ) -> tuple[list[MountEdge], list[MountDiagnostic]]:
     """Attach a relay only after its unique spawn call/result pair completes."""
 
@@ -668,7 +656,6 @@ def _attach_relay_ids(
     for parent_index, parent_edges in sorted(by_parent.items()):
         parent = leaves[parent_index]
         parent_thread_key = (
-            parent.source_partition,
             parent.session_id,
             parent.thread_id,
         )
@@ -688,7 +675,6 @@ def _attach_relay_ids(
                 continue
             child = leaves[edge.child_index]
             child_thread_key = (
-                child.source_partition,
                 child.session_id,
                 child.thread_id,
             )
@@ -948,15 +934,13 @@ def plan_subagent_mounts(
     )
     diagnostics.extend(agent_diagnostics)
 
-    thread_leaves: dict[tuple[str, str, str], list[int]] = defaultdict(list)
+    thread_leaves: dict[tuple[str, str], list[int]] = defaultdict(list)
     for index, snapshot in enumerate(canonical_leaves):
-        thread_leaves[
-            (snapshot.source_partition, snapshot.session_id, snapshot.thread_id)
-        ].append(index)
+        thread_leaves[(snapshot.session_id, snapshot.thread_id)].append(index)
 
     # Bind every spawn event to exactly one maximal parent leaf before looking
     # at children.  This also exposes a parent branch ambiguity directly.
-    parent_for_event: dict[tuple[str, str, str, str, str], int] = {}
+    parent_for_event: dict[tuple[str, str, str, str], int] = {}
     parent_linkage_incomplete: set[int] = set()
     spawn_call_counts = [0] * len(canonical_leaves)
     for event in events:
@@ -964,7 +948,6 @@ def plan_subagent_mounts(
             index
             for index in thread_leaves.get(
                 (
-                    event.source_partition,
                     event.session_id,
                     event.parent_thread_id,
                 ),
@@ -1000,13 +983,10 @@ def plan_subagent_mounts(
             parent_for_event[event.key] = candidates[0]
             spawn_call_counts[candidates[0]] += 1
 
-    events_by_turn: dict[tuple[str, str, str, str], list[SpawnEvidence]] = defaultdict(
-        list
-    )
+    events_by_turn: dict[tuple[str, str, str], list[SpawnEvidence]] = defaultdict(list)
     for event in events:
         events_by_turn[
             (
-                event.source_partition,
                 event.session_id,
                 event.parent_thread_id,
                 event.parent_turn_id,
@@ -1023,15 +1003,13 @@ def plan_subagent_mounts(
     # Linkage metadata is captured on every request in a child thread.  A
     # changing parent, parent turn, fork source, or marker is contradictory
     # evidence even if prefix aggregation happened to retain only one leaf.
-    linkage_evidence: dict[tuple[str, str, str], list[Snapshot]] = defaultdict(list)
+    linkage_evidence: dict[tuple[str, str], list[Snapshot]] = defaultdict(list)
     for snapshot in evidence_source:
         if _is_subagent(snapshot):
-            linkage_evidence[
-                (snapshot.source_partition, snapshot.session_id, snapshot.thread_id)
-            ].append(snapshot)
+            linkage_evidence[(snapshot.session_id, snapshot.thread_id)].append(snapshot)
     for child_index in sorted(subagent_indices):
         child = canonical_leaves[child_index]
-        thread_key = (child.source_partition, child.session_id, child.thread_id)
+        thread_key = (child.session_id, child.thread_id)
         records = linkage_evidence.get(thread_key, [child])
         checks = (
             ("parent_thread_id", {record.parent_thread_id for record in records}),
@@ -1094,7 +1072,6 @@ def plan_subagent_mounts(
             continue
 
         turn_key = (
-            child.source_partition,
             child.session_id,
             child.parent_thread_id,
             child.parent_turn_id,
@@ -1150,7 +1127,6 @@ def plan_subagent_mounts(
             continue
 
         child_thread_key = (
-            child.source_partition,
             child.session_id,
             child.thread_id,
         )
@@ -1318,7 +1294,6 @@ def plan_subagent_mounts(
 
     mounted_event_keys = {
         (
-            canonical_leaves[edge.parent_index].source_partition,
             canonical_leaves[edge.parent_index].session_id,
             canonical_leaves[edge.parent_index].thread_id,
             edge.parent_turn_id,
@@ -1369,7 +1344,6 @@ def _snapshot_identity(snapshot: Snapshot) -> tuple[str, ...]:
     # source sha/path identify a capture in normal operation; the remaining
     # fields make test fixtures and imported manifests safe as well.
     return (
-        snapshot.source_partition,
         snapshot.session_id,
         snapshot.thread_id,
         snapshot.turn_id,
