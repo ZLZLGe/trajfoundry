@@ -809,6 +809,45 @@ def test_unknown_endpoint_is_rejected() -> None:
         _parse(_capture(path="/v1/complete", response_body={}))
 
 
+@pytest.mark.parametrize("envelope", ["metadata", "user_id"])
+@pytest.mark.parametrize("field", ["thread_source", "threadSource"])
+@pytest.mark.parametrize("value", ["system", "automation", "subagent", "custom"])
+def test_thread_source_is_ignored_for_subagent_identity(
+    envelope: str,
+    field: str,
+    value: str,
+) -> None:
+    metadata: dict[str, object]
+    if envelope == "metadata":
+        metadata = {field: value}
+    else:
+        metadata = {"user_id": json.dumps({field: value})}
+
+    snapshot = _parse(
+        _capture(
+            request_body={
+                "model": "claude-test",
+                "metadata": metadata,
+                "messages": [],
+            },
+            response_body={
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-test",
+                "stop_reason": "end_turn",
+                "content": [],
+            },
+        )
+    )
+
+    assert snapshot.subagent_marker == ""
+    assert snapshot.thread_id == "thread-1"
+    assert "isolated_subagent_missing_thread_id" not in {
+        issue.code for issue in snapshot.issues
+    }
+    assert snapshot.outcome == "success"
+
+
 def test_subagent_without_explicit_thread_id_ignores_session_header_fallback() -> None:
     snapshot = _parse(
         _capture(

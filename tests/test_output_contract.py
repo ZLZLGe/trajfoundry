@@ -7,11 +7,12 @@ import pytest
 
 from trajfoundry.audit_codes import RESPONSES_UNSUPPORTED_CALL_EVIDENCE
 from trajfoundry.canonical import trajectory_id
-from trajfoundry.export import OutputSet
+from trajfoundry.export import SCHEMA_VERSION, OutputSet
 from trajfoundry.models import (
     AgentMessageRecord,
     AuditIssue,
     AuditTag,
+    CompactionRecord,
     FunctionCall,
     Message,
     Metadata,
@@ -24,6 +25,7 @@ from trajfoundry.models import (
 )
 from trajfoundry.output_contract import (
     OutputContractError,
+    parse_trajectory_record,
     project_message,
     project_trajectory,
 )
@@ -77,6 +79,30 @@ def _trajectory(source: str = "source.json") -> TrajectoryNode:
             ],
             source=source,
             metadata=Metadata(source_file=source),
+        )
+    )
+
+
+def _compaction_record() -> CompactionRecord:
+    return CompactionRecord(
+        origin="history",
+        item_index=36,
+        item={
+            "type": "compaction",
+            "id": "cmp-real-shape",
+            "encrypted_content": "opaque-ciphertext",
+            "future": {
+                "nested": [True, None, 7, {"unknown": "preserved"}],
+            },
+        },
+    )
+
+
+def _trajectory_with_compaction(source: str = "source.json") -> TrajectoryNode:
+    return enrich_trajectory(
+        _trajectory(source).model_copy(
+            update={"compaction_items": [_compaction_record()]},
+            deep=True,
         )
     )
 
@@ -242,6 +268,79 @@ def test_message_projection_rejects_role_fields_added_after_validation() -> None
 
     with pytest.raises(OutputContractError):
         project_message(message)
+
+
+def test_compaction_projection_is_lossless_and_round_trips() -> None:
+    node = _trajectory_with_compaction()
+
+    projected = project_trajectory(node)
+    restored = parse_trajectory_record(projected)
+
+    assert projected["compaction_items"] == [
+        {
+            "origin": "history",
+            "item_index": 36,
+            "item": _compaction_record().item,
+        }
+    ]
+    assert restored.compaction_items == node.compaction_items
+    assert project_trajectory(restored) == projected
+
+
+def test_compaction_items_is_a_required_v2_array_on_every_node() -> None:
+    assert SCHEMA_VERSION == "trajfoundry-v2"
+
+    plain = project_trajectory(_trajectory())
+    assert plain["compaction_items"] == []
+    without_field = orjson.loads(orjson.dumps(plain))
+    del without_field["compaction_items"]
+    with pytest.raises(OutputContractError, match="compaction_items"):
+        parse_trajectory_record(without_field)
+
+    not_array = orjson.loads(orjson.dumps(plain))
+    not_array["compaction_items"] = {}
+    with pytest.raises(OutputContractError, match="compaction_items"):
+        parse_trajectory_record(not_array)
+
+    mounted = project_trajectory(_trajectory_with_relay_mount())
+    assert mounted["compaction_items"] == []
+    assert mounted["sub_agent_trajectory"]["spawn-1"]["compaction_items"] == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("origin", "unknown", "origin"),
+        ("item_index", -1, "item_index"),
+        ("item", "not-an-object", "item"),
+        ("item", {"type": "message"}, "type"),
+    ],
+)
+def test_compaction_output_rejects_invalid_wrapper_or_item(
+    field: str,
+    value: object,
+    error: str,
+) -> None:
+    projected = project_trajectory(_trajectory_with_compaction())
+    projected["compaction_items"][0][field] = value
+
+    with pytest.raises(OutputContractError, match=error):
+        parse_trajectory_record(projected)
+
+
+def test_compaction_output_rejects_unknown_wrapper_fields() -> None:
+    projected = project_trajectory(_trajectory_with_compaction())
+    projected["compaction_items"][0]["message_index"] = 36
+
+    with pytest.raises(OutputContractError, match="message_index"):
+        parse_trajectory_record(projected)
+
+
+def test_compaction_changes_canonical_trajectory_id() -> None:
+    plain = _trajectory()
+    compacted = _trajectory_with_compaction()
+
+    assert trajectory_id(compacted) != trajectory_id(plain)
 
 
 def test_trajectory_projection_rejects_invalid_assignment() -> None:

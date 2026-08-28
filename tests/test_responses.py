@@ -240,6 +240,109 @@ def test_agent_message_is_preserved_raw_without_fabricating_a_role() -> None:
     assert "unknown_response_item" not in {issue.code for issue in snapshot.issues}
 
 
+def test_compaction_items_are_preserved_opaquely_from_both_origins() -> None:
+    history_compaction = {
+        "type": "compaction",
+        "id": "cmp-history",
+        "encrypted_content": "history-ciphertext",
+        "future_provider_field": {"keep": [1, None, True]},
+    }
+    response_compaction = {
+        "type": "compaction",
+        "id": "cmp-response",
+        "encrypted_content": "response-ciphertext",
+    }
+    snapshot = _parse(
+        _capture(
+            request_body={
+                "model": "gpt-test",
+                "input": [
+                    {"type": "message", "role": "user", "content": "go"},
+                    history_compaction,
+                ],
+            },
+            response_body={
+                "status": "completed",
+                "output": [
+                    response_compaction,
+                    {"type": "message", "role": "assistant", "content": "done"},
+                ],
+            },
+        )
+    )
+
+    assert [record.model_dump(mode="json") for record in snapshot.compaction_items] == [
+        {"origin": "history", "item_index": 1, "item": history_compaction},
+        {"origin": "response", "item_index": 0, "item": response_compaction},
+    ]
+    assert [message.role for message in snapshot.history] == ["user"]
+    assert [message.role for message in snapshot.response] == ["assistant"]
+    assert snapshot.outcome == "success"
+    assert snapshot.wire_complete is True
+    assert "unknown_response_item" not in {issue.code for issue in snapshot.issues}
+
+
+def test_compaction_item_is_preserved_from_streaming_output() -> None:
+    raw_compaction = {
+        "type": "compaction",
+        "id": "cmp-stream",
+        "encrypted_content": "complete-ciphertext",
+        "future_provider_field": ["preserved"],
+    }
+    frames = [
+        _frame(
+            1,
+            {
+                "type": "response.created",
+                "response": {"id": "resp-1", "status": "in_progress", "output": []},
+            },
+        ),
+        _frame(
+            2,
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {**raw_compaction, "encrypted_content": "partial"},
+            },
+        ),
+        _frame(
+            3,
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": raw_compaction,
+            },
+        ),
+        _frame(
+            4,
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-1",
+                    "status": "completed",
+                    "model": "gpt-test",
+                    "output": [raw_compaction],
+                },
+            },
+        ),
+    ]
+
+    snapshot = _parse(
+        _capture(
+            request_body={"model": "gpt-test", "input": []},
+            response_body=frames,
+        )
+    )
+
+    assert [record.model_dump(mode="json") for record in snapshot.compaction_items] == [
+        {"origin": "response", "item_index": 0, "item": raw_compaction}
+    ]
+    assert snapshot.response == []
+    assert snapshot.outcome == "success"
+    assert snapshot.wire_complete is True
+    assert "unknown_response_item" not in {issue.code for issue in snapshot.issues}
+
+
 def test_agent_message_between_spawn_call_and_result_has_no_completed_pair() -> None:
     raw_agent_message = {
         "type": "agent_message",
@@ -1409,7 +1512,7 @@ def test_distinct_subagent_labels_from_real_request_shape_do_not_conflict() -> N
 
 @pytest.mark.parametrize(
     "field",
-    ["subagent_marker", "x-openai-subagent", "subagent_kind", "thread_source"],
+    ["subagent_marker", "x-openai-subagent", "subagent_kind"],
 )
 def test_subagent_label_copies_use_source_priority_without_conflict(
     field: str,
@@ -1455,6 +1558,44 @@ def test_subagent_label_copies_use_source_priority_without_conflict(
     assert snapshot.issues == []
 
 
+@pytest.mark.parametrize("source", ["direct", "body_encoded", "header_encoded"])
+@pytest.mark.parametrize("field", ["thread_source", "threadSource"])
+@pytest.mark.parametrize("value", ["system", "automation", "subagent", "custom"])
+def test_thread_source_is_ignored_for_subagent_identity(
+    source: str,
+    field: str,
+    value: str,
+) -> None:
+    client_metadata: dict[str, object] = {"session_id": "session-1"}
+    if source == "direct":
+        client_metadata[field] = value
+    elif source == "body_encoded":
+        client_metadata["x-codex-turn-metadata"] = json.dumps({field: value})
+
+    capture = _capture(
+        request_body={
+            "model": "gpt-test",
+            "client_metadata": client_metadata,
+            "input": [],
+            "tools": [],
+        },
+        response_body={"status": "completed", "output": []},
+    )
+    if source == "header_encoded":
+        capture["request_headers"] = {
+            "X-Codex-Turn-Metadata": json.dumps({field: value})
+        }
+
+    snapshot = _parse(capture)
+
+    assert snapshot.subagent_marker == ""
+    assert snapshot.thread_id == "session-1"
+    assert "isolated_subagent_missing_thread_id" not in {
+        issue.code for issue in snapshot.issues
+    }
+    assert snapshot.outcome == "success"
+
+
 @pytest.mark.parametrize(
     ("labels", "expected"),
     [
@@ -1479,7 +1620,8 @@ def test_subagent_label_copies_use_source_priority_without_conflict(
             {"subagent_kind": "thread_spawn", "thread_source": "subagent"},
             "thread_spawn",
         ),
-        ({"thread_source": "subagent"}, "subagent"),
+        ({"thread_source": "subagent"}, ""),
+        ({"threadSource": "automation"}, ""),
         ({"thread_source": "user"}, ""),
         ({"thread_source": "main"}, ""),
     ],

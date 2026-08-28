@@ -1118,6 +1118,34 @@ def test_opaque_marker_does_not_guess_between_multiple_spawn_calls() -> None:
     )
 
 
+def test_thread_source_wrapper_in_marker_does_not_route_spawn() -> None:
+    calls = [spawn("call-a", "a"), spawn("call-b", "b")]
+    parent = snapshot(
+        "parent",
+        thread="main",
+        turn="turn-1",
+        response=[assistant(calls=calls)],
+    )
+    child = snapshot(
+        "child",
+        thread="child",
+        turn="child-turn",
+        response=[assistant("result")],
+        parent_thread="main",
+        parent_turn="turn-1",
+        forked_from="main",
+        marker=json.dumps({"thread_source": {"spawn_call_id": "call-a"}}),
+    )
+
+    plan = plan_subagent_mounts([parent, child])
+
+    assert plan.edges == ()
+    assert "ambiguous_spawn_call" in codes(plan)
+    assert tuple(plan.leaves[index].source_path for index in plan.orphan_indices) == (
+        "/child.json",
+    )
+
+
 def test_explicit_routing_mismatch_never_falls_back_to_only_spawn() -> None:
     parent = snapshot(
         "parent",

@@ -7,6 +7,7 @@ from trajfoundry.export import OutputSet
 from trajfoundry.io import JsonlShardWriter, load_capture
 from trajfoundry.models import (
     AuditTag,
+    CompactionRecord,
     Message,
     Metadata,
     NormalizationAudit,
@@ -48,6 +49,17 @@ def test_state_round_trip_compresses_snapshot(tmp_path: Path) -> None:
         operation="responses",
         outcome="success",
         history=[Message(role="user", content="hello")],
+        compaction_items=[
+            CompactionRecord(
+                origin="history",
+                item_index=1,
+                item={
+                    "type": "compaction",
+                    "id": "cmp-1",
+                    "encrypted_content": "opaque",
+                },
+            )
+        ],
     )
     with StateStore(tmp_path / "state.sqlite") as state:
         state.put_snapshot(snapshot)

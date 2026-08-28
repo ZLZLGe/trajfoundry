@@ -18,6 +18,7 @@ from trajfoundry.audit_codes import RESPONSES_UNSUPPORTED_CALL_EVIDENCE
 from trajfoundry.models import (
     AgentMessageEvidence,
     AuditIssue,
+    CompactionRecord,
     FunctionCall,
     Message,
     ServerToolCall,
@@ -887,10 +888,11 @@ def _normalize_items(
     list[Message],
     list[ServerToolCall],
     list[AgentMessageEvidence],
+    list[CompactionRecord],
     list[str],
 ]:
     if raw_items is None:
-        return [], [], [], list(dict.fromkeys(prior_completed_spawn_call_ids))
+        return [], [], [], [], list(dict.fromkeys(prior_completed_spawn_call_ids))
     if isinstance(raw_items, str):
         raw_items = [{"type": "message", "role": "user", "content": raw_items}]
     if not isinstance(raw_items, Sequence) or isinstance(
@@ -902,7 +904,7 @@ def _normalize_items(
             path,
             f"expected array; got {type(raw_items).__name__}",
         )
-        return [], [], [], list(dict.fromkeys(prior_completed_spawn_call_ids))
+        return [], [], [], [], list(dict.fromkeys(prior_completed_spawn_call_ids))
 
     classifications = _classify_items(
         raw_items,
@@ -941,6 +943,7 @@ def _normalize_items(
     current = _AssistantAccumulator()
     server_items: list[tuple[int, Mapping[str, Any], str]] = []
     agent_messages: list[AgentMessageEvidence] = []
+    compaction_items: list[CompactionRecord] = []
     completed_spawn_call_ids = list(dict.fromkeys(prior_completed_spawn_call_ids))
     completed_spawn_call_id_set = set(completed_spawn_call_ids)
 
@@ -964,6 +967,17 @@ def _normalize_items(
         item = dict(raw_item)
         item_type = item.get("type")
         classification = classifications.get(index)
+
+        if item_type == "compaction":
+            flush_assistant()
+            compaction_items.append(
+                CompactionRecord(
+                    origin=origin,
+                    item_index=index,
+                    item=deepcopy(item),
+                )
+            )
+            continue
 
         if item_type == "agent_message":
             flush_assistant()
@@ -1180,6 +1194,7 @@ def _normalize_items(
             path=path,
         ),
         agent_messages,
+        compaction_items,
         completed_spawn_call_ids,
     )
 
@@ -2067,10 +2082,6 @@ def _identity_metadata(
     selected_markers = explicit_markers or transport_markers or subagent_kinds
     if selected_markers:
         identity["subagent_marker"] = selected_markers[0][1]
-    else:
-        thread_sources = values_for(("thread_source", "threadSource"))
-        if thread_sources and thread_sources[0][1] not in {"user", "main"}:
-            identity["subagent_marker"] = thread_sources[0][1]
 
     harness_candidates = values_for(("harness",))
     if harness_candidates:
@@ -2152,6 +2163,7 @@ def parse_responses_capture(
         history,
         history_server_tools,
         history_agent_messages,
+        history_compaction_items,
         history_completed_spawn_ids,
     ) = _normalize_items(
         request_input,
@@ -2164,6 +2176,7 @@ def parse_responses_capture(
         response,
         response_server_tools,
         response_agent_messages,
+        response_compaction_items,
         _,
     ) = _normalize_items(
         response_items,
@@ -2265,6 +2278,7 @@ def parse_responses_capture(
         tools=tools,
         server_tool_calls=[*history_server_tools, *response_server_tools],
         agent_messages=[*history_agent_messages, *response_agent_messages],
+        compaction_items=[*history_compaction_items, *response_compaction_items],
         termination="",
         wire_complete=wire_complete,
         issues=issues,

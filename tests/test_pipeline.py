@@ -417,7 +417,7 @@ def test_server_tool_duplicate_results_survive_contributor_merge() -> None:
         ],
     )
 
-    _, server_calls, _, _ = _merge_contributor_metadata([snapshot])
+    _, server_calls, _, _, _ = _merge_contributor_metadata([snapshot])
 
     assert [call.result for call in server_calls] == [
         {"type": "web_search_tool_result", "content": ["first"]},
@@ -461,7 +461,7 @@ def test_conflicting_replayed_server_results_are_preserved_and_quarantined() -> 
         }
     )
 
-    _, server_calls, _, issues = _merge_contributor_metadata([base, replay])
+    _, server_calls, _, _, issues = _merge_contributor_metadata([base, replay])
 
     assert len(server_calls) == 2
     assert {issue.code for issue in issues} == {"duplicate_server_tool_result"}

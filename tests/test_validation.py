@@ -107,6 +107,19 @@ def test_validate_output_accepts_complete_export(tmp_path: Path) -> None:
     assert report.counts["lineage_records"] == 2
 
 
+def test_validate_output_rejects_v1_manifest(tmp_path: Path) -> None:
+    _write_output(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest = orjson.loads(manifest_path.read_bytes())
+    manifest["schema_version"] = "trajfoundry-v1"
+    manifest_path.write_bytes(orjson.dumps(manifest))
+
+    report = validate_output(tmp_path)
+
+    assert not report.valid
+    assert any("manifest contract" in error for error in report.errors)
+
+
 def test_validate_output_reports_integrity_and_json_without_content(
     tmp_path: Path,
 ) -> None:

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Any
 
+from .canonical import compaction_signature
 from .models import Message, Snapshot
 from .tool_names import is_spawn_tool_name
 
@@ -49,10 +50,11 @@ def message_prefix_token(message: Message) -> bytes:
     ).encode("utf-8")
 
 
-def _compatibility(snapshot: Snapshot) -> tuple[str, ...]:
+def _compatibility(snapshot: Snapshot) -> tuple[str | bytes, ...]:
     return (
         snapshot.session_id,
         snapshot.thread_id,
+        compaction_signature(snapshot.compaction_items),
     )
 
 
@@ -185,6 +187,7 @@ def _evidence_copy(snapshot: Snapshot) -> Snapshot:
             "tools": [],
             "server_tool_calls": [],
             "agent_messages": _routing_agent_messages(snapshot),
+            "compaction_items": [],
             "model": "",
             "harness": "",
             "instructions": "",
@@ -218,8 +221,8 @@ def streaming_prefix_leaves(
     every repeated request history.
     """
 
-    tries: dict[tuple[str, ...], _TranscriptTrie] = {}
-    active: dict[tuple[tuple[str, ...], int], list[Snapshot]] = {}
+    tries: dict[tuple[str | bytes, ...], _TranscriptTrie] = {}
+    active: dict[tuple[tuple[str | bytes, ...], int], list[Snapshot]] = {}
     contributors: dict[str, set[str]] = {}
     all_paths: list[str] = []
     evidence: list[Snapshot] = []

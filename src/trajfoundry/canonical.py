@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterable
 from typing import Any
 
 import orjson
 
 from .audit_codes import RESPONSES_UNSUPPORTED_CALL_EVIDENCE
-from .models import Message, Severity, TrajectoryNode
+from .models import CompactionRecord, Message, Severity, TrajectoryNode
 from .output_contract import project_message, project_trajectory
 
 
@@ -19,6 +20,37 @@ def canonical_json(value: Any) -> bytes:
 def message_fingerprint(message: Message) -> str:
     payload = project_message(message)
     return hashlib.sha256(canonical_json(payload)).hexdigest()
+
+
+def compaction_record_key(record: CompactionRecord) -> tuple[int, int, bytes]:
+    """Return the stable provider-position order for opaque compaction items."""
+
+    return (
+        0 if record.origin == "history" else 1,
+        record.item_index,
+        canonical_json(record.item),
+    )
+
+
+def canonical_compaction_records(
+    records: Iterable[CompactionRecord],
+) -> list[CompactionRecord]:
+    """Deduplicate exact replay records without interpreting their contents."""
+
+    unique: dict[bytes, CompactionRecord] = {}
+    for record in records:
+        encoded = canonical_json(record.model_dump(mode="json", exclude_none=False))
+        unique.setdefault(encoded, record)
+    return sorted(unique.values(), key=compaction_record_key)
+
+
+def compaction_signature(records: Iterable[CompactionRecord]) -> bytes:
+    """Return an exact, position-sensitive opaque-context signature."""
+
+    ordered = canonical_compaction_records(records)
+    return canonical_json(
+        [record.model_dump(mode="json", exclude_none=False) for record in ordered]
+    )
 
 
 def _semantic_provider_evidence(

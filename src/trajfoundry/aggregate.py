@@ -13,6 +13,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 
+from .canonical import compaction_signature
 from .models import Snapshot
 from .streaming import message_prefix_token
 
@@ -105,6 +106,8 @@ def aggregate_snapshots(snapshots: Sequence[Snapshot]) -> AggregationResult:
     ``A`` is suppressed only when all of the following are true:
 
     * ``A`` and ``B`` have the same ``(session, thread)``;
+    * their complete opaque-compaction records are identical, including
+      provider origin and item index;
     * ``A.history + A.response`` equals the beginning of ``B.history``;
     * ``B`` has a strictly longer complete transcript.
 
@@ -131,10 +134,14 @@ def aggregate_snapshots(snapshots: Sequence[Snapshot]) -> AggregationResult:
 
     # Full transcripts are indexed once. The session/thread group is part of
     # the key, making cross-thread matching impossible by construction.
-    index: dict[tuple[GroupKey, int, bytes], list[int]] = {}
+    compaction_signatures = [
+        compaction_signature(snapshot.compaction_items) for snapshot in items
+    ]
+    index: dict[tuple[GroupKey, bytes, int, bytes], list[int]] = {}
     for input_index, snapshot in enumerate(items):
         key = (
             _group_key(snapshot),
+            compaction_signatures[input_index],
             len(full_tokens[input_index]),
             full_digests[input_index],
         )
@@ -165,6 +172,7 @@ def aggregate_snapshots(snapshots: Sequence[Snapshot]) -> AggregationResult:
         # leaf if upstream sends an empty first response.
         empty_key = (
             _group_key(snapshot),
+            compaction_signatures[extending_index],
             0,
             state.digest(),
         )
@@ -179,6 +187,7 @@ def aggregate_snapshots(snapshots: Sequence[Snapshot]) -> AggregationResult:
                 continue
             lookup_key = (
                 _group_key(snapshot),
+                compaction_signatures[extending_index],
                 prefix_length,
                 state.digest(),
             )

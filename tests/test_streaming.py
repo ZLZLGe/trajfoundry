@@ -1,5 +1,8 @@
+from typing import Literal
+
 from trajfoundry.models import (
     AgentMessageEvidence,
+    CompactionRecord,
     FunctionCall,
     Message,
     Snapshot,
@@ -26,6 +29,23 @@ def snap(
         instructions=instructions,
         history=history,
         response=response,
+    )
+
+
+def compaction(
+    *,
+    origin: Literal["history", "response"] = "history",
+    item_index: int = 1,
+    encrypted_content: str = "opaque-a",
+) -> CompactionRecord:
+    return CompactionRecord(
+        origin=origin,
+        item_index=item_index,
+        item={
+            "type": "compaction",
+            "id": "cmp-1",
+            "encrypted_content": encrypted_content,
+        },
     )
 
 
@@ -108,6 +128,55 @@ def test_reasoning_envelope_differences_do_not_split_prefix() -> None:
     assert result.leaves == (leaf,)
     assert result.contributor_paths["new/leaf"] == ("new/leaf", "old/short")
     assert result.leaves[0].history[1] == replay_assistant
+
+
+def test_identical_compaction_signature_allows_streaming_prefix_fold() -> None:
+    question = Message(role="user", content="q")
+    answer = Message(role="assistant", content="a", reasoning_content="")
+    next_question = Message(role="user", content="next")
+    final = Message(role="assistant", content="done", reasoning_content="")
+    record = compaction()
+    short = snap("short", [question], [answer]).model_copy(
+        update={"compaction_items": [record]}
+    )
+    long = snap("long", [question, answer, next_question], [final]).model_copy(
+        update={"compaction_items": [record.model_copy(deep=True)]}
+    )
+
+    result = streaming_prefix_leaves([short, long])
+
+    assert result.leaves == (long,)
+    assert result.contributor_paths["long"] == ("long", "short")
+
+
+def test_streaming_prefix_never_crosses_compaction_signature() -> None:
+    question = Message(role="user", content="q")
+    answer = Message(role="assistant", content="a", reasoning_content="")
+    next_question = Message(role="user", content="next")
+    final = Message(role="assistant", content="done", reasoning_content="")
+    short = snap("short", [question], [answer]).model_copy(
+        update={"compaction_items": [compaction()]}
+    )
+    variants = (
+        snap("missing", [question, answer, next_question], [final]),
+        snap("origin", [question, answer, next_question], [final]).model_copy(
+            update={"compaction_items": [compaction(origin="response")]}
+        ),
+        snap("index", [question, answer, next_question], [final]).model_copy(
+            update={"compaction_items": [compaction(item_index=2)]}
+        ),
+        snap("content", [question, answer, next_question], [final]).model_copy(
+            update={"compaction_items": [compaction(encrypted_content="opaque-b")]}
+        ),
+    )
+
+    for variant in variants:
+        result = streaming_prefix_leaves([short, variant])
+        assert {leaf.source_path for leaf in result.leaves} == {
+            "short",
+            variant.source_path,
+        }
+        assert result.intermediate_paths == ()
 
 
 def test_content_and_tool_call_differences_still_branch() -> None:
@@ -303,6 +372,25 @@ def test_agent_message_routing_evidence_drops_opaque_content_only_in_copy() -> N
         "recipient": "/root",
     }
     assert compact.preceding_completed_spawn_call_ids == ["spawn-1"]
+
+
+def test_routing_evidence_drops_compaction_only_from_lightweight_copy() -> None:
+    record = compaction(encrypted_content="must-not-enter-routing")
+    source = snap(
+        "child",
+        [Message(role="user", content="q")],
+        [Message(role="assistant", content="done", reasoning_content="")],
+    ).model_copy(
+        update={
+            "parent_thread_id": "parent",
+            "compaction_items": [record],
+        }
+    )
+
+    result = streaming_prefix_leaves([source])
+
+    assert result.leaves[0].compaction_items == [record]
+    assert result.spawn_evidence[0].compaction_items == []
 
 
 def test_equal_terminal_transcripts_remain_separate_leaves() -> None:

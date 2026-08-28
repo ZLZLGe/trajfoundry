@@ -12,6 +12,7 @@ from pydantic import BaseModel, ValidationError
 from .audit_codes import PRIMARY_MOUNT_DIAGNOSTIC_CODES
 from .models import (
     AuditIssue,
+    CompactionRecord,
     Completeness,
     Message,
     NormalizationAudit,
@@ -314,6 +315,18 @@ def _validate_agent_message(value: object, path: str) -> None:
         _fail(f"{path}/item/type", "must equal 'agent_message'")
 
 
+def _validate_compaction(value: object, path: str) -> None:
+    record = _object(value, path)
+    _keys(record, path, required={"origin", "item_index", "item"})
+    if record["origin"] not in {"history", "response"}:
+        _fail(f"{path}/origin", "has an unsupported value")
+    _integer(record["item_index"], f"{path}/item_index")
+    item = _object(record["item"], f"{path}/item")
+    _json_value(item, f"{path}/item")
+    if item.get("type") != "compaction":
+        _fail(f"{path}/item/type", "must equal 'compaction'")
+
+
 def _validate_issue(value: object, path: str) -> None:
     issue = _object(value, path)
     _keys(
@@ -385,6 +398,7 @@ _NODE_REQUIRED = {
     "tool_call_check",
     "server_tool_calls",
     "agent_messages",
+    "compaction_items",
     "metadata",
     "normalization_audit",
 }
@@ -520,6 +534,9 @@ def _validate_node(value: object, path: str, *, top_level: bool) -> tuple[bool, 
     agent_messages = _array(node["agent_messages"], f"{path}/agent_messages")
     for index, message in enumerate(agent_messages):
         _validate_agent_message(message, f"{path}/agent_messages/{index}")
+    compaction_items = _array(node["compaction_items"], f"{path}/compaction_items")
+    for index, compaction in enumerate(compaction_items):
+        _validate_compaction(compaction, f"{path}/compaction_items/{index}")
 
     metadata = _object(node["metadata"], f"{path}/metadata")
     _keys(
@@ -769,6 +786,14 @@ def _project_completeness(value: Completeness) -> dict[str, Any]:
     }
 
 
+def _project_compaction(value: CompactionRecord) -> dict[str, Any]:
+    return {
+        "origin": value.origin,
+        "item_index": value.item_index,
+        "item": value.item,
+    }
+
+
 def _project_message(message: Message) -> dict[str, Any]:
     result: dict[str, Any] = {"role": message.role, "content": message.content}
     if message.role == "assistant":
@@ -854,6 +879,9 @@ def _project_trajectory(
                 "item": message.item,
             }
             for message in node.agent_messages
+        ],
+        "compaction_items": [
+            _project_compaction(compaction) for compaction in node.compaction_items
         ],
         "metadata": {
             "source_file": node.metadata.source_file,

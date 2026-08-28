@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from trajfoundry.aggregate import aggregate_snapshots
-from trajfoundry.models import FunctionCall, Message, Snapshot, ToolCall
+from trajfoundry.models import (
+    CompactionRecord,
+    FunctionCall,
+    Message,
+    Snapshot,
+    ToolCall,
+)
 
 
 def user(content: str) -> Message:
@@ -10,6 +18,23 @@ def user(content: str) -> Message:
 
 def assistant(content: str) -> Message:
     return Message(role="assistant", content=content, reasoning_content="")
+
+
+def compaction(
+    *,
+    origin: Literal["history", "response"] = "history",
+    item_index: int = 1,
+    encrypted_content: str = "opaque-a",
+) -> CompactionRecord:
+    return CompactionRecord(
+        origin=origin,
+        item_index=item_index,
+        item={
+            "type": "compaction",
+            "id": "cmp-1",
+            "encrypted_content": encrypted_content,
+        },
+    )
 
 
 def snapshot(
@@ -69,6 +94,49 @@ def test_real_branches_are_all_preserved() -> None:
 
     assert result.leaves == (branch_a, branch_b)
     assert result.intermediate == (first,)
+
+
+def test_identical_compaction_signature_allows_batch_prefix_fold() -> None:
+    q1, a1, q2, a2 = user("q1"), assistant("a1"), user("q2"), assistant("a2")
+    record = compaction()
+    first = snapshot("first", [q1], [a1]).model_copy(
+        update={"compaction_items": [record]}
+    )
+    second = snapshot("second", [q1, a1, q2], [a2]).model_copy(
+        update={"compaction_items": [record.model_copy(deep=True)]}
+    )
+
+    result = aggregate_snapshots([second, first])
+
+    assert result.leaves == (second,)
+    assert result.intermediate == (first,)
+
+
+def test_batch_prefix_never_crosses_compaction_signature() -> None:
+    q1, a1, q2, a2 = user("q1"), assistant("a1"), user("q2"), assistant("a2")
+    first = snapshot("first", [q1], [a1]).model_copy(
+        update={"compaction_items": [compaction()]}
+    )
+    variants = (
+        snapshot("missing", [q1, a1, q2], [a2]),
+        snapshot("origin", [q1, a1, q2], [a2]).model_copy(
+            update={"compaction_items": [compaction(origin="response")]}
+        ),
+        snapshot("index", [q1, a1, q2], [a2]).model_copy(
+            update={"compaction_items": [compaction(item_index=2)]}
+        ),
+        snapshot("content", [q1, a1, q2], [a2]).model_copy(
+            update={"compaction_items": [compaction(encrypted_content="opaque-b")]}
+        ),
+    )
+
+    for variant in variants:
+        result = aggregate_snapshots([first, variant])
+        assert {leaf.source_path for leaf in result.leaves} == {
+            first.source_path,
+            variant.source_path,
+        }
+        assert result.intermediate == ()
 
 
 def test_prefix_never_crosses_session_or_thread() -> None:

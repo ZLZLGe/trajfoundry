@@ -18,7 +18,7 @@ from .models import QuarantineRecord, TrajectoryNode
 from .output_contract import project_quarantine_record, project_trajectory
 from .quality import is_strict_sample, validate_derived_fields
 
-SCHEMA_VERSION = "trajfoundry-v1"
+SCHEMA_VERSION = "trajfoundry-v2"
 
 
 @dataclass

@@ -1421,10 +1421,8 @@ def _snapshot_base(
     explicit_thread_id = _text(metadata.get("thread_id")) or _text(
         capture.get("thread_id")
     )
-    marker = (
-        _text(metadata.get("subagent_marker"))
-        or _text(metadata.get("thread_source"))
-        or _text(capture.get("subagent_marker"))
+    marker = _text(metadata.get("subagent_marker")) or _text(
+        capture.get("subagent_marker")
     )
     if marker in {"main", "user"}:
         marker = ""

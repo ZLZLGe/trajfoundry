@@ -1,10 +1,14 @@
 import pytest
 
-from trajfoundry.audit_codes import RESPONSES_UNSUPPORTED_CALL_EVIDENCE
+from trajfoundry.audit_codes import (
+    OPAQUE_COMPACTION_CONTEXT,
+    RESPONSES_UNSUPPORTED_CALL_EVIDENCE,
+)
 from trajfoundry.canonical import trajectory_id
 from trajfoundry.models import (
     AuditIssue,
     AuditTag,
+    CompactionRecord,
     FunctionCall,
     Message,
     Metadata,
@@ -96,6 +100,96 @@ def test_complete_tool_trajectory_passes_strict_gate() -> None:
     assert enriched.total_tool_calls == 1
     assert enriched.completeness_tag == "complete_main_no_sub"
     assert is_strict_sample(enriched)
+
+
+def test_opaque_compaction_context_quarantines_complete_trajectory() -> None:
+    compaction_id = "cmp-must-not-leak"
+    ciphertext = "ciphertext-must-not-leak"
+    node = TrajectoryNode(
+        messages=[Message(role="assistant", content="done", reasoning_content="")],
+        tools=[],
+        compaction_items=[
+            CompactionRecord(
+                origin="history",
+                item_index=36,
+                item={
+                    "type": "compaction",
+                    "id": compaction_id,
+                    "encrypted_content": ciphertext,
+                },
+            )
+        ],
+        source="compacted.json",
+        metadata=Metadata(source_file="compacted.json"),
+    )
+
+    enriched = enrich_trajectory(node)
+
+    assert enriched.normalization_audit is not None
+    assert enriched.normalization_audit.tag == AuditTag.QUARANTINED
+    assert enriched.normalization_audit.reason_codes == [OPAQUE_COMPACTION_CONTEXT]
+    issue = next(
+        issue
+        for issue in enriched.normalization_audit.issues
+        if issue.code == OPAQUE_COMPACTION_CONTEXT
+    )
+    assert issue.severity == Severity.ERROR
+    assert compaction_id not in issue.detail
+    assert ciphertext not in issue.detail
+    assert not is_strict_sample(enriched)
+
+
+def test_compaction_quality_issue_is_idempotent() -> None:
+    node = TrajectoryNode(
+        messages=[Message(role="assistant", content="done", reasoning_content="")],
+        tools=[],
+        compaction_items=[
+            CompactionRecord(
+                origin="response",
+                item_index=0,
+                item={"type": "compaction", "encrypted_content": "opaque"},
+            )
+        ],
+        source="compacted.json",
+        metadata=Metadata(source_file="compacted.json"),
+    )
+
+    first = enrich_trajectory(node)
+    second = enrich_trajectory(first)
+
+    assert second == first
+    assert second.normalization_audit is not None
+    assert (
+        sum(
+            issue.code == OPAQUE_COMPACTION_CONTEXT
+            for issue in second.normalization_audit.issues
+        )
+        == 1
+    )
+
+
+def test_child_compaction_quarantines_the_complete_parent_tree() -> None:
+    child = _complete_leaf("child.json")
+    child.compaction_items = [
+        CompactionRecord(
+            origin="history",
+            item_index=2,
+            item={"type": "compaction", "encrypted_content": "opaque"},
+        )
+    ]
+    parent = _spawn_parent("parent.json", "spawn-child", child)
+
+    enriched = enrich_trajectory(parent)
+
+    assert enriched.normalization_audit is not None
+    assert enriched.normalization_audit.tag == AuditTag.QUARANTINED
+    assert "subagent_quality_failure" in enriched.normalization_audit.reason_codes
+    assert enriched.sub_agent_trajectory is not None
+    enriched_child = enriched.sub_agent_trajectory["spawn-child"]
+    assert enriched_child.normalization_audit is not None
+    assert OPAQUE_COMPACTION_CONTEXT in (
+        enriched_child.normalization_audit.reason_codes
+    )
 
 
 def test_developer_is_not_equivalent_to_system() -> None:

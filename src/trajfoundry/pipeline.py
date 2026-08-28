@@ -13,13 +13,19 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from .canonical import canonical_json, semantic_payload, trajectory_id
+from .canonical import (
+    canonical_compaction_records,
+    canonical_json,
+    semantic_payload,
+    trajectory_id,
+)
 from .export import SCHEMA_VERSION, OutputSet
 from .io import decode_capture, discover_captures, read_capture_bytes
 from .models import (
     AgentMessageRecord,
     AuditIssue,
     AuditTag,
+    CompactionRecord,
     Message,
     Metadata,
     NormalizationAudit,
@@ -38,7 +44,7 @@ from .streaming import streaming_prefix_leaves
 from .subagents import SubagentMountPlan, plan_subagent_mounts
 from .tool_names import is_spawn_tool_name
 
-NORMALIZER_REVISION = "2026-08-28.4"
+NORMALIZER_REVISION = "2026-08-29.1"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 
@@ -155,6 +161,15 @@ def config_hash(config: PipelineConfig) -> str:
             "assistant": ["role", "content", "tool_calls"],
             "tool": ["role", "tool_call_id", "name", "content"],
         },
+        "responses_compaction": "lossless_opaque_sidecar_exact_prefix_quarantine",
+        "subagent_identity_fields": [
+            "subagent_marker",
+            "x-openai-subagent",
+            "subagent_kind",
+            "parent_thread_id",
+            "parent_turn_id",
+            "forked_from_thread_id",
+        ],
         "leaf_messages": "request_history_plus_response_without_contributor_backfill",
         "developer_messages": "preserve",
         "instructions": "trajectory_field",
@@ -258,6 +273,7 @@ def _merge_contributor_metadata(
     list[ToolDefinition],
     list[ServerToolCall],
     list[AgentMessageRecord],
+    list[CompactionRecord],
     list[AuditIssue],
 ]:
     tool_candidates: dict[str, list[ToolDefinition]] = defaultdict(list)
@@ -266,6 +282,7 @@ def _merge_contributor_metadata(
     server_variants: set[tuple[str, int, bytes]] = set()
     server_issues: list[AuditIssue] = []
     agent_messages: dict[bytes, AgentMessageRecord] = {}
+    compaction_items: list[CompactionRecord] = []
     contributor_issues: dict[bytes, AuditIssue] = {}
     for snapshot in snapshots:
         for definition in snapshot.tools:
@@ -279,6 +296,7 @@ def _merge_contributor_metadata(
             )
             key = canonical_json(projected.model_dump(mode="json", exclude_none=False))
             agent_messages.setdefault(key, projected)
+        compaction_items.extend(snapshot.compaction_items)
         for issue in snapshot.issues:
             contributor_issues.setdefault(_issue_key(issue), issue)
         occurrences: dict[str, int] = defaultdict(int)
@@ -349,6 +367,10 @@ def _merge_contributor_metadata(
         server_calls,
         [agent_messages[key] for key in sorted(agent_messages)],
         [
+            record.model_copy(deep=True)
+            for record in canonical_compaction_records(compaction_items)
+        ],
+        [
             *[contributor_issues[key] for key in sorted(contributor_issues)],
             *tool_issues,
             *server_issues,
@@ -397,7 +419,7 @@ def _trajectory_from_leaf(
     contributor_list = list(contributors)
     if not any(item.source_path == leaf.source_path for item in contributor_list):
         contributor_list.append(leaf)
-    tools, server_calls, agent_messages, contributor_issues = (
+    tools, server_calls, agent_messages, compaction_items, contributor_issues = (
         _merge_contributor_metadata(contributor_list)
     )
     issues = _merged_issues(
@@ -410,6 +432,7 @@ def _trajectory_from_leaf(
         messages=[*leaf.history, *leaf.response],
         tools=tools,
         agent_messages=agent_messages,
+        compaction_items=compaction_items,
         instructions=leaf.instructions,
         termination=leaf.termination,
         harness=leaf.harness,
@@ -554,6 +577,7 @@ def _minimal_evidence(snapshot: Snapshot) -> Snapshot:
             "tools": [],
             "server_tool_calls": [],
             "agent_messages": _routing_agent_messages(snapshot),
+            "compaction_items": [],
             "model": "",
             "harness": "",
             "instructions": "",
@@ -579,6 +603,7 @@ def _routing_snapshot(snapshot: Snapshot) -> Snapshot:
             "tools": [],
             "server_tool_calls": [],
             "agent_messages": _routing_agent_messages(snapshot),
+            "compaction_items": [],
             "model": "",
             "harness": "",
             "instructions": "",

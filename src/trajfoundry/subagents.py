@@ -170,7 +170,7 @@ def _walk_dicts(value: Any) -> list[Mapping[str, Any]]:
     # Known wrappers used by Codex turn metadata.  Restricting traversal to
     # dictionaries (rather than searching arbitrary strings) keeps this
     # structured evidence.
-    for key in ("sub_agent", "subagent", "routing", "thread_source"):
+    for key in ("sub_agent", "subagent", "routing"):
         child = value.get(key)
         if isinstance(child, Mapping):
             result.extend(_walk_dicts(child))

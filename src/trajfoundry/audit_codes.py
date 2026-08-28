@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Literal, TypeAlias, get_args
 
 RESPONSES_UNSUPPORTED_CALL_EVIDENCE = "responses_unsupported_tool_call"
+OPAQUE_COMPACTION_CONTEXT = "opaque_compaction_context"
 
 MountDiagnosticCode: TypeAlias = Literal[
     "missing_subagent_marker",
@@ -83,6 +84,7 @@ __all__ = [
     "DERIVED_SUBAGENT_AUDIT_CODES",
     "MOUNT_DIAGNOSTIC_CODES",
     "MOUNT_ONLY_AUDIT_CODES",
+    "OPAQUE_COMPACTION_CONTEXT",
     "PRIMARY_MOUNT_DIAGNOSTIC_CODES",
     "RESPONSES_UNSUPPORTED_CALL_EVIDENCE",
     "MountDiagnosticCode",

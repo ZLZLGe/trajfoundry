@@ -18,6 +18,9 @@ confirmed project-level extensions and overrides:
 - Responses `agent_message` items are not promoted to a conversational role;
   each raw item is preserved losslessly in `agent_messages` with its origin and
   provider item index, while routing uses only `id`, `author`, and `recipient`.
+- Responses `compaction` items are preserved losslessly as opaque
+  `compaction_items` records with their provider origin and item index. They are
+  never converted into messages, decrypted, summarized, or interpreted.
 
 ## Quick start
 
@@ -64,6 +67,9 @@ timestamp changes.
   messages; and role, call ID, name, and content for tool results. Reasoning
   payloads are preserved in output but deliberately excluded from prefix
   identity because response and replay envelopes can differ.
+- Compaction evidence is position-sensitive prefix identity. Snapshots can be
+  folded only when their complete compaction records are identical; differing
+  contents, positions, origins, or presence form separate branches.
 - Prefix aggregation uses a canonical-message trie. SHA-256 is only a lookup
   accelerator; canonical token bytes remain the equality authority. Memory
   grows with the unique transcript and active branches, not with all repeated
@@ -89,6 +95,8 @@ timestamp changes.
   canonical recipient; task-name basename matching is allowed only for a spawn
   without a canonical result name. Explicit marker/recipient conflicts remain
   orphaned. Time, file order, and free-form text are never routing signals.
+- `thread_source` is ignored completely for sub-agent detection and mounting;
+  only explicit marker/kind, parent, fork, and spawn evidence participate.
 - Responses relay mounts additionally require the canonical agent name returned
   by `spawn_agent`, a matching child recipient, and one unique parent-side
   `agent_message` after the corresponding call/result pair has completed.
@@ -131,6 +139,11 @@ and is not inferred from a provider status or stop reason.
 - `manifest.json`: schema/config versions, counts, reason frequencies, file
   sizes, and SHA-256 checksums;
 - `.state`: compressed parsing and deduplication state used by `--resume`.
+
+Trajectories containing opaque compaction context are materialized in full and
+written to `quarantine/trajectories` with reason
+`opaque_compaction_context`; compaction alone never produces a metadata-only
+quarantine record.
 
 Publishing uses immutable generation directories. Data shards are finalized and
 fsynced first, then top-level `manifest.json` is atomically replaced as the

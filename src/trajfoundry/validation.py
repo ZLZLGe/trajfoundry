@@ -56,7 +56,7 @@ class _ManifestCounts(_StrictContract):
 
 
 class _Manifest(_StrictContract):
-    schema_version: Literal["trajfoundry-v1"]
+    schema_version: Literal["trajfoundry-v2"]
     created_at: str
     input_root: str
     config_hash: str

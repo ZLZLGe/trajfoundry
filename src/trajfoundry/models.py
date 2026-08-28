@@ -197,6 +197,14 @@ class AgentMessageEvidence(AgentMessageRecord):
     preceding_completed_spawn_call_ids: list[str] = Field(default_factory=list)
 
 
+class CompactionRecord(StrictModel):
+    """Lossless opaque record for a Responses ``compaction`` item."""
+
+    origin: Literal["history", "response"]
+    item_index: int = Field(ge=0)
+    item: dict[str, JsonValue]
+
+
 class TypeMismatch(StrictModel):
     arg: str
     declared: list[str]
@@ -252,6 +260,7 @@ class TrajectoryNode(StrictModel):
     messages: list[Message]
     tools: list[ToolDefinition]
     agent_messages: list[AgentMessageRecord] = Field(default_factory=list)
+    compaction_items: list[CompactionRecord] = Field(default_factory=list)
     instructions: str = ""
     termination: str = ""
     harness: str = "unknown"
@@ -314,6 +323,7 @@ class Snapshot(StrictModel):
     tools: list[ToolDefinition] = Field(default_factory=list)
     server_tool_calls: list[ServerToolCall] = Field(default_factory=list)
     agent_messages: list[AgentMessageEvidence] = Field(default_factory=list)
+    compaction_items: list[CompactionRecord] = Field(default_factory=list)
     termination: str = ""
     wire_complete: bool = False
     issues: list[AuditIssue] = Field(default_factory=list)

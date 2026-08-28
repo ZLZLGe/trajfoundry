@@ -10,6 +10,7 @@ from typing import Any
 from .audit_codes import (
     DERIVED_SUBAGENT_AUDIT_CODES,
     MOUNT_ONLY_AUDIT_CODES,
+    OPAQUE_COMPACTION_CONTEXT,
     PRIMARY_MOUNT_DIAGNOSTIC_CODES,
     RESPONSES_UNSUPPORTED_CALL_EVIDENCE,
 )
@@ -432,6 +433,18 @@ def enrich_trajectory(
         ),
         *pairing,
     ]
+    if node.compaction_items:
+        audit_issues.append(
+            AuditIssue(
+                code=OPAQUE_COMPACTION_CONTEXT,
+                stage="quality",
+                path="/compaction_items",
+                detail=(
+                    f"trajectory contains {len(node.compaction_items)} opaque "
+                    "Responses compaction item(s) that cannot be interpreted"
+                ),
+            )
+        )
     if check.hallucinated_calls:
         audit_issues.append(
             AuditIssue(
