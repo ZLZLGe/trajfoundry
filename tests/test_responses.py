@@ -18,6 +18,7 @@ from trajfoundry.providers.responses import (
     parse_responses_capture,
 )
 from trajfoundry.quality import enrich_trajectory
+from trajfoundry.streaming import streaming_prefix_leaves
 
 
 def _capture(
@@ -687,6 +688,192 @@ def test_multiple_reasoning_items_start_separate_assistant_segments() -> None:
     assert second.tool_calls[0].function.name == "exec"
     assert all(message.reasoning_details is None for message in snapshot.response)
     assert snapshot.issues == []
+
+
+def test_adjacent_assistant_message_items_preserve_their_boundaries() -> None:
+    request = {
+        "model": "gpt-test",
+        "input": [
+            {"type": "message", "role": "user", "content": "go"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [
+                    {"type": "output_text", "text": "working"},
+                    {"type": "output_text", "text": "still working"},
+                ],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": "history final"}],
+            },
+        ],
+        "tools": [],
+    }
+    response = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": "response update"}],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": "response final"}],
+            },
+        ],
+    }
+
+    snapshot = _parse(_capture(request_body=request, response_body=response))
+
+    assert [message.content for message in snapshot.history] == [
+        "go",
+        "working\nstill working",
+        "history final",
+    ]
+    assert [message.content for message in snapshot.response] == [
+        "response update",
+        "response final",
+    ]
+
+
+def test_empty_assistant_message_item_still_preserves_a_boundary() -> None:
+    snapshot = _parse(
+        _capture(
+            request_body={"model": "gpt-test", "input": [], "tools": []},
+            response_body={
+                "status": "completed",
+                "output": [
+                    {"type": "message", "role": "assistant", "content": []},
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": "done",
+                    },
+                ],
+            },
+        )
+    )
+
+    assert [message.content for message in snapshot.response] == ["", "done"]
+
+
+def test_reasoning_and_tool_calls_stay_with_their_assistant_message_item() -> None:
+    snapshot = _parse(
+        _capture(
+            request_body={
+                "model": "gpt-test",
+                "input": [],
+                "tools": [{"type": "function", "name": "read"}],
+            },
+            response_body={
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": "inspect"}],
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": "working",
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call-1",
+                        "name": "read",
+                        "arguments": "{}",
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": "done",
+                    },
+                ],
+            },
+        )
+    )
+
+    assert len(snapshot.response) == 2
+    first, second = snapshot.response
+    assert first.content == "working"
+    assert first.reasoning_content == "inspect"
+    assert first.tool_calls is not None
+    assert first.tool_calls[0].function.name == "read"
+    assert second.content == "done"
+    assert second.reasoning_content == ""
+    assert second.tool_calls is None
+
+
+def test_preserved_assistant_boundaries_enable_prefix_matching() -> None:
+    first_capture = _capture(
+        request_body={
+            "model": "gpt-test",
+            "input": [{"type": "message", "role": "user", "content": "go"}],
+            "tools": [],
+        },
+        response_body={
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": "working",
+                }
+            ],
+        },
+    )
+    second_capture = _capture(
+        request_body={
+            "model": "gpt-test",
+            "input": [
+                {"type": "message", "role": "user", "content": "go"},
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": "working",
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": "finished",
+                },
+                {"type": "message", "role": "user", "content": "next"},
+            ],
+            "tools": [],
+        },
+        response_body={
+            "status": "completed",
+            "output": [
+                {"type": "message", "role": "assistant", "content": "next done"}
+            ],
+        },
+    )
+    first = parse_responses_capture(
+        first_capture,
+        source_path="first.json",
+        source_sha256="a" * 64,
+    )
+    second = parse_responses_capture(
+        second_capture,
+        source_path="second.json",
+        source_sha256="b" * 64,
+    )
+
+    result = streaming_prefix_leaves([first, second])
+
+    assert [snapshot.source_path for snapshot in result.leaves] == ["second.json"]
+    assert result.contributor_paths == {"second.json": ("first.json", "second.json")}
 
 
 def test_opaque_reasoning_item_is_not_dropped_when_visible_text_is_empty() -> None:

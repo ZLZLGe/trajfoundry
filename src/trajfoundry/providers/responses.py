@@ -279,6 +279,7 @@ class _AssistantAccumulator:
         self.reasoning_content: list[str] = []
         self.reasoning: Any | None = None
         self.tool_calls: list[ToolCall] = []
+        self.has_message_item = False
 
     @property
     def populated(self) -> bool:
@@ -287,6 +288,7 @@ class _AssistantAccumulator:
             or self.reasoning_content
             or self.reasoning is not None
             or self.tool_calls
+            or self.has_message_item
         )
 
     def message(self) -> Message:
@@ -661,7 +663,10 @@ def _normalize_items(
                 issues=issues,
             )
             if role == "assistant":
+                if current.has_message_item:
+                    flush_assistant()
                 current.contents.append(content)
+                current.has_message_item = True
             else:
                 flush_assistant()
                 messages.append(Message(role=role, content=content))
