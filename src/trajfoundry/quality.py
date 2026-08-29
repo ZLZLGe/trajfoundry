@@ -259,13 +259,16 @@ def _pairing_issues(messages: list[Message]) -> list[AuditIssue]:
     return issues
 
 
+def _has_final_assistant_turn(messages: list[Message]) -> bool:
+    return bool(
+        messages and messages[-1].role == "assistant" and not messages[-1].tool_calls
+    )
+
+
 def _local_complete(node: TrajectoryNode, pairing: list[AuditIssue]) -> bool:
     if pairing:
         return False
-    if not node.messages or node.messages[-1].role != "assistant":
-        return False
-    last = node.messages[-1]
-    return not bool(last.tool_calls)
+    return _has_final_assistant_turn(node.messages)
 
 
 def _descendants(children: Iterable[TrajectoryNode]) -> Iterator[TrajectoryNode]:
@@ -406,6 +409,7 @@ def enrich_trajectory(
 
     spawn_calls = _spawn_call_ids(node.messages)
     subtree_complete, unkeyed_mounts = _mount_state(node, children)
+    has_final_assistant_turn = _has_final_assistant_turn(node.messages)
     local_complete = _local_complete(node, pairing)
     has_sub = bool(spawn_calls or children or _has_mount_failure(node))
     if is_subagent and top_level:
@@ -433,6 +437,45 @@ def enrich_trajectory(
         ),
         *pairing,
     ]
+    if missing_defs:
+        audit_issues.append(
+            AuditIssue(
+                code="missing_tool_definitions",
+                stage="quality",
+                path="/missing_tool_defs",
+                detail=f"{len(missing_defs)} called tool definition(s) are missing",
+            )
+        )
+    if (
+        check.extra_arg_calls
+        or check.missing_required_calls
+        or check.type_mismatch_calls
+    ):
+        audit_issues.append(
+            AuditIssue(
+                code="tool_call_schema_mismatch",
+                stage="quality",
+                path="/tool_call_check",
+                detail=(
+                    "tool-call schema mismatches: "
+                    f"extra_args={check.extra_arg_calls}, "
+                    f"missing_required={check.missing_required_calls}, "
+                    f"type_mismatch={check.type_mismatch_calls}"
+                ),
+            )
+        )
+    if not has_final_assistant_turn:
+        audit_issues.append(
+            AuditIssue(
+                code="no_final_assistant_turn",
+                stage="quality",
+                path="/messages",
+                detail=(
+                    "trajectory does not end with an assistant message without "
+                    "tool calls"
+                ),
+            )
+        )
     if node.compaction_items:
         audit_issues.append(
             AuditIssue(
@@ -529,9 +572,7 @@ def enrich_trajectory(
             unkeyed_mounts=unkeyed_mounts,
             relay_mounts=len(node.sub_agent_relay_mounts or {}),
             trailing_unanswered_call=_trailing_unanswered_call(node.messages, pairing),
-            no_final_assistant_turn=not node.messages
-            or node.messages[-1].role != "assistant"
-            or bool(node.messages[-1].tool_calls),
+            no_final_assistant_turn=not has_final_assistant_turn,
         )
         update["normalization_audit"] = audit
     else:

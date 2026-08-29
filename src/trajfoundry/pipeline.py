@@ -44,7 +44,7 @@ from .streaming import streaming_prefix_leaves
 from .subagents import SubagentMountPlan, plan_subagent_mounts
 from .tool_names import is_spawn_tool_name
 
-NORMALIZER_REVISION = "2026-08-29.1"
+NORMALIZER_REVISION = "2026-08-29.3"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 
@@ -269,6 +269,8 @@ def _finish_tools(
 
 def _merge_contributor_metadata(
     snapshots: Iterable[Snapshot],
+    *,
+    server_origin_source_path: str | None = None,
 ) -> tuple[
     list[ToolDefinition],
     list[ServerToolCall],
@@ -279,6 +281,7 @@ def _merge_contributor_metadata(
     tool_candidates: dict[str, list[ToolDefinition]] = defaultdict(list)
     server_calls: list[ServerToolCall] = []
     server_slots: dict[tuple[str, int], int] = {}
+    authoritative_origin_slots: set[tuple[str, int]] = set()
     server_variants: set[tuple[str, int, bytes]] = set()
     server_issues: list[AuditIssue] = []
     agent_messages: dict[bytes, AgentMessageRecord] = {}
@@ -310,6 +313,8 @@ def _merge_contributor_metadata(
                 server_slots[slot] = len(server_calls)
                 server_variants.add((call.id, ordinal, signature))
                 server_calls.append(call.model_copy(deep=True))
+                if snapshot.source_path == server_origin_source_path:
+                    authoritative_origin_slots.add(slot)
                 continue
             previous = server_calls[previous_index]
             names_compatible = (
@@ -347,7 +352,12 @@ def _merge_contributor_metadata(
                     )
                 )
             else:
-                update: dict[str, Any] = {"origin": call.origin}
+                update: dict[str, Any] = {}
+                if (
+                    snapshot.source_path == server_origin_source_path
+                    or slot not in authoritative_origin_slots
+                ):
+                    update["origin"] = call.origin
                 if not previous.name and call.name:
                     update["name"] = call.name
                 if previous.result is None and call.result is not None:
@@ -355,6 +365,8 @@ def _merge_contributor_metadata(
                 server_calls[previous_index] = previous.model_copy(
                     update=update, deep=True
                 )
+                if snapshot.source_path == server_origin_source_path:
+                    authoritative_origin_slots.add(slot)
                 continue
 
             variant = (call.id, ordinal, signature)
@@ -420,7 +432,10 @@ def _trajectory_from_leaf(
     if not any(item.source_path == leaf.source_path for item in contributor_list):
         contributor_list.append(leaf)
     tools, server_calls, agent_messages, compaction_items, contributor_issues = (
-        _merge_contributor_metadata(contributor_list)
+        _merge_contributor_metadata(
+            contributor_list,
+            server_origin_source_path=leaf.source_path,
+        )
     )
     issues = _merged_issues(
         leaf.issues,

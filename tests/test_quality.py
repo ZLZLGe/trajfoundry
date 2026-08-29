@@ -30,6 +30,40 @@ def _complete_leaf(source: str) -> TrajectoryNode:
     )
 
 
+def _completed_tool_call_trajectory(
+    *,
+    arguments: object,
+    tools: list[ToolDefinition],
+    tool_name: str = "read",
+) -> TrajectoryNode:
+    return TrajectoryNode(
+        messages=[
+            Message(role="user", content="go"),
+            Message(
+                role="assistant",
+                content="",
+                reasoning_content="",
+                tool_calls=[
+                    ToolCall(
+                        id="call-1",
+                        function=FunctionCall(name=tool_name, arguments=arguments),
+                    )
+                ],
+            ),
+            Message(
+                role="tool",
+                tool_call_id="call-1",
+                name=tool_name,
+                content="ok",
+            ),
+            Message(role="assistant", content="done", reasoning_content=""),
+        ],
+        tools=tools,
+        source="root.json",
+        metadata=Metadata(source_file="root.json"),
+    )
+
+
 def _spawn_parent(
     source: str,
     call_id: str,
@@ -100,6 +134,168 @@ def test_complete_tool_trajectory_passes_strict_gate() -> None:
     assert enriched.total_tool_calls == 1
     assert enriched.completeness_tag == "complete_main_no_sub"
     assert is_strict_sample(enriched)
+
+
+def test_missing_tool_definition_gets_reason_without_schema_mismatch() -> None:
+    node = _completed_tool_call_trajectory(
+        arguments={"path": "x"},
+        tools=[],
+        tool_name="unknown_read",
+    )
+
+    enriched = enrich_trajectory(node)
+    without_derived_audit = enriched.model_copy(
+        update={"normalization_audit": NormalizationAudit(tag=AuditTag.PASS)}
+    )
+
+    assert trajectory_id(enriched) == trajectory_id(without_derived_audit)
+    assert enriched.missing_tool_defs == ["unknown_read"]
+    assert enriched.normalization_audit is not None
+    assert enriched.normalization_audit.reason_codes == ["missing_tool_definitions"]
+    assert "tool_call_schema_mismatch" not in enriched.normalization_audit.reason_codes
+    assert enriched.tool_call_check.undefined_tool_calls == 1
+    assert enriched.tool_call_check.extra_arg_calls == 0
+    assert enriched.tool_call_check.missing_required_calls == 0
+    assert enriched.tool_call_check.type_mismatch_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("arguments", "parameters", "counter"),
+    [
+        (
+            {"path": "x", "unexpected": True},
+            {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+            "extra_arg_calls",
+        ),
+        (
+            {},
+            {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+            "missing_required_calls",
+        ),
+        (
+            {"path": 1},
+            {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+            "type_mismatch_calls",
+        ),
+    ],
+)
+def test_schema_validation_failures_get_one_summary_reason(
+    arguments: object,
+    parameters: dict[str, object],
+    counter: str,
+) -> None:
+    node = _completed_tool_call_trajectory(
+        arguments=arguments,
+        tools=[ToolDefinition(name="read", parameters=parameters)],
+    )
+
+    enriched = enrich_trajectory(node)
+
+    assert getattr(enriched.tool_call_check, counter) == 1
+    assert enriched.normalization_audit is not None
+    assert enriched.normalization_audit.reason_codes == ["tool_call_schema_mismatch"]
+    assert (
+        sum(
+            issue.code == "tool_call_schema_mismatch"
+            for issue in enriched.normalization_audit.issues
+        )
+        == 1
+    )
+
+
+def test_no_final_assistant_turn_gets_reason_code() -> None:
+    node = TrajectoryNode(
+        messages=[Message(role="user", content="continue")],
+        tools=[],
+        source="root.json",
+        metadata=Metadata(source_file="root.json"),
+    )
+
+    enriched = enrich_trajectory(node)
+
+    assert enriched.completeness is not None
+    assert enriched.completeness.no_final_assistant_turn
+    assert enriched.normalization_audit is not None
+    assert enriched.normalization_audit.reason_codes == ["no_final_assistant_turn"]
+
+
+def test_quality_reason_codes_coexist_and_are_idempotent() -> None:
+    node = TrajectoryNode(
+        messages=[
+            Message(
+                role="assistant",
+                content="",
+                reasoning_content="",
+                tool_calls=[
+                    ToolCall(
+                        id="call-1",
+                        function=FunctionCall(name="unknown_read", arguments={}),
+                    ),
+                    ToolCall(
+                        id="call-2",
+                        function=FunctionCall(name="read", arguments={"path": 1}),
+                    ),
+                ],
+            )
+        ],
+        tools=[
+            ToolDefinition(
+                name="read",
+                parameters={
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            )
+        ],
+        source="root.json",
+        metadata=Metadata(source_file="root.json"),
+    )
+
+    first = enrich_trajectory(node)
+    second = enrich_trajectory(first)
+
+    assert first.normalization_audit is not None
+    assert first.normalization_audit.reason_codes == [
+        "missing_tool_definitions",
+        "missing_tool_result",
+        "no_final_assistant_turn",
+        "tool_call_schema_mismatch",
+    ]
+    assert second == first
+
+
+def test_child_no_final_assistant_reason_stays_local() -> None:
+    child = TrajectoryNode(
+        messages=[Message(role="user", content="continue")],
+        tools=[],
+        source="child.json",
+        metadata=Metadata(source_file="child.json"),
+    )
+    parent = _spawn_parent("root.json", "spawn-child", child)
+
+    enriched = enrich_trajectory(parent)
+
+    assert enriched.normalization_audit is not None
+    assert enriched.normalization_audit.reason_codes == ["subagent_quality_failure"]
+    assert enriched.sub_agent_trajectory is not None
+    enriched_child = enriched.sub_agent_trajectory["spawn-child"]
+    assert enriched_child.normalization_audit is not None
+    assert enriched_child.normalization_audit.reason_codes == [
+        "no_final_assistant_turn"
+    ]
 
 
 def test_opaque_compaction_context_quarantines_complete_trajectory() -> None:
@@ -744,6 +940,7 @@ def test_enrichment_discards_stale_derived_issues_after_message_repair() -> None
     first = enrich_trajectory(node)
     assert first.normalization_audit is not None
     assert "missing_tool_result" in first.normalization_audit.reason_codes
+    assert "no_final_assistant_turn" in first.normalization_audit.reason_codes
 
     repaired = first.model_copy(deep=True)
     repaired.messages.extend(
@@ -762,6 +959,7 @@ def test_enrichment_discards_stale_derived_issues_after_message_repair() -> None
     assert second.normalization_audit is not None
     assert second.normalization_audit.tag == AuditTag.PASS
     assert "missing_tool_result" not in second.normalization_audit.reason_codes
+    assert "no_final_assistant_turn" not in second.normalization_audit.reason_codes
     assert second == enrich_trajectory(second)
 
 

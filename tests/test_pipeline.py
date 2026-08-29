@@ -467,6 +467,135 @@ def test_conflicting_replayed_server_results_are_preserved_and_quarantined() -> 
     assert {issue.code for issue in issues} == {"duplicate_server_tool_result"}
 
 
+@pytest.mark.parametrize(
+    "leaf_origin",
+    ["history", "response"],
+)
+def test_replayed_server_tool_origin_follows_leaf(
+    leaf_origin: str,
+) -> None:
+    call = ServerToolCall(
+        name="web_search",
+        id="server-1",
+        arguments={"query": "x"},
+        origin="response",
+        result={"type": "web_search_tool_result", "content": ["result"]},
+    )
+    contributor = Snapshot(
+        source_path="z/previous.json",
+        source_sha256="a" * 64,
+        session_id="session",
+        thread_id="thread",
+        provider="anthropic",
+        operation="messages",
+        outcome="success",
+        server_tool_calls=[call],
+    )
+    leaf = contributor.model_copy(
+        update={
+            "source_path": "a/leaf.json",
+            "source_sha256": "b" * 64,
+            "server_tool_calls": [call.model_copy(update={"origin": leaf_origin})],
+        }
+    )
+
+    contributor_first = _trajectory_from_leaf(leaf, [contributor, leaf])
+    leaf_first = _trajectory_from_leaf(leaf, [leaf, contributor])
+
+    assert contributor_first.server_tool_calls == leaf_first.server_tool_calls
+    assert len(contributor_first.server_tool_calls) == 1
+    assert contributor_first.server_tool_calls[0].origin == leaf_origin
+
+
+def test_leaf_origin_priority_does_not_reorder_conflicting_server_variants() -> None:
+    leaf_call = ServerToolCall(
+        name="web_search",
+        id="server-1",
+        arguments={"query": "leaf"},
+        origin="history",
+    )
+    contributor_call = leaf_call.model_copy(
+        update={"arguments": {"query": "contributor"}, "origin": "response"}
+    )
+    leaf = Snapshot(
+        source_path="a/leaf.json",
+        source_sha256="a" * 64,
+        session_id="session",
+        thread_id="thread",
+        provider="anthropic",
+        operation="messages",
+        outcome="success",
+        server_tool_calls=[leaf_call],
+    )
+    first_contributor = leaf.model_copy(
+        update={
+            "source_path": "b/first.json",
+            "source_sha256": "b" * 64,
+            "server_tool_calls": [contributor_call],
+        }
+    )
+    second_contributor = first_contributor.model_copy(
+        update={
+            "source_path": "c/second.json",
+            "source_sha256": "c" * 64,
+            "server_tool_calls": [
+                contributor_call.model_copy(update={"origin": "history"})
+            ],
+        }
+    )
+
+    node = _trajectory_from_leaf(
+        leaf,
+        [leaf, first_contributor, second_contributor],
+    )
+
+    assert [(call.arguments, call.origin) for call in node.server_tool_calls] == [
+        ({"query": "leaf"}, "history"),
+        ({"query": "contributor"}, "response"),
+        ({"query": "contributor"}, "history"),
+    ]
+
+
+def test_replayed_server_tool_origin_priority_is_per_occurrence() -> None:
+    contributor_calls = [
+        ServerToolCall(
+            name="web_search",
+            id="server-1",
+            arguments={"query": query},
+            origin="response",
+        )
+        for query in ("first", "second", "contributor-only")
+    ]
+    contributor = Snapshot(
+        source_path="z/previous.json",
+        source_sha256="a" * 64,
+        session_id="session",
+        thread_id="thread",
+        provider="anthropic",
+        operation="messages",
+        outcome="success",
+        server_tool_calls=contributor_calls,
+    )
+    leaf = contributor.model_copy(
+        update={
+            "source_path": "a/leaf.json",
+            "source_sha256": "b" * 64,
+            "server_tool_calls": [
+                call.model_copy(update={"origin": "history"})
+                for call in contributor_calls[:2]
+            ],
+        }
+    )
+
+    node = _trajectory_from_leaf(leaf, [leaf, contributor])
+
+    assert [call.origin for call in node.server_tool_calls] == [
+        "history",
+        "history",
+        "response",
+    ]
+
+
 def test_leaf_messages_stay_exact_while_contributor_evidence_is_unioned() -> None:
     question = Message(role="user", content="q")
     earlier_assistant = Message(
