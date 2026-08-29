@@ -11,7 +11,7 @@ from collections.abc import Iterable, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Literal
 
 from .canonical import (
     canonical_compaction_records,
@@ -37,14 +37,16 @@ from .models import (
     TrajectoryNode,
 )
 from .providers.anthropic import parse_anthropic_capture
+from .providers.chat import parse_chat_capture
 from .providers.responses import parse_responses_capture
 from .quality import enrich_trajectory
+from .sources.tokenplan import TokenPlanError, adapt_tokenplan_envelope
 from .state import StateStore
 from .streaming import streaming_prefix_leaves
 from .subagents import SubagentMountPlan, plan_subagent_mounts
 from .tool_names import is_spawn_tool_name
 
-NORMALIZER_REVISION = "2026-08-29.3"
+NORMALIZER_REVISION = "2026-08-30.1"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 
@@ -112,6 +114,7 @@ def _normalization_locks(config: PipelineConfig) -> Iterable[None]:
 @dataclass(frozen=True, slots=True)
 class PipelineConfig:
     input_root: Path = DEFAULT_INPUT
+    input_format: Literal["freerouter", "tokenplan"] = "freerouter"
     output_root: Path = DEFAULT_OUTPUT
     state_path: Path | None = None
     resume: bool = False
@@ -128,6 +131,7 @@ class PipelineStats:
     reused: int = 0
     parsed: int = 0
     parse_failures: int = 0
+    skipped_inputs: int = 0
     eligible_snapshots: int = 0
     prefix_intermediates: int = 0
     leaf_snapshots: int = 0
@@ -155,6 +159,10 @@ def config_hash(config: PipelineConfig) -> str:
     value = {
         "normalizer_revision": NORMALIZER_REVISION,
         "schema_version": SCHEMA_VERSION,
+        "input_format": config.input_format,
+        "media_policy": (
+            "skip_and_count" if config.input_format == "tokenplan" else "not_applicable"
+        ),
         "aggregation_scope": ["session_id", "thread_id"],
         "prefix_message_fields": {
             "system_developer_user": ["role", "content"],
@@ -185,6 +193,8 @@ def parse_capture(
     *,
     source_path: str,
     source_sha256: str,
+    source_name: Literal["freerouter", "tokenplan"] = "freerouter",
+    response_is_normalized_final: bool = False,
 ) -> Snapshot:
     endpoint_value = capture.get("path")
     endpoint = (
@@ -197,15 +207,29 @@ def parse_capture(
         "source_sha256": source_sha256,
     }
     if endpoint in {"/v1/responses", "/responses"}:
-        return parse_responses_capture(capture, **arguments)
-    if endpoint in {
+        snapshot = parse_responses_capture(capture, **arguments)
+    elif endpoint in {"/v1/chat/completions", "/chat/completions"}:
+        snapshot = parse_chat_capture(
+            capture,
+            response_is_normalized_final=response_is_normalized_final,
+            **arguments,
+        )
+    elif endpoint in {
         "/v1/messages",
         "/messages",
         "/v1/messages/count_tokens",
         "/messages/count_tokens",
     }:
-        return parse_anthropic_capture(capture, **arguments)
-    raise UnsupportedCaptureError(f"unsupported capture endpoint: {endpoint!r}")
+        snapshot = parse_anthropic_capture(
+            capture,
+            response_is_normalized_final=response_is_normalized_final,
+            **arguments,
+        )
+    else:
+        raise UnsupportedCaptureError(f"unsupported capture endpoint: {endpoint!r}")
+    if snapshot.source_name == source_name:
+        return snapshot
+    return snapshot.model_copy(update={"source_name": source_name})
 
 
 def _definition_score(definition: ToolDefinition) -> tuple[int, int, int, bytes]:
@@ -456,6 +480,7 @@ def _trajectory_from_leaf(
         server_tool_calls=server_calls,
         metadata=Metadata(
             source_file=basename,
+            source_name=leaf.source_name,
             line_no=0,
             created_at=leaf.captured_at,
         ),
@@ -964,7 +989,16 @@ def _export(state: StateStore, config: PipelineConfig, configuration_hash: str) 
             endpoint,
             captured_at,
         ) in state.capture_records():
+            if status == "skipped":
+                output.write_skipped(reason)
+                continue
             if status == "failed":
+                reason_code = reason.partition(":")[0]
+                if reason_code not in {
+                    "tokenplan_empty_envelope",
+                    "invalid_tokenplan_envelope",
+                }:
+                    reason_code = "capture_parse_failed"
                 output.write_record(
                     QuarantineRecord(
                         source_ref=source_ref,
@@ -973,10 +1007,10 @@ def _export(state: StateStore, config: PipelineConfig, configuration_hash: str) 
                         captured_at=captured_at,
                         normalization_audit=NormalizationAudit(
                             tag=AuditTag.QUARANTINED,
-                            reason_codes=["capture_parse_failed"],
+                            reason_codes=[reason_code],
                             issues=[
                                 AuditIssue(
-                                    code="capture_parse_failed",
+                                    code=reason_code,
                                     stage="ingest",
                                     detail=reason,
                                 )
@@ -991,7 +1025,11 @@ def _export(state: StateStore, config: PipelineConfig, configuration_hash: str) 
 
         for _, node, origins in state.iter_trajectories():
             output.write_trajectory(node, origins)
-        output.close(input_root=str(config.input_root), config_hash=configuration_hash)
+        output.close(
+            input_root=str(config.input_root),
+            input_format=config.input_format,
+            config_hash=configuration_hash,
+        )
     except BaseException:
         output.abort()
         raise
@@ -1019,6 +1057,7 @@ def normalize(config: PipelineConfig) -> PipelineStats:
 
     normalized_config = PipelineConfig(
         input_root=input_root,
+        input_format=config.input_format,
         output_root=output_root,
         state_path=(
             config.state_path.resolve() if config.state_path is not None else None
@@ -1039,7 +1078,10 @@ def normalize(config: PipelineConfig) -> PipelineStats:
             state.reset_ingest()
         state.set_meta("config_hash", configuration_hash)
         state.begin_scan(uuid.uuid4().hex)
-        for path in discover_captures(input_root):
+        for path in discover_captures(
+            input_root,
+            input_format=normalized_config.input_format,
+        ):
             stats.discovered += 1
             source_ref = path.relative_to(input_root).as_posix()
             digest = ""
@@ -1050,7 +1092,29 @@ def normalize(config: PipelineConfig) -> PipelineStats:
                 if state.capture_matches(source_ref, digest):
                     stats.reused += 1
                     continue
-                capture = decode_capture(payload)
+                capture = decode_capture(
+                    payload,
+                    input_format=normalized_config.input_format,
+                )
+                source_name: Literal["freerouter", "tokenplan"] = "freerouter"
+                response_is_normalized_final = False
+                if normalized_config.input_format == "tokenplan":
+                    adapted = adapt_tokenplan_envelope(capture)
+                    capture = adapted.capture
+                    source_name = adapted.source_name
+                    endpoint = adapted.endpoint
+                    captured_at = adapted.captured_at
+                    response_is_normalized_final = adapted.response_is_normalized_final
+                    if adapted.has_media:
+                        state.put_skipped(
+                            source_ref,
+                            digest,
+                            "unsupported_media_capture",
+                            endpoint=endpoint,
+                            captured_at=captured_at,
+                        )
+                        stats.skipped_inputs += 1
+                        continue
                 endpoint_value = capture.get("path")
                 endpoint = (
                     endpoint_value.split("?", 1)[0].rstrip("/")
@@ -1063,9 +1127,20 @@ def normalize(config: PipelineConfig) -> PipelineStats:
                     capture,
                     source_path=source_ref,
                     source_sha256=digest,
+                    source_name=source_name,
+                    response_is_normalized_final=response_is_normalized_final,
                 )
                 state.put_snapshot(snapshot, endpoint=endpoint)
                 stats.parsed += 1
+            except TokenPlanError as error:
+                state.put_failure(
+                    source_ref,
+                    digest,
+                    f"{error.code}: {error.detail}",
+                    endpoint=endpoint,
+                    captured_at=captured_at,
+                )
+                stats.parse_failures += 1
             except Exception as error:  # noqa: BLE001 - quarantine per-file defects
                 state.put_failure(
                     source_ref,
@@ -1076,6 +1151,9 @@ def normalize(config: PipelineConfig) -> PipelineStats:
                 )
                 stats.parse_failures += 1
         state.finish_scan()
+        stats.skipped_inputs = sum(
+            status == "skipped" for _, _, status, _, _, _ in state.capture_records()
+        )
         _build_trajectories(state, stats)
         _export(state, normalized_config, configuration_hash)
     return stats

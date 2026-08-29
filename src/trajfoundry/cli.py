@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import orjson
 import typer
@@ -22,7 +22,7 @@ from .validation import validate_output
 
 app = typer.Typer(
     name="trajfoundry",
-    help="Normalize freerouter captures into auditable trajectory JSONL.",
+    help="Normalize supported capture formats into auditable trajectory JSONL.",
     no_args_is_help=True,
 )
 
@@ -31,8 +31,15 @@ app = typer.Typer(
 def normalize_command(
     input_root: Annotated[
         Path,
-        typer.Option("--input", help="Root containing freerouter JSON captures."),
+        typer.Option("--input", help="Root containing source capture files."),
     ] = DEFAULT_INPUT,
+    input_format: Annotated[
+        Literal["freerouter", "tokenplan"],
+        typer.Option(
+            "--input-format",
+            help="Input layout and envelope format.",
+        ),
+    ] = "freerouter",
     output_root: Annotated[
         Path,
         typer.Option("--output", help="Destination for normalized shards."),
@@ -56,6 +63,7 @@ def normalize_command(
         stats = run_normalize(
             PipelineConfig(
                 input_root=input_root,
+                input_format=input_format,
                 output_root=output_root,
                 state_path=state_path,
                 resume=resume,
@@ -111,6 +119,7 @@ def inspect_command(
             "schema_version": manifest.get("schema_version"),
             "created_at": manifest.get("created_at"),
             "input_root": manifest.get("input_root"),
+            "input_format": manifest.get("input_format", "freerouter"),
             "counts": manifest.get("counts", {}),
         }
         typer.echo(json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2))

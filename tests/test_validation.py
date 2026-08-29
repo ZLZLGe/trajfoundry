@@ -228,6 +228,66 @@ def test_validate_output_requires_complete_input_coverage(tmp_path: Path) -> Non
     assert any("input_files" in error for error in report.errors)
 
 
+def test_validate_output_accepts_skipped_input_coverage(tmp_path: Path) -> None:
+    _write_output(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest = orjson.loads(manifest_path.read_bytes())
+    manifest["counts"]["input_files"] += 2
+    manifest["counts"]["skipped_inputs"] = 2
+    manifest["counts"]["skip_reason_counts"] = {
+        "empty_envelope": 1,
+        "test_input": 1,
+    }
+    manifest_path.write_bytes(orjson.dumps(manifest))
+
+    report = validate_output(tmp_path)
+
+    assert report.valid
+
+
+def test_validate_output_rejects_inconsistent_skip_counts(tmp_path: Path) -> None:
+    _write_output(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest = orjson.loads(manifest_path.read_bytes())
+    manifest["counts"]["input_files"] += 1
+    manifest["counts"]["skipped_inputs"] = 1
+    manifest["counts"]["skip_reason_counts"] = {"test_input": 2}
+    manifest_path.write_bytes(orjson.dumps(manifest))
+
+    report = validate_output(tmp_path)
+
+    assert not report.valid
+    assert any("skipped_inputs" in error for error in report.errors)
+
+
+def test_validate_output_accepts_v2_manifest_with_skip_defaults(tmp_path: Path) -> None:
+    _write_output(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest = orjson.loads(manifest_path.read_bytes())
+    manifest["schema_version"] = "trajfoundry-v2"
+    manifest.pop("input_format")
+    manifest["counts"].pop("skipped_inputs")
+    manifest["counts"].pop("skip_reason_counts")
+    manifest_path.write_bytes(orjson.dumps(manifest))
+
+    report = validate_output(tmp_path)
+
+    assert report.valid
+
+
+def test_validate_output_rejects_unknown_v3_input_format(tmp_path: Path) -> None:
+    _write_output(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest = orjson.loads(manifest_path.read_bytes())
+    manifest["input_format"] = "unknown"
+    manifest_path.write_bytes(orjson.dumps(manifest))
+
+    report = validate_output(tmp_path)
+
+    assert not report.valid
+    assert report.errors == ["manifest.json violates the manifest contract"]
+
+
 @pytest.mark.parametrize(
     "mutate",
     [

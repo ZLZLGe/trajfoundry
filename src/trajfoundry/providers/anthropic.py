@@ -1021,6 +1021,7 @@ def _parse_stream_response(
     saw_start = False
     saw_stop = False
     saw_error = False
+    saw_max_tokens = False
     state_valid = sequence_valid
     model = ""
 
@@ -1051,6 +1052,8 @@ def _parse_stream_response(
             saw_start = True
             message = data.get("message", {})
             if isinstance(message, dict):
+                if message.get("stop_reason") == "max_tokens":
+                    saw_max_tokens = True
                 if message.get("role") != "assistant":
                     context.issues.append(
                         _issue(
@@ -1231,6 +1234,11 @@ def _parse_stream_response(
                     )
                 )
                 state_valid = False
+            delta = data.get("delta")
+            if (
+                isinstance(delta, dict) and delta.get("stop_reason") == "max_tokens"
+            ) or data.get("stop_reason") == "max_tokens":
+                saw_max_tokens = True
             continue
         elif event == "message_stop":
             if not saw_start:
@@ -1321,10 +1329,18 @@ def _parse_stream_response(
             path="response_body.content",
         )
     ]
+    if saw_max_tokens:
+        context.issues.append(
+            _issue(
+                "anthropic_max_tokens_truncated",
+                "response stopped because the model reached max_tokens",
+                path="response_body",
+            )
+        )
     wire_complete = saw_start and saw_stop and state_valid and not saw_error
     if saw_error:
         outcome = "api_error"
-    elif not saw_stop or not state_valid:
+    elif saw_max_tokens or not saw_stop or not state_valid:
         outcome = "truncated"
     else:
         outcome = "success"
@@ -1383,6 +1399,15 @@ def _parse_nonstream_response(
             path="response_body.content",
         )
     ]
+    if body.get("stop_reason") == "max_tokens":
+        context.issues.append(
+            _issue(
+                "anthropic_max_tokens_truncated",
+                "response stopped because the model reached max_tokens",
+                path="response_body.stop_reason",
+            )
+        )
+        return response, _text(body.get("model")), False, "truncated"
     return response, _text(body.get("model")), True, "success"
 
 
@@ -1478,6 +1503,7 @@ def parse_anthropic_capture(
     *,
     source_path: str,
     source_sha256: str,
+    response_is_normalized_final: bool = False,
 ) -> Snapshot:
     """Parse one freerouter Anthropic capture.
 
@@ -1605,7 +1631,7 @@ def parse_anthropic_capture(
         response_model = ""
         outcome = "api_error"
         wire_complete = False
-    elif (
+    elif not response_is_normalized_final and (
         capture.get("is_stream") is True
         or request.get("stream") is True
         or isinstance(capture.get("response_body"), list)

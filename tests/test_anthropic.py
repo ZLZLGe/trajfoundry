@@ -295,6 +295,85 @@ def test_nonstream_response_and_mid_conversation_system_message() -> None:
     assert snapshot.termination == ""
 
 
+@pytest.mark.parametrize(
+    ("is_stream", "response_is_normalized_final"),
+    [(False, False), (True, True)],
+    ids=["nonstream", "normalized-final"],
+)
+def test_final_response_max_tokens_is_truncated_and_preserves_content(
+    is_stream: bool,
+    response_is_normalized_final: bool,
+) -> None:
+    snapshot = parse_anthropic_capture(
+        _capture(
+            request_body={
+                "model": "claude-test",
+                "stream": is_stream,
+                "messages": [{"role": "user", "content": "continue"}],
+            },
+            response_body={
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-test",
+                "stop_reason": "max_tokens",
+                "content": [{"type": "text", "text": "partial answer"}],
+            },
+            is_stream=is_stream,
+        ),
+        source_path="/captures/example.json",
+        source_sha256="a" * 64,
+        response_is_normalized_final=response_is_normalized_final,
+    )
+
+    assert snapshot.outcome == "truncated"
+    assert snapshot.wire_complete is False
+    assert snapshot.response[0].content == "partial answer"
+    assert snapshot.termination == ""
+    assert "anthropic_max_tokens_truncated" in {issue.code for issue in snapshot.issues}
+
+
+@pytest.mark.parametrize("stop_location", ["message_start", "message_delta"])
+def test_stream_max_tokens_is_truncated_and_preserves_content(
+    stop_location: str,
+) -> None:
+    start_message: dict[str, object] = {
+        "role": "assistant",
+        "model": "claude-test",
+        "content": [],
+    }
+    if stop_location == "message_start":
+        start_message["stop_reason"] = "max_tokens"
+    response = [
+        _event(1, "message_start", message=start_message),
+        _event(
+            2,
+            "content_block_start",
+            index=0,
+            content_block={"type": "text", "text": ""},
+        ),
+        _event(
+            3,
+            "content_block_delta",
+            index=0,
+            delta={"type": "text_delta", "text": "partial answer"},
+        ),
+        _event(4, "content_block_stop", index=0),
+    ]
+    if stop_location == "message_delta":
+        response.append(_event(5, "message_delta", delta={"stop_reason": "max_tokens"}))
+    response.append(
+        _event(6 if stop_location == "message_delta" else 5, "message_stop")
+    )
+
+    snapshot = _parse(_capture(response_body=response, is_stream=True))
+
+    assert snapshot.outcome == "truncated"
+    assert snapshot.wire_complete is False
+    assert snapshot.response[0].content == "partial answer"
+    assert snapshot.termination == ""
+    assert "anthropic_max_tokens_truncated" in {issue.code for issue in snapshot.issues}
+
+
 def test_server_tools_are_separate_from_client_tools_and_results_attach() -> None:
     capture = _capture(
         request_body={

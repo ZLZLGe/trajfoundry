@@ -1,7 +1,7 @@
 [project]
 name = "trajfoundry"
 version = "0.1.0"
-description = "Normalize freerouter HTTP captures into auditable training trajectories."
+description = "Normalize supported capture formats into auditable training trajectories."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

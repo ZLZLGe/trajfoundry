@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 import orjson
 
@@ -18,7 +18,7 @@ from .models import QuarantineRecord, TrajectoryNode
 from .output_contract import project_quarantine_record, project_trajectory
 from .quality import is_strict_sample, validate_derived_fields
 
-SCHEMA_VERSION = "trajfoundry-v2"
+SCHEMA_VERSION = "trajfoundry-v3"
 
 
 @dataclass
@@ -30,10 +30,18 @@ class ExportStats:
     duplicate_trajectories: int = 0
     input_files: int = 0
     reason_counts: dict[str, int] = field(default_factory=dict)
+    skipped_inputs: int = 0
+    skip_reason_counts: dict[str, int] = field(default_factory=dict)
 
     def add_reasons(self, reasons: list[str]) -> None:
         for reason in reasons:
             self.reason_counts[reason] = self.reason_counts.get(reason, 0) + 1
+
+    def add_skipped(self, reason: str) -> None:
+        if not reason:
+            raise ValueError("skip reason must not be empty")
+        self.skipped_inputs += 1
+        self.skip_reason_counts[reason] = self.skip_reason_counts.get(reason, 0) + 1
 
 
 class OutputSet:
@@ -159,7 +167,22 @@ class OutputSet:
             self.stats.excluded_records += 1
         self.stats.add_reasons(record.normalization_audit.reason_codes)
 
-    def close(self, *, input_root: str, config_hash: str) -> None:
+    def write_skipped(self, reason: str) -> None:
+        """Count an intentionally omitted input without emitting a row.
+
+        Skipped inputs have no normalized record and deliberately contribute no
+        lineage.  Their reason is retained only in the run manifest summary.
+        """
+
+        self.stats.add_skipped(reason)
+
+    def close(
+        self,
+        *,
+        input_root: str,
+        config_hash: str,
+        input_format: Literal["freerouter", "tokenplan"] = "freerouter",
+    ) -> None:
         self.accepted.close()
         self.quarantined.close()
         self.records.close()
@@ -182,11 +205,15 @@ class OutputSet:
             "schema_version": SCHEMA_VERSION,
             "created_at": datetime.now(UTC).isoformat(),
             "input_root": input_root,
+            "input_format": input_format,
             "config_hash": config_hash,
             "token_estimator": "unicode-word-v1",
             "counts": {
                 **self.stats.__dict__,
                 "reason_counts": dict(sorted(self.stats.reason_counts.items())),
+                "skip_reason_counts": dict(
+                    sorted(self.stats.skip_reason_counts.items())
+                ),
             },
             "files": [
                 {

@@ -12,7 +12,6 @@ import orjson
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .canonical import trajectory_id
-from .export import SCHEMA_VERSION
 from .io import file_sha256
 from .models import AuditTag
 from .output_contract import (
@@ -53,16 +52,32 @@ class _ManifestCounts(_StrictContract):
     duplicate_trajectories: NonNegativeInt
     input_files: NonNegativeInt
     reason_counts: dict[str, NonNegativeInt]
+    skipped_inputs: NonNegativeInt = 0
+    skip_reason_counts: dict[str, NonNegativeInt] = Field(default_factory=dict)
 
 
 class _Manifest(_StrictContract):
-    schema_version: Literal["trajfoundry-v2"]
+    schema_version: Literal["trajfoundry-v2", "trajfoundry-v3"]
     created_at: str
     input_root: str
+    input_format: Literal["freerouter", "tokenplan"] = "freerouter"
     config_hash: str
     token_estimator: str
     counts: _ManifestCounts
     files: list[_ManifestFile]
+
+    @model_validator(mode="after")
+    def require_v3_skip_fields(self) -> _Manifest:
+        """Keep v2 readable while requiring the new accounting in v3."""
+
+        if self.schema_version == "trajfoundry-v3":
+            if "input_format" not in self.model_fields_set:
+                raise ValueError("v3 manifest requires input_format")
+            if "skipped_inputs" not in self.counts.model_fields_set:
+                raise ValueError("v3 manifest requires counts.skipped_inputs")
+            if "skip_reason_counts" not in self.counts.model_fields_set:
+                raise ValueError("v3 manifest requires counts.skip_reason_counts")
+        return self
 
 
 class _LineageOrigin(_StrictContract):
@@ -127,6 +142,7 @@ class _Observed:
             "lineage_records": 0,
             "duplicate_trajectories": 0,
             "input_files_declared": 0,
+            "skipped_inputs": 0,
         }
     )
     reason_counts: Counter[str] = field(default_factory=Counter)
@@ -403,11 +419,9 @@ def validate_output(root: Path) -> ValidationReport:
             valid=False, errors=errors.finish(), counts=observed.counts
         )
 
-    if manifest.schema_version != SCHEMA_VERSION:
-        errors.add("manifest.json has an unsupported schema version")
-
     observed.counts["manifest_files"] = len(manifest.files)
     observed.counts["input_files_declared"] = manifest.counts.input_files
+    observed.counts["skipped_inputs"] = manifest.counts.skipped_inputs
     seen_paths: set[str] = set()
     lineage_entries = 0
 
@@ -485,8 +499,17 @@ def validate_output(root: Path) -> ValidationReport:
         errors.add("trajectory IDs must be globally unique")
     if any(count != 1 for count in observed.lineage_ids.values()):
         errors.add("lineage trajectory IDs must be globally unique")
-    if len(observed.covered_sources) != manifest.counts.input_files:
-        errors.add("input_files does not match unique lineage and quarantine sources")
+    if (
+        len(observed.covered_sources) + manifest.counts.skipped_inputs
+        != manifest.counts.input_files
+    ):
+        errors.add(
+            "input_files does not match unique lineage, quarantine, and skipped sources"
+        )
+    if manifest.counts.skipped_inputs != sum(
+        manifest.counts.skip_reason_counts.values()
+    ):
+        errors.add("skipped_inputs does not match skip_reason_counts")
 
     _compare_manifest_counts(manifest, observed, errors)
     messages = errors.finish()

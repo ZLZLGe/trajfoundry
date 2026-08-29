@@ -1,8 +1,8 @@
 # TrajFoundry
 
-TrajFoundry normalizes desensitized freerouter HTTP captures into deterministic,
-auditable trajectory JSONL. It is an independent project: it does not import,
-write to, or depend on AutoData or DataHarness.
+TrajFoundry normalizes desensitized Freerouter captures and TokenPlan feedback
+envelopes into deterministic, auditable trajectory JSONL. It is an independent
+project: it does not import, write to, or depend on AutoData or DataHarness.
 
 The first phase implements trajectory standardization. The data contract is
 based on `/root/ailab文档/轨迹标准化/轨迹数据的标准化格式.docx`, with these
@@ -28,11 +28,22 @@ confirmed project-level extensions and overrides:
 uv sync --python 3.11 --dev --locked
 
 uv run trajfoundry normalize \
+  --input-format freerouter \
   --input /data/回流轨迹/data_feedback_des \
   --output /data/trajfoundry
 
 uv run trajfoundry validate --output /data/trajfoundry
 uv run trajfoundry inspect --output /data/trajfoundry
+```
+
+TokenPlan uses an explicit input format so its manifests and media assets are
+not mistaken for request captures:
+
+```bash
+uv run trajfoundry normalize \
+  --input-format tokenplan \
+  --input /data/回流轨迹/lakehouse/token-plan/raw/v001 \
+  --output /data/trajfoundry-tokenplan
 ```
 
 The input tree is read-only. A non-empty output directory requires `--resume`:
@@ -52,11 +63,24 @@ timestamp changes.
 ## Normalization rules
 
 - Supported endpoints: OpenAI-compatible Responses and Anthropic Messages,
-  including streamed and non-streamed responses. Anthropic `count_tokens`
-  captures are recorded as excluded non-trajectory records.
+  plus OpenAI-compatible Chat Completions. Streamed and non-streamed responses
+  are supported; TokenPlan's normalized-final stream objects are parsed as
+  final objects without changing the original request's `stream` value.
+  Anthropic `count_tokens` captures are recorded as excluded non-trajectory
+  records.
+- TokenPlan discovery selects only `req_*.json`; partition manifests and media
+  files are not capture inputs. Media-bearing envelopes are intentionally
+  skipped under the current text-only contract and are counted by reason in
+  the manifest without producing trajectory, quarantine, or lineage rows.
 - Only a successful, structurally complete terminal response has
   `wire_complete=true`. API errors, transport failures, SSE gaps, truncation,
-  and invalid captures are quarantined.
+  and invalid captures are quarantined. Explicit Anthropic
+  `stop_reason=max_tokens` and Chat Completions
+  `finish_reason=length|content_filter` are treated as truncation without
+  inventing a `termination` value.
+- New runs use manifest schema `trajfoundry-v3`, which records `input_format`,
+  `skipped_inputs`, and `skip_reason_counts`; validation remains backward
+  compatible with existing v2 manifests.
 - `--input` defines the dataset boundary. Cumulative snapshots are grouped only
   by `(session_id, thread_id)`; storage directories are provenance, not
   trajectory identity. A snapshot is suppressed only when its complete

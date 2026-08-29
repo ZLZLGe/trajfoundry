@@ -6,7 +6,7 @@ import hashlib
 import os
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 import orjson
 
@@ -18,8 +18,27 @@ SAFE_REQUEST_HEADERS = {
 }
 
 
-def discover_captures(root: Path) -> Iterator[Path]:
-    yield from sorted(path for path in root.rglob("*.json") if path.is_file())
+def discover_captures(
+    root: Path,
+    *,
+    input_format: Literal["freerouter", "tokenplan"] = "freerouter",
+) -> Iterator[Path]:
+    """Yield only capture files for the selected source format.
+
+    TokenPlan partitions also contain manifests and media assets.  Request
+    envelopes have a stable ``req_*.json`` basename, so selecting that shape
+    keeps manifests out of ingest without inspecting or mutating the source
+    tree.  A caller can include a top-level ``test`` partition simply by
+    choosing an input root that contains it.
+    """
+
+    if input_format == "freerouter":
+        pattern = "*.json"
+    elif input_format == "tokenplan":
+        pattern = "req_*.json"
+    else:  # pragma: no cover - PipelineConfig constrains the public value.
+        raise ValueError(f"unsupported input format: {input_format!r}")
+    yield from sorted(path for path in root.rglob(pattern) if path.is_file())
 
 
 def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -44,7 +63,11 @@ def read_capture_bytes(path: Path) -> tuple[bytes, str]:
     return payload, hashlib.sha256(payload).hexdigest()
 
 
-def decode_capture(payload: bytes) -> dict[str, Any]:
+def decode_capture(
+    payload: bytes,
+    *,
+    input_format: Literal["freerouter", "tokenplan"] = "freerouter",
+) -> dict[str, Any]:
     """Decode one capture while discarding sensitive headers immediately.
 
     Memory is bounded by an individual capture, never by a complete session.
@@ -53,17 +76,20 @@ def decode_capture(payload: bytes) -> dict[str, Any]:
     capture = orjson.loads(payload)
     if not isinstance(capture, dict):
         raise TypeError("capture root must be a JSON object")
-    raw_headers = capture.get("request_headers")
-    if isinstance(raw_headers, dict):
-        capture["request_headers"] = {
-            str(key).lower(): value
-            for key, value in raw_headers.items()
-            if str(key).lower() in SAFE_REQUEST_HEADERS
-        }
-    else:
-        capture["request_headers"] = {}
-    capture.pop("response_headers", None)
-    capture.pop("query_string", None)
+    if input_format == "freerouter":
+        raw_headers = capture.get("request_headers")
+        if isinstance(raw_headers, dict):
+            capture["request_headers"] = {
+                str(key).lower(): value
+                for key, value in raw_headers.items()
+                if str(key).lower() in SAFE_REQUEST_HEADERS
+            }
+        else:
+            capture["request_headers"] = {}
+        capture.pop("response_headers", None)
+        capture.pop("query_string", None)
+    elif input_format != "tokenplan":
+        raise ValueError(f"unsupported input format: {input_format!r}")
     return capture
 
 

@@ -287,8 +287,8 @@ def test_compaction_projection_is_lossless_and_round_trips() -> None:
     assert project_trajectory(restored) == projected
 
 
-def test_compaction_items_is_a_required_v2_array_on_every_node() -> None:
-    assert SCHEMA_VERSION == "trajfoundry-v2"
+def test_compaction_items_is_a_required_array_on_every_node() -> None:
+    assert SCHEMA_VERSION == "trajfoundry-v3"
 
     plain = project_trajectory(_trajectory())
     assert plain["compaction_items"] == []

@@ -240,7 +240,7 @@ class ToolCallCheck(StrictModel):
 
 class Metadata(StrictModel):
     source_file: str
-    source_name: Literal["freerouter"] = "freerouter"
+    source_name: Literal["freerouter", "tokenplan"] = "freerouter"
     line_no: int = 0
     created_at: str = ""
 
@@ -301,6 +301,7 @@ class TrajectoryNode(StrictModel):
 class Snapshot(StrictModel):
     source_path: str
     source_sha256: str
+    source_name: Literal["freerouter", "tokenplan"] = "freerouter"
     session_id: str
     thread_id: str
     turn_id: str = ""
@@ -309,7 +310,7 @@ class Snapshot(StrictModel):
     forked_from_thread_id: str = ""
     subagent_marker: str = ""
     provider: Literal["openai", "anthropic"]
-    operation: Literal["responses", "messages", "count_tokens"]
+    operation: Literal["responses", "chat_completions", "messages", "count_tokens"]
     outcome: Literal[
         "success", "api_error", "transport_error", "truncated", "capture_invalid"
     ]

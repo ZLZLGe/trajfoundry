@@ -186,7 +186,10 @@ class StateStore:
         row = self.connection.execute(
             "SELECT sha256, status FROM captures WHERE source_path=?", (source_path,)
         ).fetchone()
-        matched = bool(row and row[0] == sha256 and row[1] == "parsed")
+        # A skipped input is a deliberate, terminal ingest decision just like a
+        # parsed snapshot.  It must participate in a resumed scan so that a
+        # stable non-trajectory file is not repeatedly reclassified.
+        matched = bool(row and row[0] == sha256 and row[1] in {"parsed", "skipped"})
         if matched and self._scan_id is not None:
             self.connection.execute(
                 "UPDATE captures SET scan_id=? WHERE source_path=?",
@@ -266,6 +269,44 @@ class StateStore:
                     source_path,
                     sha256,
                     "failed",
+                    reason,
+                    endpoint,
+                    captured_at,
+                    self._scan_id or "",
+                ),
+            )
+
+    def put_skipped(
+        self,
+        source_path: str,
+        sha256: str,
+        reason: str,
+        *,
+        endpoint: str = "",
+        captured_at: str = "",
+    ) -> None:
+        """Persist a non-exported input and its stable skip reason."""
+
+        if not reason:
+            raise ValueError("skipped capture reason must not be empty")
+        with self.connection:
+            self.connection.execute(
+                "DELETE FROM snapshots WHERE source_path=?", (source_path,)
+            )
+            self.connection.execute(
+                """
+                INSERT INTO captures(
+                    source_path,sha256,status,reason,endpoint,captured_at,scan_id
+                ) VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(source_path) DO UPDATE SET
+                    sha256=excluded.sha256,status=excluded.status,reason=excluded.reason,
+                    endpoint=excluded.endpoint,captured_at=excluded.captured_at,
+                    scan_id=excluded.scan_id
+                """,
+                (
+                    source_path,
+                    sha256,
+                    "skipped",
                     reason,
                     endpoint,
                     captured_at,

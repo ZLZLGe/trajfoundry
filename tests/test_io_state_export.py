@@ -83,6 +83,29 @@ def test_failed_reparse_removes_stale_snapshot(tmp_path: Path) -> None:
         assert state.get_snapshot(snapshot.source_path) is None
 
 
+def test_skipped_capture_is_resumable_and_removes_stale_snapshot(
+    tmp_path: Path,
+) -> None:
+    snapshot = Snapshot(
+        source_path="test/sample.json",
+        source_sha256="a" * 64,
+        session_id="s",
+        thread_id="t",
+        provider="openai",
+        operation="responses",
+        outcome="success",
+    )
+    with StateStore(tmp_path / "state.sqlite") as state:
+        state.begin_scan("first")
+        state.put_snapshot(snapshot)
+        state.put_skipped(snapshot.source_path, "b" * 64, "test_input")
+        assert state.get_snapshot(snapshot.source_path) is None
+        assert state.capture_matches(snapshot.source_path, "b" * 64)
+        assert list(state.capture_records()) == [
+            (snapshot.source_path, "b" * 64, "skipped", "test_input", "", "")
+        ]
+
+
 def test_completed_inventory_removes_deleted_sources(tmp_path: Path) -> None:
     snapshot = Snapshot(
         source_path="gone.json",
@@ -198,6 +221,25 @@ def test_export_writes_manifest_and_lineage(tmp_path: Path) -> None:
         if entry["path"].endswith("/lineage.jsonl")
     )
     assert (tmp_path / lineage).is_file()
+
+
+def test_export_counts_skipped_inputs_without_emitting_rows(tmp_path: Path) -> None:
+    output = OutputSet(tmp_path)
+    output.stats.input_files = 2
+    output.write_skipped("test_input")
+    output.write_skipped("empty_envelope")
+    output.close(input_root="/input", config_hash="config", input_format="tokenplan")
+
+    manifest = orjson.loads((tmp_path / "manifest.json").read_bytes())
+    assert manifest["schema_version"] == "trajfoundry-v3"
+    assert manifest["input_format"] == "tokenplan"
+    assert manifest["counts"]["skipped_inputs"] == 2
+    assert manifest["counts"]["skip_reason_counts"] == {
+        "empty_envelope": 1,
+        "test_input": 1,
+    }
+    assert not any("accepted/" in item["path"] for item in manifest["files"])
+    assert not any("quarantine/" in item["path"] for item in manifest["files"])
 
 
 def test_aborted_export_publishes_no_partial_run(tmp_path: Path) -> None:
