@@ -14,6 +14,7 @@ from .models import (
     AuditIssue,
     CompactionRecord,
     Completeness,
+    MediaMapping,
     Message,
     NormalizationAudit,
     QuarantineRecord,
@@ -327,6 +328,50 @@ def _validate_compaction(value: object, path: str) -> None:
         _fail(f"{path}/item/type", "must equal 'compaction'")
 
 
+def _validate_media_mapping(value: object, path: str) -> None:
+    """Validate one published media-part to object-name mapping.
+
+    ``object_name`` is a storage filename, rather than an arbitrary path.  Keep
+    this boundary strict so a record cannot accidentally publish a path outside
+    the capture's media directory.
+    """
+
+    mapping = _object(value, path)
+    _keys(mapping, path, required={"part_id", "object_name"})
+    part_id = _string(mapping["part_id"], f"{path}/part_id", nonempty=True)
+    if not part_id.strip():
+        _fail(f"{path}/part_id", "must not be blank")
+    object_name = _string(mapping["object_name"], f"{path}/object_name", nonempty=True)
+    if not object_name.strip():
+        _fail(f"{path}/object_name", "must not be blank")
+    if (
+        PurePath(object_name).name != object_name
+        or "/" in object_name
+        or "\\" in object_name
+        or "\x00" in object_name
+        or object_name in {".", ".."}
+    ):
+        _fail(
+            f"{path}/object_name",
+            "must be a non-empty filename basename",
+        )
+
+
+def _validate_media_mappings(value: object, path: str) -> list[Any]:
+    mappings = _array(value, path)
+    if not mappings:
+        _fail(path, "must be omitted when empty")
+    seen_part_ids: set[str] = set()
+    for index, mapping in enumerate(mappings):
+        mapping_path = f"{path}/{index}"
+        _validate_media_mapping(mapping, mapping_path)
+        part_id = mapping["part_id"]
+        if part_id in seen_part_ids:
+            _fail(f"{mapping_path}/part_id", "must be unique")
+        seen_part_ids.add(part_id)
+    return mappings
+
+
 def _validate_issue(value: object, path: str) -> None:
     issue = _object(value, path)
     _keys(
@@ -403,6 +448,7 @@ _NODE_REQUIRED = {
     "normalization_audit",
 }
 _NODE_OPTIONAL = {
+    "multimodal_file_mapping",
     "sub_agent_trajectory",
     "sub_agent_relay_mounts",
     "completeness_tag",
@@ -500,6 +546,11 @@ def _validate_node(value: object, path: str, *, top_level: bool) -> tuple[bool, 
     messages = _array(node["messages"], f"{path}/messages")
     for index, message in enumerate(messages):
         _validate_message(message, f"{path}/messages/{index}")
+    if "multimodal_file_mapping" in node:
+        _validate_media_mappings(
+            node["multimodal_file_mapping"],
+            f"{path}/multimodal_file_mapping",
+        )
     tools = _array(node["tools"], f"{path}/tools")
     for index, definition in enumerate(tools):
         _validate_tool_definition(definition, f"{path}/tools/{index}")
@@ -797,6 +848,13 @@ def _project_compaction(value: CompactionRecord) -> dict[str, Any]:
     }
 
 
+def _project_media_mapping(value: MediaMapping) -> dict[str, Any]:
+    return {
+        "part_id": value.part_id,
+        "object_name": value.object_name,
+    }
+
+
 def _project_message(message: Message) -> dict[str, Any]:
     result: dict[str, Any] = {"role": message.role, "content": message.content}
     if message.role == "assistant":
@@ -894,6 +952,10 @@ def _project_trajectory(
         },
         "normalization_audit": _project_audit(node.normalization_audit),
     }
+    if node.multimodal_file_mapping:
+        result["multimodal_file_mapping"] = [
+            _project_media_mapping(mapping) for mapping in node.multimodal_file_mapping
+        ]
     if node.sub_agent_trajectory:
         result["sub_agent_trajectory"] = {
             call_id: _project_trajectory(

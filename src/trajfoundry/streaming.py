@@ -193,6 +193,7 @@ def _evidence_copy(snapshot: Snapshot) -> Snapshot:
             "instructions": "",
             "termination": "",
             "issues": [],
+            "multimodal_file_mapping": [],
         },
         deep=False,
     )

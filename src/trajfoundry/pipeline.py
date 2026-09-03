@@ -26,6 +26,7 @@ from .models import (
     AuditIssue,
     AuditTag,
     CompactionRecord,
+    MediaMapping,
     Message,
     Metadata,
     NormalizationAudit,
@@ -46,7 +47,7 @@ from .streaming import streaming_prefix_leaves
 from .subagents import SubagentMountPlan, plan_subagent_mounts
 from .tool_names import is_spawn_tool_name
 
-NORMALIZER_REVISION = "2026-08-30.1"
+NORMALIZER_REVISION = "2026-09-03.1"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 
@@ -161,7 +162,9 @@ def config_hash(config: PipelineConfig) -> str:
         "schema_version": SCHEMA_VERSION,
         "input_format": config.input_format,
         "media_policy": (
-            "skip_and_count" if config.input_format == "tokenplan" else "not_applicable"
+            "capture_used_object_name_mapping"
+            if config.input_format == "tokenplan"
+            else "not_applicable"
         ),
         "aggregation_scope": ["session_id", "thread_id"],
         "prefix_message_fields": {
@@ -195,6 +198,7 @@ def parse_capture(
     source_sha256: str,
     source_name: Literal["freerouter", "tokenplan"] = "freerouter",
     response_is_normalized_final: bool = False,
+    multimodal_file_mapping: Sequence[MediaMapping] | None = None,
 ) -> Snapshot:
     endpoint_value = capture.get("path")
     endpoint = (
@@ -227,9 +231,14 @@ def parse_capture(
         )
     else:
         raise UnsupportedCaptureError(f"unsupported capture endpoint: {endpoint!r}")
-    if snapshot.source_name == source_name:
-        return snapshot
-    return snapshot.model_copy(update={"source_name": source_name})
+    updates: dict[str, Any] = {}
+    if snapshot.source_name != source_name:
+        updates["source_name"] = source_name
+    if multimodal_file_mapping is not None:
+        updates["multimodal_file_mapping"] = [
+            item.model_copy(deep=True) for item in multimodal_file_mapping
+        ]
+    return snapshot.model_copy(update=updates) if updates else snapshot
 
 
 def _definition_score(definition: ToolDefinition) -> tuple[int, int, int, bytes]:
@@ -438,6 +447,42 @@ def _contributor_leaf_warnings(
     return warnings
 
 
+def _merged_multimodal_file_mapping(
+    leaf: Snapshot, contributors: Iterable[Snapshot]
+) -> list[MediaMapping]:
+    """Union media mappings from a leaf and its cumulative prefix captures.
+
+    Contributors are ordered by the same stable capture key used elsewhere in
+    the pipeline.  A part is emitted once, while the selected leaf remains
+    authoritative if a replay supplied a different filename for that part.
+    """
+
+    snapshots = list(contributors)
+    snapshots.sort(key=_snapshot_order_key)
+
+    by_part: dict[str, MediaMapping] = {}
+    part_order: list[str] = []
+
+    # The leaf contains the complete request history in normal cumulative
+    # captures, so its order is the most faithful representation of first use
+    # in the published transcript.  It is also authoritative when a replay
+    # reused a part id with a different storage name.
+    for entry in leaf.multimodal_file_mapping:
+        if entry.part_id not in by_part:
+            part_order.append(entry.part_id)
+        by_part[entry.part_id] = entry.model_copy(deep=True)
+
+    # Prefix captures can contain a media reference omitted by a later replay
+    # (for example after provider-side compaction).  Retain those mappings, but
+    # append them deterministically after the leaf's first-use order.
+    for snapshot in snapshots:
+        for entry in snapshot.multimodal_file_mapping:
+            if entry.part_id not in by_part:
+                part_order.append(entry.part_id)
+                by_part[entry.part_id] = entry.model_copy(deep=True)
+    return [by_part[part_id] for part_id in part_order]
+
+
 def _initial_audit(issues: Sequence[AuditIssue]) -> NormalizationAudit:
     reasons = sorted(
         {issue.code for issue in issues if issue.severity == Severity.ERROR}
@@ -466,9 +511,11 @@ def _trajectory_from_leaf(
         contributor_issues,
         _contributor_leaf_warnings(leaf, contributor_list),
     )
+    multimodal_file_mapping = _merged_multimodal_file_mapping(leaf, contributor_list)
     basename = Path(leaf.source_path).name
     return TrajectoryNode(
         messages=[*leaf.history, *leaf.response],
+        multimodal_file_mapping=multimodal_file_mapping,
         tools=tools,
         agent_messages=agent_messages,
         compaction_items=compaction_items,
@@ -623,6 +670,7 @@ def _minimal_evidence(snapshot: Snapshot) -> Snapshot:
             "instructions": "",
             "termination": "",
             "issues": [],
+            "multimodal_file_mapping": [],
         },
         deep=False,
     )
@@ -649,6 +697,7 @@ def _routing_snapshot(snapshot: Snapshot) -> Snapshot:
             "instructions": "",
             "termination": "",
             "issues": [],
+            "multimodal_file_mapping": [],
         },
         deep=False,
     )
@@ -1098,6 +1147,7 @@ def normalize(config: PipelineConfig) -> PipelineStats:
                 )
                 source_name: Literal["freerouter", "tokenplan"] = "freerouter"
                 response_is_normalized_final = False
+                multimodal_file_mapping: list[MediaMapping] = []
                 if normalized_config.input_format == "tokenplan":
                     adapted = adapt_tokenplan_envelope(capture)
                     capture = adapted.capture
@@ -1105,16 +1155,7 @@ def normalize(config: PipelineConfig) -> PipelineStats:
                     endpoint = adapted.endpoint
                     captured_at = adapted.captured_at
                     response_is_normalized_final = adapted.response_is_normalized_final
-                    if adapted.has_media:
-                        state.put_skipped(
-                            source_ref,
-                            digest,
-                            "unsupported_media_capture",
-                            endpoint=endpoint,
-                            captured_at=captured_at,
-                        )
-                        stats.skipped_inputs += 1
-                        continue
+                    multimodal_file_mapping = adapted.multimodal_file_mapping
                 endpoint_value = capture.get("path")
                 endpoint = (
                     endpoint_value.split("?", 1)[0].rstrip("/")
@@ -1129,6 +1170,7 @@ def normalize(config: PipelineConfig) -> PipelineStats:
                     source_sha256=digest,
                     source_name=source_name,
                     response_is_normalized_final=response_is_normalized_final,
+                    multimodal_file_mapping=multimodal_file_mapping,
                 )
                 state.put_snapshot(snapshot, endpoint=endpoint)
                 stats.parsed += 1

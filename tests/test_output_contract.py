@@ -14,6 +14,7 @@ from trajfoundry.models import (
     AuditTag,
     CompactionRecord,
     FunctionCall,
+    MediaMapping,
     Message,
     Metadata,
     NormalizationAudit,
@@ -104,6 +105,18 @@ def _trajectory_with_compaction(source: str = "source.json") -> TrajectoryNode:
             update={"compaction_items": [_compaction_record()]},
             deep=True,
         )
+    )
+
+
+def _trajectory_with_media_mapping(source: str = "source.json") -> TrajectoryNode:
+    return _trajectory(source).model_copy(
+        update={
+            "multimodal_file_mapping": [
+                MediaMapping(part_id="media_0", object_name="media_0-image.png"),
+                MediaMapping(part_id="media_1", object_name="media_1-photo.jpeg"),
+            ]
+        },
+        deep=True,
     )
 
 
@@ -307,6 +320,75 @@ def test_compaction_items_is_a_required_array_on_every_node() -> None:
     assert mounted["sub_agent_trajectory"]["spawn-1"]["compaction_items"] == []
 
 
+def test_media_mapping_projection_round_trips_in_first_use_order() -> None:
+    node = _trajectory_with_media_mapping()
+
+    projected = project_trajectory(node)
+    assert projected["multimodal_file_mapping"] == [
+        {"part_id": "media_0", "object_name": "media_0-image.png"},
+        {"part_id": "media_1", "object_name": "media_1-photo.jpeg"},
+    ]
+
+    restored = parse_trajectory_record(projected)
+    assert restored.multimodal_file_mapping == node.multimodal_file_mapping
+    assert project_trajectory(restored) == projected
+
+
+def test_empty_media_mapping_is_omitted_and_legacy_record_still_parses() -> None:
+    projected = project_trajectory(_trajectory())
+    assert "multimodal_file_mapping" not in projected
+
+    restored = parse_trajectory_record(projected)
+    assert restored.multimodal_file_mapping == []
+    assert project_trajectory(restored) == projected
+
+
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [
+        ({}, "multimodal_file_mapping"),
+        ([], "must be omitted when empty"),
+        ([{"part_id": "", "object_name": "image.png"}], "part_id"),
+        ([{"part_id": " ", "object_name": "image.png"}], "blank"),
+        ([{"part_id": "media_0", "object_name": ""}], "object_name"),
+        ([{"part_id": "media_0", "object_name": "   "}], "blank"),
+        ([{"part_id": "media_0", "object_name": "nested/image.png"}], "basename"),
+        ([{"part_id": "media_0", "object_name": "image.png", "extra": 1}], "extra"),
+        (
+            [
+                {"part_id": "media_0", "object_name": "first.png"},
+                {"part_id": "media_0", "object_name": "second.png"},
+            ],
+            "unique",
+        ),
+    ],
+)
+def test_media_mapping_output_rejects_invalid_items(value: object, error: str) -> None:
+    projected = project_trajectory(_trajectory())
+    projected["multimodal_file_mapping"] = value
+
+    with pytest.raises(OutputContractError, match=error):
+        parse_trajectory_record(projected)
+
+
+def test_media_mapping_is_supported_on_nested_nodes() -> None:
+    node = _trajectory_with_relay_mount()
+    assert node.sub_agent_trajectory is not None
+    node.sub_agent_trajectory["spawn-1"].multimodal_file_mapping = [
+        MediaMapping(part_id="media_child", object_name="child.png")
+    ]
+
+    projected = project_trajectory(node)
+    assert projected["sub_agent_trajectory"]["spawn-1"]["multimodal_file_mapping"] == [
+        {"part_id": "media_child", "object_name": "child.png"}
+    ]
+    restored = parse_trajectory_record(projected)
+    assert (
+        restored.sub_agent_trajectory["spawn-1"].multimodal_file_mapping
+        == node.sub_agent_trajectory["spawn-1"].multimodal_file_mapping
+    )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "error"),
     [
@@ -341,6 +423,13 @@ def test_compaction_changes_canonical_trajectory_id() -> None:
     compacted = _trajectory_with_compaction()
 
     assert trajectory_id(compacted) != trajectory_id(plain)
+
+
+def test_media_mapping_changes_canonical_trajectory_id() -> None:
+    plain = _trajectory()
+    mapped = _trajectory_with_media_mapping()
+
+    assert trajectory_id(mapped) != trajectory_id(plain)
 
 
 def test_trajectory_projection_rejects_invalid_assignment() -> None:

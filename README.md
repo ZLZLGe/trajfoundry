@@ -69,9 +69,11 @@ timestamp changes.
   Anthropic `count_tokens` captures are recorded as excluded non-trajectory
   records.
 - TokenPlan discovery selects only `req_*.json`; partition manifests and media
-  files are not capture inputs. Media-bearing envelopes are intentionally
-  skipped under the current text-only contract and are counted by reason in
-  the manifest without producing trajectory, quarantine, or lineage rows.
+  files are not capture inputs. Media-bearing envelopes are normalized without
+  copying media bytes. When a body contains an explicit `$media_ref:<part_id>`
+  reference, the published trajectory includes the optional
+  `multimodal_file_mapping` entry for that part and its stored `object_name`;
+  unused attachments are omitted.
 - Only a successful, structurally complete terminal response has
   `wire_complete=true`. API errors, transport failures, SSE gaps, truncation,
   and invalid captures are quarantined. Explicit Anthropic

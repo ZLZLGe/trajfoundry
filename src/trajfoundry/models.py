@@ -245,6 +245,13 @@ class Metadata(StrictModel):
     created_at: str = ""
 
 
+class MediaMapping(StrictModel):
+    """Map a structured media part reference to its stored object filename."""
+
+    part_id: str = Field(min_length=1)
+    object_name: str = Field(min_length=1)
+
+
 class Completeness(StrictModel):
     is_subagent: bool
     spawn_calls: int = 0
@@ -258,6 +265,7 @@ class Completeness(StrictModel):
 
 class TrajectoryNode(StrictModel):
     messages: list[Message]
+    multimodal_file_mapping: list[MediaMapping] = Field(default_factory=list)
     tools: list[ToolDefinition]
     agent_messages: list[AgentMessageRecord] = Field(default_factory=list)
     compaction_items: list[CompactionRecord] = Field(default_factory=list)
@@ -319,6 +327,7 @@ class Snapshot(StrictModel):
     model: str = ""
     harness: str = "unknown"
     instructions: str = ""
+    multimodal_file_mapping: list[MediaMapping] = Field(default_factory=list)
     history: list[Message] = Field(default_factory=list)
     response: list[Message] = Field(default_factory=list)
     tools: list[ToolDefinition] = Field(default_factory=list)

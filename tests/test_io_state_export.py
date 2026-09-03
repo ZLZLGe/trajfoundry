@@ -3,11 +3,13 @@ from pathlib import Path
 
 import orjson
 
+from trajfoundry.canonical import trajectory_id
 from trajfoundry.export import OutputSet
 from trajfoundry.io import JsonlShardWriter, load_capture
 from trajfoundry.models import (
     AuditTag,
     CompactionRecord,
+    MediaMapping,
     Message,
     Metadata,
     NormalizationAudit,
@@ -49,6 +51,9 @@ def test_state_round_trip_compresses_snapshot(tmp_path: Path) -> None:
         operation="responses",
         outcome="success",
         history=[Message(role="user", content="hello")],
+        multimodal_file_mapping=[
+            MediaMapping(part_id="media_0", object_name="media_0-image.png")
+        ],
         compaction_items=[
             CompactionRecord(
                 origin="history",
@@ -65,6 +70,44 @@ def test_state_round_trip_compresses_snapshot(tmp_path: Path) -> None:
         state.put_snapshot(snapshot)
         restored = list(state.iter_snapshots())
     assert restored == [snapshot]
+
+
+def test_state_round_trip_preserves_trajectory_media_mapping(tmp_path: Path) -> None:
+    node = enrich_trajectory(
+        TrajectoryNode(
+            messages=[
+                Message(role="user", content="look"),
+                Message(role="assistant", content="done", reasoning_content=""),
+            ],
+            tools=[],
+            source="media.json",
+            metadata=Metadata(source_file="media.json"),
+            multimodal_file_mapping=[
+                MediaMapping(part_id="media_0", object_name="stored.png")
+            ],
+        )
+    )
+    identifier = trajectory_id(node)
+    assert node.normalization_audit is not None
+
+    with StateStore(tmp_path / "state.sqlite") as state:
+        state.put_trajectory(
+            identifier,
+            node,
+            representative_key="media.json",
+            source_ref="media.json",
+            sha256="a" * 64,
+            captured_at="2026-09-03T00:00:00Z",
+            disposition=node.normalization_audit.tag.value,
+            reason_codes=node.normalization_audit.reason_codes,
+        )
+        restored = list(state.iter_trajectories())
+
+    assert len(restored) == 1
+    assert restored[0][0] == identifier
+    assert restored[0][1].multimodal_file_mapping == [
+        MediaMapping(part_id="media_0", object_name="stored.png")
+    ]
 
 
 def test_failed_reparse_removes_stale_snapshot(tmp_path: Path) -> None:

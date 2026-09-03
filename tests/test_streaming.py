@@ -4,6 +4,7 @@ from trajfoundry.models import (
     AgentMessageEvidence,
     CompactionRecord,
     FunctionCall,
+    MediaMapping,
     Message,
     Snapshot,
     ToolCall,
@@ -65,6 +66,41 @@ def test_streaming_keeps_all_divergent_leaves() -> None:
     assert [leaf.source_path for leaf in result.leaves] == ["b", "c"]
     assert result.contributor_paths["b"] == ("a", "b")
     assert result.contributor_paths["c"] == ("a", "c")
+
+
+def test_streaming_preserves_leaf_media_mapping_across_prefix_fold() -> None:
+    question = Message(role="user", content="q")
+    answer = Message(role="assistant", content="a", reasoning_content="")
+    final_question = Message(role="user", content="next")
+    final = Message(role="assistant", content="done", reasoning_content="")
+    short = snap("short-media", [question], [answer]).model_copy(
+        update={
+            "multimodal_file_mapping": [
+                MediaMapping(part_id="media_0", object_name="first.png")
+            ]
+        }
+    )
+    leaf = snap(
+        "leaf-media",
+        [question, answer, final_question],
+        [final],
+    ).model_copy(
+        update={
+            "multimodal_file_mapping": [
+                MediaMapping(part_id="media_0", object_name="first.png"),
+                MediaMapping(part_id="media_1", object_name="second.jpg"),
+            ]
+        }
+    )
+
+    result = streaming_prefix_leaves([leaf, short])
+
+    assert result.leaves == (leaf,)
+    assert result.leaves[0].multimodal_file_mapping == [
+        MediaMapping(part_id="media_0", object_name="first.png"),
+        MediaMapping(part_id="media_1", object_name="second.jpg"),
+    ]
+    assert result.contributor_paths["leaf-media"] == ("leaf-media", "short-media")
 
 
 def test_instructions_do_not_split_proven_prefix_chains() -> None:

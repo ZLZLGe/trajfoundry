@@ -11,6 +11,7 @@ from trajfoundry.models import (
     AuditIssue,
     AuditTag,
     FunctionCall,
+    MediaMapping,
     Message,
     ServerToolCall,
     Severity,
@@ -25,6 +26,7 @@ from trajfoundry.pipeline import (
     _exclusive_lock,
     _flat_semantic_key,
     _merge_contributor_metadata,
+    _merged_multimodal_file_mapping,
     _trajectory_from_leaf,
     normalize,
 )
@@ -695,6 +697,48 @@ def test_leaf_messages_stay_exact_while_contributor_evidence_is_unioned() -> Non
         "contributor_termination_changed",
     }
     assert node.normalization_audit.tag == AuditTag.PASS
+
+
+def test_multimodal_mapping_prefers_leaf_order_and_appends_prefix_only_parts() -> None:
+    contributor = Snapshot(
+        source_path="old/short.json",
+        source_sha256="a" * 64,
+        session_id="session",
+        thread_id="thread",
+        provider="openai",
+        operation="responses",
+        outcome="success",
+        multimodal_file_mapping=[
+            MediaMapping(part_id="media_1", object_name="old-one.png"),
+            MediaMapping(part_id="media_2", object_name="prefix-only.jpg"),
+        ],
+    )
+    leaf = contributor.model_copy(
+        update={
+            "source_path": "new/leaf.json",
+            "source_sha256": "b" * 64,
+            "multimodal_file_mapping": [
+                # The leaf's order is the order of first use in its complete
+                # request history and therefore must come first.
+                MediaMapping(part_id="media_0", object_name="leaf-zero.png"),
+                # A replay may provide a different object name for the same
+                # part; the selected leaf is authoritative.
+                MediaMapping(part_id="media_1", object_name="leaf-one.png"),
+            ],
+        }
+    )
+
+    merged = _merged_multimodal_file_mapping(leaf, [contributor, leaf])
+
+    assert merged == [
+        MediaMapping(part_id="media_0", object_name="leaf-zero.png"),
+        MediaMapping(part_id="media_1", object_name="leaf-one.png"),
+        MediaMapping(part_id="media_2", object_name="prefix-only.jpg"),
+    ]
+    assert (
+        _trajectory_from_leaf(leaf, [contributor, leaf]).multimodal_file_mapping
+        == merged
+    )
 
 
 def test_output_may_not_be_nested_under_input(tmp_path: Path) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from trajfoundry.models import MediaMapping
 from trajfoundry.providers.anthropic import parse_anthropic_capture
 from trajfoundry.providers.chat import parse_chat_capture
 from trajfoundry.sources.tokenplan import TokenPlanError, adapt_tokenplan_envelope
@@ -237,3 +238,223 @@ def test_tokenplan_chat_marker_and_request_identity_are_preserved() -> None:
     assert snapshot.turn_id == "body-turn"
     assert snapshot.outcome == "success"
     assert snapshot.issues == []
+
+
+def test_tokenplan_maps_only_explicit_body_refs_in_first_use_order() -> None:
+    request_body = {
+        "model": "claude-test",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "before"},
+                    {"type": "image", "source": {"url": "$media_ref:media_1"}},
+                    {"type": "text", "text": "again $media_ref:media_1"},
+                    {"type": "image", "source": {"url": "$media_ref:media_0"}},
+                ],
+            }
+        ],
+    }
+    response_body = {"text": 'embedded {"url":"$media_ref:media_0"}'}
+    adapted = adapt_tokenplan_envelope(
+        _envelope(
+            request_body=request_body,
+            response_body=response_body,
+            media=[
+                {"part_id": "media_0", "object_name": "media_0-hash.png"},
+                {"part_id": "media_1", "object_name": "media_1-hash.jpg"},
+                {"part_id": "media_unused", "object_name": "unused.png"},
+            ],
+        )
+    )
+
+    assert adapted.multimodal_file_mapping == [
+        MediaMapping(part_id="media_1", object_name="media_1-hash.jpg"),
+        MediaMapping(part_id="media_0", object_name="media_0-hash.png"),
+    ]
+    assert adapted.capture["request_body"] is request_body
+    assert adapted.capture["response_body"] is response_body
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "($media_ref:media_0)",
+        "`$media_ref:media_0`",
+        "$media_ref:media_0\u3002",
+    ],
+    ids=["parentheses", "backticks", "unicode-punctuation"],
+)
+def test_tokenplan_plain_media_ref_stops_at_prose_punctuation(content: str) -> None:
+    adapted = adapt_tokenplan_envelope(
+        _envelope(
+            request_body={
+                "model": "claude-test",
+                "messages": [{"role": "user", "content": content}],
+            },
+            media=[{"part_id": "media_0", "object_name": "stored.png"}],
+        )
+    )
+
+    assert adapted.multimodal_file_mapping == [
+        MediaMapping(part_id="media_0", object_name="stored.png")
+    ]
+
+
+def test_tokenplan_supports_structured_media_ref_without_parsing_labels() -> None:
+    request_body = {
+        "model": "claude-test",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"$media_ref": "media_0"},
+                    {"type": "text", "text": "@image#1 [Image #1] Image 2"},
+                ],
+            }
+        ],
+    }
+    adapted = adapt_tokenplan_envelope(
+        _envelope(
+            request_body=request_body,
+            media=[{"part_id": "media_0", "object_name": "stored.png"}],
+        )
+    )
+
+    assert adapted.multimodal_file_mapping == [
+        MediaMapping(part_id="media_0", object_name="stored.png")
+    ]
+
+
+def test_tokenplan_supports_structured_media_ref_in_embedded_json_text() -> None:
+    adapted = adapt_tokenplan_envelope(
+        _envelope(
+            request_body={
+                "model": "claude-test",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": '{"asset":{"$media_ref":"media_0"}}',
+                    }
+                ],
+            },
+            media=[{"part_id": "media_0", "object_name": "stored.png"}],
+        )
+    )
+
+    assert adapted.multimodal_file_mapping == [
+        MediaMapping(part_id="media_0", object_name="stored.png")
+    ]
+
+
+def test_tokenplan_does_not_infer_mapping_from_human_image_labels() -> None:
+    adapted = adapt_tokenplan_envelope(
+        _envelope(
+            request_body={
+                "model": "claude-test",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "@image#1 [Image #1] Image 2",
+                    }
+                ],
+            },
+            media=[{"part_id": "media_0", "object_name": "stored.png"}],
+        )
+    )
+
+    assert adapted.multimodal_file_mapping == []
+
+
+def test_tokenplan_ignores_documentation_template_sentinels() -> None:
+    adapted = adapt_tokenplan_envelope(
+        _envelope(
+            request_body={
+                "model": "claude-test",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": 'replace "$media_ref:{part_id}" or '
+                        '$media_ref:"+partID in documentation',
+                    }
+                ],
+            }
+        )
+    )
+
+    assert adapted.multimodal_file_mapping == []
+    assert adapted.has_media is False
+
+
+def test_tokenplan_rejects_an_empty_explicit_sentinel() -> None:
+    with pytest.raises(TokenPlanError) as error:
+        adapt_tokenplan_envelope(
+            _envelope(
+                request_body={
+                    "model": "claude-test",
+                    "messages": [{"role": "user", "content": "$media_ref:"}],
+                }
+            )
+        )
+
+    assert error.value.code == "invalid_tokenplan_envelope"
+
+
+@pytest.mark.parametrize(
+    "media",
+    [
+        [{"part_id": "media_0"}],
+        [{"part_id": "media_0", "object_name": "   "}],
+        [{"part_id": "media_0", "object_name": "nested/path.png"}],
+        [
+            {"part_id": "media_0", "object_name": "first.png"},
+            {"part_id": "media_0", "object_name": "second.png"},
+        ],
+        [],
+    ],
+    ids=[
+        "missing-object-name",
+        "whitespace-object-name",
+        "invalid-object-name",
+        "conflicting-object-names",
+        "unknown-part",
+    ],
+)
+def test_tokenplan_rejects_malformed_metadata_for_used_refs(media: list[dict]) -> None:
+    with pytest.raises(TokenPlanError) as error:
+        adapt_tokenplan_envelope(
+            _envelope(
+                request_body={
+                    "model": "claude-test",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "$media_ref:media_0",
+                        }
+                    ],
+                },
+                media=media,
+            )
+        )
+
+    assert error.value.code == "invalid_tokenplan_envelope"
+
+
+def test_tokenplan_ignores_malformed_unused_attachment() -> None:
+    adapted = adapt_tokenplan_envelope(
+        _envelope(
+            request_body={
+                "model": "claude-test",
+                "messages": [{"role": "user", "content": "$media_ref:media_0"}],
+            },
+            media=[
+                {"part_id": "media_0", "object_name": "used.png"},
+                {"part_id": "unused", "object_name": "nested/path.png"},
+                {"part_id": "also_unused"},
+            ],
+        )
+    )
+
+    assert adapted.multimodal_file_mapping == [
+        MediaMapping(part_id="media_0", object_name="used.png")
+    ]
