@@ -187,6 +187,9 @@ uv run pytest -q
 python -m compileall -q src tests
 ```
 
+For scheduler deployment with a shared Python environment and editable
+checkout, see [`docs/dolphinscheduler.md`](docs/dolphinscheduler.md).
+
 The implementation has also been smoke-tested on 56 real captures (43
 Anthropic and 13 Responses), including successful SSE, API failures,
 `count_tokens`, prefix aggregation, validation, and byte-stable resume output.
