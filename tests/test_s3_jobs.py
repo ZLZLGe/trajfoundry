@@ -9,6 +9,7 @@ import orjson
 import pytest
 
 from trajfoundry import jobs
+from trajfoundry.credentials import S3Credentials
 from trajfoundry.validation import ValidationReport
 
 
@@ -185,6 +186,7 @@ def _run(
         "freerouter",
         "http://s3.example.invalid",
         workspace_parent=workspace,
+        credentials_path=None,
     )
     assert list(workspace.iterdir()) == []
     return result
@@ -235,6 +237,7 @@ def test_run_s3_job_normalizes_tokenplan_directly_between_s3_prefixes(
         "tokenplan",
         "http://s3.example.invalid",
         workspace_parent=workspace,
+        credentials_path=None,
     )
 
     assert result.validation.valid
@@ -289,6 +292,50 @@ def test_run_s3_job_rejects_empty_input_without_writing_output(
     assert client.closed
 
 
+def test_run_s3_job_loads_default_credentials_and_closes_client(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = _MemoryS3Client()
+    credentials = S3Credentials(
+        aws_access_key_id="fake-access-key",
+        aws_secret_access_key="fake-secret-key",
+        aws_session_token="fake-session-token",
+    )
+    loaded_paths: list[Path] = []
+    client_kwargs: list[dict[str, Any]] = []
+
+    def _load(path: Path) -> S3Credentials:
+        loaded_paths.append(path)
+        return credentials
+
+    def _create(**kwargs: Any) -> _MemoryS3Client:
+        client_kwargs.append(kwargs)
+        return client
+
+    monkeypatch.setattr(jobs, "load_s3_credentials", _load)
+    monkeypatch.setattr(jobs, "create_s3_client", _create)
+
+    with pytest.raises(ValueError, match="capture source is empty"):
+        jobs.run_s3_job(
+            "s3://bucket/input/",
+            "s3://bucket/output/",
+            "freerouter",
+            "http://s3.example.invalid",
+            workspace_parent=tmp_path,
+        )
+
+    assert loaded_paths == [jobs.DEFAULT_S3_CREDENTIALS_PATH]
+    assert client_kwargs == [
+        {
+            "endpoint_url": "http://s3.example.invalid",
+            "region_name": "us-east-1",
+            "credentials": credentials,
+        }
+    ]
+    assert client.closed
+
+
 @pytest.mark.parametrize(
     ("input_uri", "output_uri"),
     [
@@ -307,6 +354,11 @@ def test_run_s3_job_rejects_overlapping_locations_before_client_creation(
         jobs,
         "create_s3_client",
         lambda **kwargs: pytest.fail("client must not be created"),
+    )
+    monkeypatch.setattr(
+        jobs,
+        "load_s3_credentials",
+        lambda path: pytest.fail("credentials must not be loaded"),
     )
 
     with pytest.raises(ValueError, match="must not overlap"):
@@ -327,6 +379,11 @@ def test_run_s3_job_rejects_missing_workspace_before_client_creation(
         jobs,
         "create_s3_client",
         lambda **kwargs: pytest.fail("client must not be created"),
+    )
+    monkeypatch.setattr(
+        jobs,
+        "load_s3_credentials",
+        lambda path: pytest.fail("credentials must not be loaded"),
     )
 
     with pytest.raises(NotADirectoryError, match="workspace parent"):

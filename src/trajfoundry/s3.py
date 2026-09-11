@@ -10,8 +10,11 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
+
+if TYPE_CHECKING:
+    from .credentials import S3Credentials
 
 InputFormat = Literal["freerouter", "tokenplan"]
 _READ_CHUNK_BYTES = 1024 * 1024
@@ -123,7 +126,12 @@ def parse_s3_uri(uri: str) -> S3Location:
     return S3Location(bucket=parsed.netloc, prefix=prefix)
 
 
-def create_s3_client(endpoint_url: str, region_name: str) -> Any:
+def create_s3_client(
+    endpoint_url: str,
+    region_name: str,
+    *,
+    credentials: S3Credentials | None = None,
+) -> Any:
     """Create the configured S3-compatible client, importing boto3 lazily."""
 
     import boto3
@@ -134,12 +142,18 @@ def create_s3_client(endpoint_url: str, region_name: str) -> Any:
         s3={"addressing_style": "path"},
         retries={"mode": "standard", "max_attempts": 10},
     )
-    return boto3.client(
-        "s3",
-        endpoint_url=endpoint_url,
-        region_name=region_name,
-        config=config,
-    )
+    client_kwargs: dict[str, Any] = {
+        "endpoint_url": endpoint_url,
+        "region_name": region_name,
+        "config": config,
+    }
+    if credentials is not None:
+        client_kwargs["aws_access_key_id"] = credentials.aws_access_key_id
+        client_kwargs["aws_secret_access_key"] = credentials.aws_secret_access_key
+        if credentials.aws_session_token is not None:
+            client_kwargs["aws_session_token"] = credentials.aws_session_token
+
+    return boto3.client("s3", **client_kwargs)
 
 
 @dataclass(frozen=True, slots=True)

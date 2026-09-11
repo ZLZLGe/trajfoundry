@@ -8,6 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Literal
 
+from .credentials import DEFAULT_S3_CREDENTIALS_PATH, load_s3_credentials
 from .pipeline import PipelineConfig, PipelineStats, normalize, normalize_source
 from .s3 import S3CaptureSource, S3Location, create_s3_client, parse_s3_uri
 from .s3_output import S3OutputSet
@@ -253,13 +254,16 @@ def run_s3_job(
     region_name: str = "us-east-1",
     workspace_parent: str | Path | None = None,
     max_shard_bytes: int = DEFAULT_MAX_SHARD_BYTES,
+    credentials_path: str | Path | None = DEFAULT_S3_CREDENTIALS_PATH,
 ) -> JobResult:
     """Normalize an S3 prefix directly into an unpublished S3 generation.
 
     Raw captures and JSONL output never pass through local staging files.  The
     aggregation database is created in a unique workspace-local directory and is
     deleted when this call returns or raises.  The root manifest is published
-    only after the complete candidate generation passes remote validation.
+    only after the complete candidate generation passes remote validation. S3
+    credentials come from the fixed credential file by default; explicitly pass
+    ``credentials_path=None`` only when the standard AWS SDK chain is intended.
     """
 
     if input_format not in {"freerouter", "tokenplan"}:
@@ -282,6 +286,12 @@ def run_s3_job(
     if not workspace.is_dir():
         raise NotADirectoryError(f"workspace parent does not exist: {workspace}")
 
+    credentials = (
+        None
+        if credentials_path is None
+        else load_s3_credentials(Path(credentials_path).expanduser())
+    )
+
     LOGGER.info(
         "starting TrajFoundry S3 job: input=%s output=%s format=%s",
         input_location.uri,
@@ -291,6 +301,7 @@ def run_s3_job(
     client = create_s3_client(
         endpoint_url=endpoint_url,
         region_name=region_name,
+        credentials=credentials,
     )
     try:
         return _run_s3_job_with_client(

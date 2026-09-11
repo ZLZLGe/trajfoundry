@@ -133,20 +133,73 @@ and streams normalized JSONL shards back to S3. It does not stage the complete
 input or output under `/share`, and it does not require AWS CLI. `/share` is
 still used for the shared Python environment and editable source checkout.
 
-Configure credentials only through the standard AWS SDK environment variables.
-The values below are placeholders; never paste real credentials into the
-repository, Python node, workflow parameters, or task logs:
+S3 credentials are loaded from this fixed path by default:
 
-```bash
-export AWS_ACCESS_KEY_ID="<ACCESS_KEY_ID_FROM_PLATFORM_SECRET>"
-export AWS_SECRET_ACCESS_KEY="<SECRET_ACCESS_KEY_FROM_PLATFORM_SECRET>"
-# Set this only when the platform issues temporary credentials:
-export AWS_SESSION_TOKEN="<SESSION_TOKEN_FROM_PLATFORM_SECRET>"
+```text
+/share/gezhilong/trajfoundry-secrets/s3_credentials.json
 ```
 
-The application does not accept AK/SK arguments and does not log them. Access
-to a scheduler environment may still reveal variables configured directly in
-that environment, so use the platform's secret facility when one is available.
+Do not put an AK/SK in DolphinScheduler environment variables, workflow or task
+parameters, or `rawScript`. The Python node does not accept credential values or
+a credential-file parameter. In particular, do not configure
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, or `AWS_SESSION_TOKEN` for this
+workflow. This keeps credential material out of generated scripts, scheduler
+metadata, and task logs.
+
+The credential file contains one JSON object. The following values are
+placeholders only:
+
+```json
+{
+  "aws_access_key_id": "<ACCESS_KEY_ID>",
+  "aws_secret_access_key": "<SECRET_ACCESS_KEY>",
+  "aws_session_token": "<SESSION_TOKEN>"
+}
+```
+
+Omit the entire `aws_session_token` member when the credentials are not
+temporary. Never paste real values into this repository, documentation, Python
+node, workflow configuration, command line, or logs.
+
+The loader accepts the credential path only when all of these conditions hold:
+
+- it is a regular file and not a symbolic link;
+- it is no larger than 64 KiB;
+- its mode is exactly `0400` or `0600`, with no group or other access; and
+- its owner is the operating-system identity that runs the Dolphin task.
+
+Use mode `0700` for the containing directory. The current task identity has
+been verified as UID:GID `1007:1007`, so the initial deployment can be created
+as follows. The guarded block refuses to replace any existing credential path.
+`sudoedit` keeps secret values out of shell arguments and shell history:
+
+```bash
+CREDENTIAL_DIR=/share/gezhilong/trajfoundry-secrets
+CREDENTIAL_FILE=$CREDENTIAL_DIR/s3_credentials.json
+
+sudo sh -c '
+  set -eu
+  credential_dir=$1
+  credential_file=$2
+  test ! -L "$credential_dir"
+  test ! -e "$credential_file"
+  test ! -L "$credential_file"
+  install -d -o 1007 -g 1007 -m 0700 "$credential_dir"
+  install -o 1007 -g 1007 -m 0600 /dev/null "$credential_file"
+' sh "$CREDENTIAL_DIR" "$CREDENTIAL_FILE"
+sudoedit "$CREDENTIAL_FILE"
+sudo chown 1007:1007 "$CREDENTIAL_FILE"
+sudo chmod 0400 "$CREDENTIAL_FILE"
+sudo stat -c 'type=%F mode=%a owner=%u:%g bytes=%s path=%n' "$CREDENTIAL_FILE"
+```
+
+The final `stat` command prints metadata only; do not use `cat`, `jq`, shell
+tracing, or another command that writes the file contents to a terminal or
+task log. UID/GID mappings can change when the DolphinScheduler tenant or worker
+configuration changes. Re-check the task's effective identity after such a
+change and adjust the directory and file owner before running the workflow.
+The example node calls `run_s3_job()` without credential arguments; the client
+loads this fixed file internally.
 
 Create two independent workflows, each containing one Python task based on
 [`dolphinscheduler_s3_node.py`](../examples/dolphinscheduler_s3_node.py). For

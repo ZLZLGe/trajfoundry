@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from trajfoundry.credentials import S3Credentials
 from trajfoundry.s3 import (
     S3Capture,
     S3CaptureSource,
@@ -306,7 +307,7 @@ def test_read_capture_closes_body_when_stream_fails() -> None:
     assert body.was_closed
 
 
-def test_create_s3_client_uses_sigv4_path_style_and_standard_retries(
+def test_create_s3_client_uses_configuration_and_optional_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[str, dict[str, Any]]] = []
@@ -330,9 +331,28 @@ def test_create_s3_client_uses_sigv4_path_style_and_standard_retries(
     monkeypatch.setitem(sys.modules, "botocore.config", fake_config)
 
     created = create_s3_client("http://ceph.internal", "us-east-1")
+    credentialed = create_s3_client(
+        "http://ceph.internal",
+        "us-east-1",
+        credentials=S3Credentials(
+            aws_access_key_id="fake-access-key",
+            aws_secret_access_key="fake-secret-key",
+            aws_session_token="fake-session-token",
+        ),
+    )
+    credentialed_without_token = create_s3_client(
+        "http://ceph.internal",
+        "us-east-1",
+        credentials=S3Credentials(
+            aws_access_key_id="fake-access-key",
+            aws_secret_access_key="fake-secret-key",
+        ),
+    )
 
     assert created is not None
-    assert len(calls) == 1
+    assert credentialed is not None
+    assert credentialed_without_token is not None
+    assert len(calls) == 3
     service, kwargs = calls[0]
     assert service == "s3"
     assert kwargs["endpoint_url"] == "http://ceph.internal"
@@ -342,3 +362,16 @@ def test_create_s3_client_uses_sigv4_path_style_and_standard_retries(
         "s3": {"addressing_style": "path"},
         "retries": {"mode": "standard", "max_attempts": 10},
     }
+    assert not any(name.startswith("aws_") for name in kwargs)
+
+    credentialed_service, credentialed_kwargs = calls[1]
+    assert credentialed_service == "s3"
+    assert credentialed_kwargs["aws_access_key_id"] == "fake-access-key"
+    assert credentialed_kwargs["aws_secret_access_key"] == "fake-secret-key"
+    assert credentialed_kwargs["aws_session_token"] == "fake-session-token"
+
+    without_token_service, without_token_kwargs = calls[2]
+    assert without_token_service == "s3"
+    assert without_token_kwargs["aws_access_key_id"] == "fake-access-key"
+    assert without_token_kwargs["aws_secret_access_key"] == "fake-secret-key"
+    assert "aws_session_token" not in without_token_kwargs
