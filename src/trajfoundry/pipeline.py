@@ -7,7 +7,7 @@ import hashlib
 import json
 import uuid
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -20,7 +20,7 @@ from .canonical import (
     trajectory_id,
 )
 from .export import SCHEMA_VERSION, OutputSet
-from .io import decode_capture, discover_captures, read_capture_bytes
+from .io import CaptureSource, LocalCaptureSource, decode_capture
 from .models import (
     AgentMessageRecord,
     AuditIssue,
@@ -1026,8 +1026,18 @@ def _snapshot_record(snapshot: Snapshot) -> QuarantineRecord | None:
     )
 
 
-def _export(state: StateStore, config: PipelineConfig, configuration_hash: str) -> None:
-    output = OutputSet(config.output_root, max_shard_bytes=config.max_shard_bytes)
+def _export(
+    state: StateStore,
+    config: PipelineConfig,
+    configuration_hash: str,
+    *,
+    output: Any | None = None,
+    input_root_label: str | None = None,
+) -> Any:
+    output = output or OutputSet(
+        config.output_root,
+        max_shard_bytes=config.max_shard_bytes,
+    )
     try:
         output.stats.input_files = state.capture_count()
         for (
@@ -1074,14 +1084,165 @@ def _export(state: StateStore, config: PipelineConfig, configuration_hash: str) 
 
         for _, node, origins in state.iter_trajectories():
             output.write_trajectory(node, origins)
-        output.close(
-            input_root=str(config.input_root),
+        return output.close(
+            input_root=input_root_label or str(config.input_root),
             input_format=config.input_format,
             config_hash=configuration_hash,
         )
     except BaseException:
         output.abort()
         raise
+
+
+def _ingest_source(
+    source: CaptureSource,
+    state: StateStore,
+    config: PipelineConfig,
+    stats: PipelineStats,
+    *,
+    source_errors_fatal: bool = False,
+) -> None:
+    state.begin_scan(uuid.uuid4().hex)
+    for capture_ref in source.iter_captures(config.input_format):
+        stats.discovered += 1
+        source_ref = capture_ref.source_ref
+        digest = ""
+        endpoint = ""
+        captured_at = ""
+
+        try:
+            payload, digest = source.read_capture_bytes(capture_ref)
+        except Exception as error:
+            if source_errors_fatal:
+                raise
+            state.put_failure(
+                source_ref,
+                digest,
+                f"{type(error).__name__}: capture could not be normalized",
+                endpoint=endpoint,
+                captured_at=captured_at,
+            )
+            stats.parse_failures += 1
+            continue
+        if state.capture_matches(source_ref, digest):
+            stats.reused += 1
+            continue
+
+        try:
+            capture = decode_capture(payload, input_format=config.input_format)
+            source_name: Literal["freerouter", "tokenplan"] = "freerouter"
+            response_is_normalized_final = False
+            multimodal_file_mapping: list[MediaMapping] = []
+            if config.input_format == "tokenplan":
+                adapted = adapt_tokenplan_envelope(capture)
+                capture = adapted.capture
+                source_name = adapted.source_name
+                endpoint = adapted.endpoint
+                captured_at = adapted.captured_at
+                response_is_normalized_final = adapted.response_is_normalized_final
+                multimodal_file_mapping = adapted.multimodal_file_mapping
+            endpoint_value = capture.get("path")
+            endpoint = (
+                endpoint_value.split("?", 1)[0].rstrip("/")
+                if isinstance(endpoint_value, str)
+                else ""
+            )
+            captured_value = capture.get("captured_at")
+            captured_at = captured_value if isinstance(captured_value, str) else ""
+            snapshot = parse_capture(
+                capture,
+                source_path=source_ref,
+                source_sha256=digest,
+                source_name=source_name,
+                response_is_normalized_final=response_is_normalized_final,
+                multimodal_file_mapping=multimodal_file_mapping,
+            )
+            state.put_snapshot(snapshot, endpoint=endpoint)
+            stats.parsed += 1
+        except TokenPlanError as error:
+            state.put_failure(
+                source_ref,
+                digest,
+                f"{error.code}: {error.detail}",
+                endpoint=endpoint,
+                captured_at=captured_at,
+            )
+            stats.parse_failures += 1
+        except Exception as error:  # noqa: BLE001 - quarantine per-file defects
+            state.put_failure(
+                source_ref,
+                digest,
+                f"{type(error).__name__}: capture could not be normalized",
+                endpoint=endpoint,
+                captured_at=captured_at,
+            )
+            stats.parse_failures += 1
+    state.finish_scan()
+    stats.skipped_inputs = sum(
+        status == "skipped" for _, _, status, _, _, _ in state.capture_records()
+    )
+
+
+def normalize_source(
+    source: CaptureSource,
+    *,
+    input_format: Literal["freerouter", "tokenplan"],
+    state_path: Path,
+    output_factory: Callable[[], Any],
+    max_shard_bytes: int = 512 * 1024 * 1024,
+) -> tuple[PipelineStats, Any]:
+    """Normalize a non-filesystem source with ephemeral local state.
+
+    The source and output implementation own remote I/O.  SQLite remains
+    local because aggregation requires ordered, random access to snapshots.
+    This boundary deliberately has no resume mode: scheduler retries rebuild
+    the ephemeral state from the immutable input inventory.
+    """
+
+    if input_format not in {"freerouter", "tokenplan"}:
+        raise ValueError(f"unsupported input format: {input_format!r}")
+    if max_shard_bytes <= 0:
+        raise ValueError("max_shard_bytes must be positive")
+    resolved_state = state_path.resolve()
+    if resolved_state.is_symlink():
+        raise ValueError("state database path must not be a symlink")
+    runtime_root = resolved_state.parent
+    runtime_config = PipelineConfig(
+        input_root=Path("."),
+        input_format=input_format,
+        output_root=runtime_root,
+        state_path=resolved_state,
+        resume=False,
+        max_shard_bytes=max_shard_bytes,
+    )
+    configuration_hash = config_hash(runtime_config)
+    stats = PipelineStats()
+    with (
+        _exclusive_lock(resolved_state.with_suffix(".lock")),
+        StateStore(resolved_state) as state,
+    ):
+        state.reset_ingest()
+        state.set_meta("config_hash", configuration_hash)
+        # Remote read errors are infrastructure failures, rather than content
+        # defects, and must fail the scheduler task without publication.
+        _ingest_source(
+            source,
+            state,
+            runtime_config,
+            stats,
+            source_errors_fatal=True,
+        )
+        if stats.discovered == 0:
+            raise ValueError(f"capture source is empty: {source.label}")
+        _build_trajectories(state, stats)
+        output_result = _export(
+            state,
+            runtime_config,
+            configuration_hash,
+            output=output_factory(),
+            input_root_label=source.label,
+        )
+    return stats, output_result
 
 
 def normalize(config: PipelineConfig) -> PipelineStats:
@@ -1126,75 +1287,11 @@ def normalize(config: PipelineConfig) -> PipelineStats:
         if not normalized_config.resume or previous_hash != configuration_hash:
             state.reset_ingest()
         state.set_meta("config_hash", configuration_hash)
-        state.begin_scan(uuid.uuid4().hex)
-        for path in discover_captures(
-            input_root,
-            input_format=normalized_config.input_format,
-        ):
-            stats.discovered += 1
-            source_ref = path.relative_to(input_root).as_posix()
-            digest = ""
-            endpoint = ""
-            captured_at = ""
-            try:
-                payload, digest = read_capture_bytes(path)
-                if state.capture_matches(source_ref, digest):
-                    stats.reused += 1
-                    continue
-                capture = decode_capture(
-                    payload,
-                    input_format=normalized_config.input_format,
-                )
-                source_name: Literal["freerouter", "tokenplan"] = "freerouter"
-                response_is_normalized_final = False
-                multimodal_file_mapping: list[MediaMapping] = []
-                if normalized_config.input_format == "tokenplan":
-                    adapted = adapt_tokenplan_envelope(capture)
-                    capture = adapted.capture
-                    source_name = adapted.source_name
-                    endpoint = adapted.endpoint
-                    captured_at = adapted.captured_at
-                    response_is_normalized_final = adapted.response_is_normalized_final
-                    multimodal_file_mapping = adapted.multimodal_file_mapping
-                endpoint_value = capture.get("path")
-                endpoint = (
-                    endpoint_value.split("?", 1)[0].rstrip("/")
-                    if isinstance(endpoint_value, str)
-                    else ""
-                )
-                captured_value = capture.get("captured_at")
-                captured_at = captured_value if isinstance(captured_value, str) else ""
-                snapshot = parse_capture(
-                    capture,
-                    source_path=source_ref,
-                    source_sha256=digest,
-                    source_name=source_name,
-                    response_is_normalized_final=response_is_normalized_final,
-                    multimodal_file_mapping=multimodal_file_mapping,
-                )
-                state.put_snapshot(snapshot, endpoint=endpoint)
-                stats.parsed += 1
-            except TokenPlanError as error:
-                state.put_failure(
-                    source_ref,
-                    digest,
-                    f"{error.code}: {error.detail}",
-                    endpoint=endpoint,
-                    captured_at=captured_at,
-                )
-                stats.parse_failures += 1
-            except Exception as error:  # noqa: BLE001 - quarantine per-file defects
-                state.put_failure(
-                    source_ref,
-                    digest,
-                    f"{type(error).__name__}: capture could not be normalized",
-                    endpoint=endpoint,
-                    captured_at=captured_at,
-                )
-                stats.parse_failures += 1
-        state.finish_scan()
-        stats.skipped_inputs = sum(
-            status == "skipped" for _, _, status, _, _, _ in state.capture_records()
+        _ingest_source(
+            LocalCaptureSource(input_root),
+            state,
+            normalized_config,
+            stats,
         )
         _build_trajectories(state, stats)
         _export(state, normalized_config, configuration_hash)
@@ -1214,6 +1311,7 @@ __all__ = [
     "UnsupportedCaptureError",
     "config_hash",
     "normalize",
+    "normalize_source",
     "parse_capture",
     "stats_json",
 ]

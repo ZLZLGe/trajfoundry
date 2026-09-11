@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Literal
+from typing import Annotated, BinaryIO, Literal, Protocol
 
 import orjson
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .canonical import trajectory_id
-from .io import file_sha256
 from .models import AuditTag
 from .output_contract import (
     OutputContractError,
@@ -111,6 +112,28 @@ class ValidationReport(BaseModel):
     counts: dict[str, int]
 
 
+@dataclass(frozen=True)
+class ValidationFile:
+    """A backend object and the byte size reported for its binary stream."""
+
+    size: int
+    stream: BinaryIO
+
+
+class ValidationBackend(Protocol):
+    """Storage-neutral access required to validate one output generation."""
+
+    def open_file(self, relative_path: str) -> ValidationFile | None:
+        """Open a manifest file, or return ``None`` when it does not exist."""
+        ...
+
+    def iter_generated_jsonl_paths(
+        self, generation_ids: frozenset[str]
+    ) -> Iterable[str]:
+        """Yield generated JSONL paths that could have been omitted from manifest."""
+        ...
+
+
 @dataclass
 class _ErrorCollector:
     messages: list[str] = field(default_factory=list)
@@ -120,6 +143,12 @@ class _ErrorCollector:
         self.total += 1
         if len(self.messages) < _MAX_REPORTED_ERRORS:
             self.messages.append(message)
+
+    def extend(self, other: _ErrorCollector) -> None:
+        available = _MAX_REPORTED_ERRORS - len(self.messages)
+        if available > 0:
+            self.messages.extend(other.messages[:available])
+        self.total += other.total
 
     def finish(self) -> list[str]:
         omitted = self.total - len(self.messages)
@@ -165,16 +194,21 @@ class _Observed:
             self.lineage_contract_valid = False
 
 
-def _safe_manifest_path(root: Path, relative: str) -> Path | None:
+def _is_safe_manifest_path(relative: str) -> bool:
     if "\\" in relative or "\x00" in relative:
-        return None
+        return False
     pure = PurePosixPath(relative)
     if pure.is_absolute() or any(
         part in {"", ".", ".."} for part in relative.split("/")
     ):
+        return False
+    return pure.as_posix() == relative
+
+
+def _safe_manifest_path(root: Path, relative: str) -> Path | None:
+    if not _is_safe_manifest_path(relative):
         return None
-    if pure.as_posix() != relative:
-        return None
+    pure = PurePosixPath(relative)
     try:
         resolved_root = root.resolve()
         candidate = (root / Path(*pure.parts)).resolve()
@@ -275,84 +309,168 @@ def _validate_row(
         observed.covered_sources.update(origin.source_ref for origin in lineage.origins)
 
 
-def _validate_jsonl(
-    path: Path,
+@dataclass(frozen=True)
+class _StreamResult:
+    bytes_read: int
+    sha256: str
+    complete: bool
+
+
+def _validate_jsonl_stream(
+    stream: BinaryIO,
     *,
     kind: str | None,
     file_index: int,
     observed: _Observed,
     errors: _ErrorCollector,
-) -> None:
+) -> _StreamResult:
+    digest = hashlib.sha256()
+    bytes_read = 0
+    pending = bytearray()
+    line_no = 0
+    scan_from = 0
+    complete = False
     try:
-        handle = path.open("rb")
-    except OSError:
-        errors.add(f"manifest files[{file_index}] could not be opened")
-        observed.mark_invalid(kind)
-        return
+        while True:
+            try:
+                chunk = stream.read(1024 * 1024)
+            # Backends may surface SDK-specific transport exceptions here.
+            except Exception:  # noqa: BLE001
+                observed.mark_invalid(kind)
+                errors.add(f"manifest files[{file_index}] could not be read completely")
+                break
+            if not chunk:
+                complete = True
+                break
+            if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                observed.mark_invalid(kind)
+                errors.add(f"manifest files[{file_index}] could not be read completely")
+                break
+            digest.update(chunk)
+            bytes_read += len(chunk)
+            pending.extend(chunk)
 
-    try:
-        with handle:
-            for line_no, raw_line in enumerate(handle, start=1):
-                observed.counts["jsonl_rows"] += 1
-                if kind in {
-                    "accepted",
-                    "quarantined_trajectories",
-                    "quarantined_records",
-                }:
-                    observed.counts[kind] += 1
-                elif kind == "lineage":
-                    observed.counts["lineage_records"] += 1
-                try:
-                    value = orjson.loads(raw_line)
-                except orjson.JSONDecodeError:
-                    observed.mark_invalid(kind)
-                    context = _row_context(file_index, line_no, kind)
-                    errors.add(f"{context} is not valid JSON")
-                    continue
-                _validate_row(
-                    value,
+            start = 0
+            while (newline := pending.find(b"\n", scan_from)) >= 0:
+                line_no += 1
+                _validate_jsonl_row(
+                    bytes(pending[start : newline + 1]),
                     kind=kind,
                     file_index=file_index,
                     line_no=line_no,
                     observed=observed,
                     errors=errors,
                 )
-    except OSError:
-        observed.mark_invalid(kind)
-        errors.add(f"manifest files[{file_index}] could not be read completely")
+                start = newline + 1
+                scan_from = start
+            if start:
+                del pending[:start]
+            scan_from = len(pending)
 
+        if complete and pending:
+            line_no += 1
+            _validate_jsonl_row(
+                bytes(pending),
+                kind=kind,
+                file_index=file_index,
+                line_no=line_no,
+                observed=observed,
+                errors=errors,
+            )
+    finally:
+        try:
+            stream.close()
+        # Closing a remote response can also raise an SDK-specific exception.
+        except Exception:  # noqa: BLE001
+            observed.mark_invalid(kind)
+            errors.add(f"manifest files[{file_index}] could not be read completely")
 
-def _generated_files(root: Path, listed: set[str]) -> set[str]:
-    files: set[str] = set()
-    patterns = (
-        (root / "accepted", "trajectories-*.jsonl"),
-        (root / "quarantine", "trajectories-*.jsonl"),
-        (root / "quarantine", "records-*.jsonl"),
+    return _StreamResult(
+        bytes_read=bytes_read,
+        sha256=digest.hexdigest(),
+        complete=complete,
     )
-    for directory, pattern in patterns:
-        if directory.is_dir():
-            files.update(
-                path.relative_to(root).as_posix()
-                for path in directory.glob(pattern)
-                if path.is_file()
-            )
-    if (root / "lineage.jsonl").is_file():
-        files.add("lineage.jsonl")
-    generation_ids = {
-        parts[1]
-        for relative in listed
-        if len(parts := PurePosixPath(relative).parts) >= 3
-        and parts[0] == "generations"
-    }
-    for generation_id in generation_ids:
-        generation = root / "generations" / generation_id
-        if generation.is_dir() and not generation.is_symlink():
-            files.update(
-                path.relative_to(root).as_posix()
-                for path in generation.rglob("*.jsonl")
-                if path.is_file()
-            )
-    return files
+
+
+def _validate_jsonl_row(
+    raw_line: bytes,
+    *,
+    kind: str | None,
+    file_index: int,
+    line_no: int,
+    observed: _Observed,
+    errors: _ErrorCollector,
+) -> None:
+    observed.counts["jsonl_rows"] += 1
+    if kind in {
+        "accepted",
+        "quarantined_trajectories",
+        "quarantined_records",
+    }:
+        observed.counts[kind] += 1
+    elif kind == "lineage":
+        observed.counts["lineage_records"] += 1
+    try:
+        value = orjson.loads(raw_line)
+    except orjson.JSONDecodeError:
+        observed.mark_invalid(kind)
+        context = _row_context(file_index, line_no, kind)
+        errors.add(f"{context} is not valid JSON")
+        return
+    _validate_row(
+        value,
+        kind=kind,
+        file_index=file_index,
+        line_no=line_no,
+        observed=observed,
+        errors=errors,
+    )
+
+
+class _UnsafeBackendPathError(Exception):
+    """A local manifest path resolved outside the validation root."""
+
+
+class _LocalValidationBackend:
+    def __init__(self, root: Path) -> None:
+        self._root = root
+
+    def open_file(self, relative_path: str) -> ValidationFile | None:
+        path = _safe_manifest_path(self._root, relative_path)
+        if path is None:
+            raise _UnsafeBackendPathError
+        if not path.is_file():
+            return None
+        size = path.stat().st_size
+        return ValidationFile(size=size, stream=path.open("rb"))
+
+    def iter_generated_jsonl_paths(
+        self, generation_ids: frozenset[str]
+    ) -> Iterable[str]:
+        files: set[str] = set()
+        patterns = (
+            (self._root / "accepted", "trajectories-*.jsonl"),
+            (self._root / "quarantine", "trajectories-*.jsonl"),
+            (self._root / "quarantine", "records-*.jsonl"),
+        )
+        for directory, pattern in patterns:
+            if directory.is_dir():
+                files.update(
+                    path.relative_to(self._root).as_posix()
+                    for path in directory.glob(pattern)
+                    if path.is_file()
+                )
+        if (self._root / "lineage.jsonl").is_file():
+            files.add("lineage.jsonl")
+        for generation_id in generation_ids:
+            generation = self._root / "generations" / generation_id
+            if generation.is_dir() and not generation.is_symlink():
+                files.update(
+                    path.relative_to(self._root).as_posix()
+                    for path in generation.rglob("*.jsonl")
+                    if path.is_file()
+                )
+        return files
 
 
 def _compare_manifest_counts(
@@ -386,26 +504,22 @@ def _compare_manifest_counts(
             errors.add("manifest reason_counts does not match quarantined output")
 
 
-def validate_output(root: Path) -> ValidationReport:
-    """Validate a completed output directory without exposing record contents.
+def validate_output_backend(
+    manifest_bytes: bytes, backend: ValidationBackend
+) -> ValidationReport:
+    """Validate output through a storage-neutral streaming backend.
 
-    Validation is streaming at the JSONL level. Error messages identify only a
-    manifest entry and line number; values and validation exception text are
-    deliberately omitted because trajectory rows can contain sensitive data.
+    The caller supplies the exact manifest bytes that are candidates for
+    publication. Backend exceptions and validation details are deliberately
+    omitted from errors because storage responses and rows can contain secrets.
+    Every stream returned by the backend is closed before this function returns.
     """
 
-    root = Path(root)
     errors = _ErrorCollector()
     observed = _Observed()
-    manifest_path = root / "manifest.json"
     try:
-        raw_manifest = orjson.loads(manifest_path.read_bytes())
-    except FileNotFoundError:
-        errors.add("manifest.json is missing")
-        return ValidationReport(
-            valid=False, errors=errors.finish(), counts=observed.counts
-        )
-    except (OSError, orjson.JSONDecodeError):
+        raw_manifest = orjson.loads(manifest_bytes)
+    except (TypeError, orjson.JSONDecodeError):
         errors.add("manifest.json could not be read as valid JSON")
         return ValidationReport(
             valid=False, errors=errors.finish(), counts=observed.counts
@@ -426,8 +540,7 @@ def validate_output(root: Path) -> ValidationReport:
     lineage_entries = 0
 
     for file_index, entry in enumerate(manifest.files):
-        path = _safe_manifest_path(root, entry.path)
-        if path is None:
+        if not _is_safe_manifest_path(entry.path):
             errors.add(f"manifest files[{file_index}] has an unsafe path")
             continue
         if entry.path in seen_paths:
@@ -441,48 +554,61 @@ def validate_output(root: Path) -> ValidationReport:
         elif kind == "lineage":
             lineage_entries += 1
 
-        if not path.is_file():
+        try:
+            source = backend.open_file(entry.path)
+        except _UnsafeBackendPathError:
+            errors.add(f"manifest files[{file_index}] has an unsafe path")
+            continue
+        # This is the storage boundary; exception details may contain secrets.
+        except Exception:  # noqa: BLE001
+            errors.add(f"manifest files[{file_index}] could not be opened")
+            observed.mark_invalid(kind)
+            continue
+        if source is None:
             errors.add(f"manifest files[{file_index}] is missing or not a regular file")
             observed.mark_invalid(kind)
             continue
 
         observed.counts["checked_files"] += 1
-        try:
-            actual_bytes = path.stat().st_size
-            actual_sha256 = file_sha256(path)
-        except OSError:
-            errors.add(f"manifest files[{file_index}] could not be inspected")
-            observed.mark_invalid(kind)
-            continue
-        if actual_bytes != entry.bytes:
-            errors.add(f"manifest files[{file_index}] byte count does not match")
-        if actual_sha256 != entry.sha256:
-            errors.add(f"manifest files[{file_index}] sha256 does not match")
-        _validate_jsonl(
-            path,
+        file_errors = _ErrorCollector()
+        result = _validate_jsonl_stream(
+            source.stream,
             kind=kind,
             file_index=file_index,
             observed=observed,
-            errors=errors,
+            errors=file_errors,
         )
+        if source.size != entry.bytes or (
+            result.complete and result.bytes_read != entry.bytes
+        ):
+            errors.add(f"manifest files[{file_index}] byte count does not match")
+        if result.complete and result.sha256 != entry.sha256:
+            errors.add(f"manifest files[{file_index}] sha256 does not match")
+        errors.extend(file_errors)
 
     if lineage_entries != 1:
         errors.add("manifest must list lineage.jsonl exactly once")
 
-    generation_ids = {
+    generation_ids = frozenset(
         parts[1]
         for relative in seen_paths
         if len(parts := PurePosixPath(relative).parts) >= 3
         and parts[0] == "generations"
-    }
+    )
     if len(generation_ids) > 1:
         errors.add("manifest files must belong to one immutable generation")
 
-    unlisted_count = len(_generated_files(root, seen_paths) - seen_paths)
-    if unlisted_count:
-        errors.add(
-            f"found {unlisted_count} generated JSONL file(s) not listed in manifest"
-        )
+    try:
+        generated_files = set(backend.iter_generated_jsonl_paths(generation_ids))
+    # Remote listing failures are SDK-specific and must remain safe to display.
+    except Exception:  # noqa: BLE001
+        errors.add("generated JSONL files could not be enumerated")
+    else:
+        unlisted_count = len(generated_files - seen_paths)
+        if unlisted_count:
+            errors.add(
+                f"found {unlisted_count} generated JSONL file(s) not listed in manifest"
+            )
 
     trajectory_count = (
         observed.counts["accepted"] + observed.counts["quarantined_trajectories"]
@@ -516,3 +642,32 @@ def validate_output(root: Path) -> ValidationReport:
     return ValidationReport(
         valid=errors.total == 0, errors=messages, counts=observed.counts
     )
+
+
+def validate_output(root: Path) -> ValidationReport:
+    """Validate a completed local output directory without exposing contents.
+
+    Validation is streaming at the JSONL level. Error messages identify only a
+    manifest entry and line number; values and validation exception text are
+    deliberately omitted because trajectory rows can contain sensitive data.
+    """
+
+    root = Path(root)
+    manifest_path = root / "manifest.json"
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+    except FileNotFoundError:
+        observed = _Observed()
+        return ValidationReport(
+            valid=False,
+            errors=["manifest.json is missing"],
+            counts=observed.counts,
+        )
+    except OSError:
+        observed = _Observed()
+        return ValidationReport(
+            valid=False,
+            errors=["manifest.json could not be read as valid JSON"],
+            counts=observed.counts,
+        )
+    return validate_output_backend(manifest_bytes, _LocalValidationBackend(root))

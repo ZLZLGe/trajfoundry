@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 import os
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Any, Literal, Protocol, Self
 
 import orjson
 
@@ -16,6 +17,52 @@ SAFE_REQUEST_HEADERS = {
     "x-codex-turn-metadata",
     "x-openai-subagent",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class LocalCapture:
+    """One capture rooted at a local input directory."""
+
+    source_ref: str
+    path: Path
+
+
+class CaptureSource(Protocol):
+    """Minimal source boundary consumed by the normalization pipeline."""
+
+    @property
+    def label(self) -> str: ...
+
+    def iter_captures(
+        self,
+        input_format: Literal["freerouter", "tokenplan"],
+    ) -> Iterator[Any]: ...
+
+    def read_capture_bytes(self, capture: Any) -> tuple[bytes, str]: ...
+
+
+class LocalCaptureSource:
+    """Expose the existing read-only filesystem behavior as a capture source."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    @property
+    def label(self) -> str:
+        return str(self.root)
+
+    def iter_captures(
+        self,
+        input_format: Literal["freerouter", "tokenplan"],
+    ) -> Iterator[LocalCapture]:
+        for path in discover_captures(self.root, input_format=input_format):
+            yield LocalCapture(
+                source_ref=path.relative_to(self.root).as_posix(),
+                path=path,
+            )
+
+    def read_capture_bytes(self, capture: LocalCapture) -> tuple[bytes, str]:
+        return read_capture_bytes(capture.path)
 
 
 def discover_captures(

@@ -46,6 +46,20 @@ uv run trajfoundry normalize \
   --output /data/trajfoundry-tokenplan
 ```
 
+Scheduler jobs can also normalize directly from one S3 prefix to another with
+`trajfoundry.jobs.run_s3_job`. The S3 mode lists and reads source objects one at
+a time and streams generation JSONL back to S3; it does not copy the complete
+input partition or normalized output onto `/share`. Global aggregation still
+uses one temporary local SQLite database in the task workspace. The state is
+deleted when the task finishes and is rebuilt from the source inventory on a
+retry, so S3 jobs do not resume across workers.
+
+S3 publication writes an immutable `generations/<run-id>/` first, validates it
+by reading the remote objects, and uploads the top-level `manifest.json` last.
+Readers therefore continue to see the previous manifest if generation upload
+or validation fails. See [`docs/dolphinscheduler.md`](docs/dolphinscheduler.md)
+for the two-workflow FreeRouter and TokenPlan configuration.
+
 The input tree is read-only. A non-empty output directory requires `--resume`:
 
 ```bash
@@ -177,6 +191,11 @@ single current-generation pointer. The prior generation remains available to
 readers during the next publication. `validate` checks checksums, contracts,
 input coverage, derived quality fields, strict admission, lineage IDs, and
 manifest counts.
+
+That filesystem behavior remains the default for `normalize` and `run_job`.
+For `run_s3_job`, generation objects are completed and remotely validated
+before `manifest.json` is uploaded as the publication pointer; the local
+SQLite state is temporary and no source capture is persisted locally.
 
 ## Development
 
