@@ -605,10 +605,10 @@ def _validate_node(value: object, path: str, *, top_level: bool) -> tuple[bool, 
         or "\\" in source_file
     ):
         _fail(f"{path}/metadata/source_file", "must equal source and be a basename")
-    if metadata["source_name"] not in {"freerouter", "tokenplan"}:
+    if metadata["source_name"] not in {"freerouter", "tokenplan", "sxf"}:
         _fail(
             f"{path}/metadata/source_name",
-            "must equal 'freerouter' or 'tokenplan'",
+            "must equal 'freerouter', 'tokenplan', or 'sxf'",
         )
     _integer(metadata["line_no"], f"{path}/metadata/line_no")
     _string(metadata["created_at"], f"{path}/metadata/created_at")

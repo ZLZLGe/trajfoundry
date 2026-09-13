@@ -34,7 +34,7 @@ def normalize_command(
         typer.Option("--input", help="Root containing source capture files."),
     ] = DEFAULT_INPUT,
     input_format: Annotated[
-        Literal["freerouter", "tokenplan"],
+        Literal["freerouter", "tokenplan", "sxf"],
         typer.Option(
             "--input-format",
             help="Input layout and envelope format.",

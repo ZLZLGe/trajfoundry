@@ -41,6 +41,7 @@ from .providers.anthropic import parse_anthropic_capture
 from .providers.chat import parse_chat_capture
 from .providers.responses import parse_responses_capture
 from .quality import enrich_trajectory
+from .sources.sxf import SXFError, adapt_sxf_envelope
 from .sources.tokenplan import TokenPlanError, adapt_tokenplan_envelope
 from .state import StateStore
 from .streaming import streaming_prefix_leaves
@@ -115,7 +116,7 @@ def _normalization_locks(config: PipelineConfig) -> Iterable[None]:
 @dataclass(frozen=True, slots=True)
 class PipelineConfig:
     input_root: Path = DEFAULT_INPUT
-    input_format: Literal["freerouter", "tokenplan"] = "freerouter"
+    input_format: Literal["freerouter", "tokenplan", "sxf"] = "freerouter"
     output_root: Path = DEFAULT_OUTPUT
     state_path: Path | None = None
     resume: bool = False
@@ -196,7 +197,7 @@ def parse_capture(
     *,
     source_path: str,
     source_sha256: str,
-    source_name: Literal["freerouter", "tokenplan"] = "freerouter",
+    source_name: Literal["freerouter", "tokenplan", "sxf"] = "freerouter",
     response_is_normalized_final: bool = False,
     multimodal_file_mapping: Sequence[MediaMapping] | None = None,
 ) -> Snapshot:
@@ -494,6 +495,15 @@ def _initial_audit(issues: Sequence[AuditIssue]) -> NormalizationAudit:
     )
 
 
+def _source_file_and_line(source_path: str) -> tuple[str, int]:
+    """Extract SXF's line marker while preserving legacy file sources."""
+
+    base, marker, line_text = source_path.rpartition("#L")
+    if base and marker and line_text.isdigit():
+        return Path(base).name, int(line_text)
+    return Path(source_path).name, 0
+
+
 def _trajectory_from_leaf(
     leaf: Snapshot, contributors: Iterable[Snapshot]
 ) -> TrajectoryNode:
@@ -512,7 +522,7 @@ def _trajectory_from_leaf(
         _contributor_leaf_warnings(leaf, contributor_list),
     )
     multimodal_file_mapping = _merged_multimodal_file_mapping(leaf, contributor_list)
-    basename = Path(leaf.source_path).name
+    basename, line_no = _source_file_and_line(leaf.source_path)
     return TrajectoryNode(
         messages=[*leaf.history, *leaf.response],
         multimodal_file_mapping=multimodal_file_mapping,
@@ -528,7 +538,7 @@ def _trajectory_from_leaf(
         metadata=Metadata(
             source_file=basename,
             source_name=leaf.source_name,
-            line_no=0,
+            line_no=line_no,
             created_at=leaf.captured_at,
         ),
         normalization_audit=_initial_audit(issues),
@@ -1056,6 +1066,7 @@ def _export(
                 if reason_code not in {
                     "tokenplan_empty_envelope",
                     "invalid_tokenplan_envelope",
+                    "sxf_error",
                 }:
                     reason_code = "capture_parse_failed"
                 output.write_record(
@@ -1103,34 +1114,24 @@ def _ingest_source(
     source_errors_fatal: bool = False,
 ) -> None:
     state.begin_scan(uuid.uuid4().hex)
-    for capture_ref in source.iter_captures(config.input_format):
+
+    def process_payload(source_ref: str, payload: bytes, digest: str) -> None:
         stats.discovered += 1
-        source_ref = capture_ref.source_ref
-        digest = ""
         endpoint = ""
         captured_at = ""
-
-        try:
-            payload, digest = source.read_capture_bytes(capture_ref)
-        except Exception as error:
-            if source_errors_fatal:
-                raise
-            state.put_failure(
-                source_ref,
-                digest,
-                f"{type(error).__name__}: capture could not be normalized",
-                endpoint=endpoint,
-                captured_at=captured_at,
-            )
-            stats.parse_failures += 1
-            continue
         if state.capture_matches(source_ref, digest):
             stats.reused += 1
-            continue
+            return
 
         try:
             capture = decode_capture(payload, input_format=config.input_format)
-            source_name: Literal["freerouter", "tokenplan"] = "freerouter"
+            endpoint_value = capture.get("path")
+            endpoint = (
+                endpoint_value.split("?", 1)[0].rstrip("/")
+                if isinstance(endpoint_value, str)
+                else ""
+            )
+            source_name: Literal["freerouter", "tokenplan", "sxf"] = "freerouter"
             response_is_normalized_final = False
             multimodal_file_mapping: list[MediaMapping] = []
             if config.input_format == "tokenplan":
@@ -1141,12 +1142,9 @@ def _ingest_source(
                 captured_at = adapted.captured_at
                 response_is_normalized_final = adapted.response_is_normalized_final
                 multimodal_file_mapping = adapted.multimodal_file_mapping
-            endpoint_value = capture.get("path")
-            endpoint = (
-                endpoint_value.split("?", 1)[0].rstrip("/")
-                if isinstance(endpoint_value, str)
-                else ""
-            )
+            elif config.input_format == "sxf":
+                capture = adapt_sxf_envelope(capture)
+                source_name = "sxf"
             captured_value = capture.get("captured_at")
             captured_at = captured_value if isinstance(captured_value, str) else ""
             snapshot = parse_capture(
@@ -1168,6 +1166,15 @@ def _ingest_source(
                 captured_at=captured_at,
             )
             stats.parse_failures += 1
+        except SXFError as error:
+            state.put_failure(
+                source_ref,
+                digest,
+                f"sxf_error: {error}",
+                endpoint=endpoint,
+                captured_at=captured_at,
+            )
+            stats.parse_failures += 1
         except Exception as error:  # noqa: BLE001 - quarantine per-file defects
             state.put_failure(
                 source_ref,
@@ -1177,6 +1184,30 @@ def _ingest_source(
                 captured_at=captured_at,
             )
             stats.parse_failures += 1
+
+    streaming = getattr(source, "iter_capture_payloads", None)
+    if config.input_format == "sxf" and callable(streaming):
+        for source_ref, payload, digest in streaming(config.input_format):
+            process_payload(source_ref, payload, digest)
+    else:
+        for capture_ref in source.iter_captures(config.input_format):
+            source_ref = capture_ref.source_ref
+            try:
+                payload, digest = source.read_capture_bytes(capture_ref)
+            except Exception as error:
+                if source_errors_fatal:
+                    raise
+                stats.discovered += 1
+                state.put_failure(
+                    source_ref,
+                    "",
+                    f"{type(error).__name__}: capture could not be normalized",
+                    endpoint="",
+                    captured_at="",
+                )
+                stats.parse_failures += 1
+                continue
+            process_payload(source_ref, payload, digest)
     state.finish_scan()
     stats.skipped_inputs = sum(
         status == "skipped" for _, _, status, _, _, _ in state.capture_records()
@@ -1186,7 +1217,7 @@ def _ingest_source(
 def normalize_source(
     source: CaptureSource,
     *,
-    input_format: Literal["freerouter", "tokenplan"],
+    input_format: Literal["freerouter", "tokenplan", "sxf"],
     state_path: Path,
     output_factory: Callable[[], Any],
     max_shard_bytes: int = 512 * 1024 * 1024,
@@ -1199,7 +1230,7 @@ def normalize_source(
     the ephemeral state from the immutable input inventory.
     """
 
-    if input_format not in {"freerouter", "tokenplan"}:
+    if input_format not in {"freerouter", "tokenplan", "sxf"}:
         raise ValueError(f"unsupported input format: {input_format!r}")
     if max_shard_bytes <= 0:
         raise ValueError("max_shard_bytes must be positive")

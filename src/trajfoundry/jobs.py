@@ -17,7 +17,7 @@ from .validation import ValidationReport, validate_output, validate_output_backe
 
 LOGGER = logging.getLogger(__name__)
 
-InputFormat = Literal["freerouter", "tokenplan"]
+InputFormat = Literal["freerouter", "tokenplan", "sxf"]
 DEFAULT_MAX_SHARD_BYTES = 512 * 1024 * 1024
 
 
@@ -189,7 +189,7 @@ def run_job(
     exception or an invalid published output propagates as a task failure.
     """
 
-    if input_format not in {"freerouter", "tokenplan"}:
+    if input_format not in {"freerouter", "tokenplan", "sxf"}:
         raise ValueError(f"unsupported input format: {input_format!r}")
 
     input_path = Path(input_root).expanduser()
@@ -266,7 +266,7 @@ def run_s3_job(
     ``credentials_path=None`` only when the standard AWS SDK chain is intended.
     """
 
-    if input_format not in {"freerouter", "tokenplan"}:
+    if input_format not in {"freerouter", "tokenplan", "sxf"}:
         raise ValueError(f"unsupported input format: {input_format!r}")
     if not isinstance(endpoint_url, str) or not endpoint_url:
         raise ValueError("endpoint_url must not be empty")

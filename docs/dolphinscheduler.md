@@ -117,7 +117,8 @@ On the workflow and task definitions:
    the Python task.
 
 `input_root` and `output_root` must be absolute paths. `input_format` must be
-`freerouter` or `tokenplan`. The DolphinScheduler tenant must be able to read
+`freerouter`, `tokenplan`, or `sxf`; SXF input roots contain `.jsonl.zst`
+objects. The DolphinScheduler tenant must be able to read
 and traverse the environment, project, and input paths, and must be able to
 create or write `output_root`.
 
@@ -128,9 +129,10 @@ an all-quarantine batch are logged as warnings for inspection.
 
 ### Direct S3 workflows
 
-S3 mode reads each source object into memory only while it is being normalized
-and streams normalized JSONL shards back to S3. It does not stage the complete
-input or output under `/share`, and it does not require AWS CLI. `/share` is
+S3 mode streams each SXF `.jsonl.zst` object through a bounded decompressor and
+handles one JSONL row at a time; other formats read one capture object at a
+time. Normalized JSONL shards are streamed back to S3. The complete input or
+output is never staged under `/share`, and AWS CLI is not required. `/share` is
 still used for the shared Python environment and editable source checkout.
 
 S3 credentials are loaded from this fixed path by default:
@@ -209,6 +211,7 @@ the first `2026-09-09` run, configure the task parameters as follows:
 | --- | --- | --- | --- |
 | `trajfoundry_tokenplan_v002` | `tokenplan` | `s3://agent-trajectory/lakehouse/token-plan/masked-raw/v001/dt=2026-09-09/` | `s3://agent-trajectory/lakehouse/token-plan/normalized/v002/dt=2026-09-09/` |
 | `trajfoundry_freerouter_v002` | `freerouter` | `s3://agent-trajectory/lakehouse/free-router/masked-raw/v001/dt=2026-09-09/` | `s3://agent-trajectory/lakehouse/free-router/normalized/v002/dt=2026-09-09/` |
+| `trajfoundry_sxf_v001` | `sxf` | `s3://agent-trajectory/lakehouse/SXF/mul-agent-sxf/guixu-data/260821/gpt-5.6-sol/` | `s3://agent-trajectory/lakehouse/SXF/mul-agent-sxf/normalized/v001/dt=2026-08-21/` |
 
 Set the shared `endpoint_url` parameter to:
 
@@ -228,11 +231,12 @@ the same time because both would compete to publish the same manifest. Enforce
 maximum concurrency `1` for each format/date in the scheduler; the application
 does not create a distributed S3 lock.
 
-Add a shared workflow parameter named `workspace_parent`, for example
-`/share/OWNER/trajfoundry-state`. Create that directory once and make it
-writable by the Dolphin tenant before the first run. Do not set it to
-`Path.cwd()` or `/tmp`: the scheduler task directory is under `/tmp` in this
-deployment, and the aggregation state can grow with the input partition.
+Add a shared workflow parameter named `workspace_parent`. For production S3
+jobs, point it at a worker-local writable directory such as `/tmp` (or another
+local filesystem with sufficient free space), not `/share`: SQLite aggregation
+state is read/write and concurrent NFS access can corrupt it. The directory
+must already exist and be writable by the Dolphin tenant. Size the local disk
+for the largest expected partition; the state is removed when the task exits.
 
 Only a unique temporary SQLite state directory is created below
 `workspace_parent`; source captures and normalized shards are not persisted

@@ -240,7 +240,7 @@ class ToolCallCheck(StrictModel):
 
 class Metadata(StrictModel):
     source_file: str
-    source_name: Literal["freerouter", "tokenplan"] = "freerouter"
+    source_name: Literal["freerouter", "tokenplan", "sxf"] = "freerouter"
     line_no: int = 0
     created_at: str = ""
 
@@ -309,7 +309,7 @@ class TrajectoryNode(StrictModel):
 class Snapshot(StrictModel):
     source_path: str
     source_sha256: str
-    source_name: Literal["freerouter", "tokenplan"] = "freerouter"
+    source_name: Literal["freerouter", "tokenplan", "sxf"] = "freerouter"
     session_id: str
     thread_id: str
     turn_id: str = ""

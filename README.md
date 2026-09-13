@@ -1,8 +1,9 @@
 # TrajFoundry
 
-TrajFoundry normalizes desensitized Freerouter captures and TokenPlan feedback
-envelopes into deterministic, auditable trajectory JSONL. It is an independent
-project: it does not import, write to, or depend on AutoData or DataHarness.
+TrajFoundry normalizes desensitized Freerouter captures, TokenPlan feedback
+envelopes, and SXF `.jsonl.zst` capture streams into deterministic, auditable
+trajectory JSONL. It is an independent project: it does not import, write to,
+or depend on AutoData or DataHarness.
 
 The first phase implements trajectory standardization. The data contract is
 based on `/root/ailab文档/轨迹标准化/轨迹数据的标准化格式.docx`, with these
@@ -46,6 +47,16 @@ uv run trajfoundry normalize \
   --output /data/trajfoundry-tokenplan
 ```
 
+SXF partitions are newline-delimited compressed streams.  They are decompressed
+and parsed one row at a time, so the complete partition is never staged locally:
+
+```bash
+uv run trajfoundry normalize \
+  --input-format sxf \
+  --input /data/sxf/partitions \
+  --output /data/trajfoundry-sxf
+```
+
 Scheduler jobs can also normalize directly from one S3 prefix to another with
 `trajfoundry.jobs.run_s3_job`. The S3 mode lists and reads source objects one at
 a time and streams generation JSONL back to S3; it does not copy the complete
@@ -58,7 +69,7 @@ S3 publication writes an immutable `generations/<run-id>/` first, validates it
 by reading the remote objects, and uploads the top-level `manifest.json` last.
 Readers therefore continue to see the previous manifest if generation upload
 or validation fails. See [`docs/dolphinscheduler.md`](docs/dolphinscheduler.md)
-for the two-workflow FreeRouter and TokenPlan configuration.
+for the FreeRouter, TokenPlan, and SXF workflow configuration.
 
 The input tree is read-only. A non-empty output directory requires `--resume`:
 
@@ -78,8 +89,9 @@ timestamp changes.
 
 - Supported endpoints: OpenAI-compatible Responses and Anthropic Messages,
   plus OpenAI-compatible Chat Completions. Streamed and non-streamed responses
-  are supported; TokenPlan's normalized-final stream objects are parsed as
-  final objects without changing the original request's `stream` value.
+  are supported; SXF SSE bodies are decoded before provider parsing. TokenPlan's
+  normalized-final stream objects are parsed as final objects without changing
+  the original request's `stream` value.
   Anthropic `count_tokens` captures are recorded as excluded non-trajectory
   records.
 - TokenPlan discovery selects only `req_*.json`; partition manifests and media
@@ -124,8 +136,10 @@ timestamp changes.
 - Client tool definitions are merged across proven prefix contributors. The
   richer compatible definition wins deterministically; incompatible same-name
   schemas quarantine the trajectory.
-- Cross-`session_id` tool-definition aggregation is intentionally deferred;
-  the current aggregation boundary remains `(session_id, thread_id)`.
+- Tool definitions are merged only among prefix contributors to the same
+  `(session_id, thread_id, compaction signature)` trajectory group. There is no
+  cross-session tool registry: a tool seen in a different trajectory cannot
+  backfill this one.
 - Server tools remain in `server_tool_calls` and never become client tools or
   tool messages. Their provider result blocks are preserved verbatim, and a
   missing result is represented explicitly as `"result": null`.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -35,10 +36,18 @@ class CaptureSource(Protocol):
 
     def iter_captures(
         self,
-        input_format: Literal["freerouter", "tokenplan"],
+        input_format: Literal["freerouter", "tokenplan", "sxf"],
     ) -> Iterator[Any]: ...
 
     def read_capture_bytes(self, capture: Any) -> tuple[bytes, str]: ...
+
+
+class StreamingCaptureSource(Protocol):
+    """Optional source boundary for line-oriented compressed inputs."""
+
+    def iter_capture_payloads(
+        self, input_format: Literal["freerouter", "tokenplan", "sxf"]
+    ) -> Iterator[tuple[str, bytes, str]]: ...
 
 
 class LocalCaptureSource:
@@ -53,7 +62,7 @@ class LocalCaptureSource:
 
     def iter_captures(
         self,
-        input_format: Literal["freerouter", "tokenplan"],
+        input_format: Literal["freerouter", "tokenplan", "sxf"],
     ) -> Iterator[LocalCapture]:
         for path in discover_captures(self.root, input_format=input_format):
             yield LocalCapture(
@@ -64,11 +73,21 @@ class LocalCaptureSource:
     def read_capture_bytes(self, capture: LocalCapture) -> tuple[bytes, str]:
         return read_capture_bytes(capture.path)
 
+    def iter_capture_payloads(
+        self, input_format: Literal["freerouter", "tokenplan", "sxf"]
+    ) -> Iterator[tuple[str, bytes, str]]:
+        if input_format != "sxf":
+            raise ValueError(
+                f"streaming payloads are only available for sxf: {input_format!r}"
+            )
+        for capture in self.iter_captures(input_format):
+            yield from _iter_local_sxf_payloads(capture)
+
 
 def discover_captures(
     root: Path,
     *,
-    input_format: Literal["freerouter", "tokenplan"] = "freerouter",
+    input_format: Literal["freerouter", "tokenplan", "sxf"] = "freerouter",
 ) -> Iterator[Path]:
     """Yield only capture files for the selected source format.
 
@@ -83,6 +102,8 @@ def discover_captures(
         pattern = "*.json"
     elif input_format == "tokenplan":
         pattern = "req_*.json"
+    elif input_format == "sxf":
+        pattern = "*.jsonl.zst"
     else:  # pragma: no cover - PipelineConfig constrains the public value.
         raise ValueError(f"unsupported input format: {input_format!r}")
     yield from sorted(path for path in root.rglob(pattern) if path.is_file())
@@ -113,7 +134,7 @@ def read_capture_bytes(path: Path) -> tuple[bytes, str]:
 def decode_capture(
     payload: bytes,
     *,
-    input_format: Literal["freerouter", "tokenplan"] = "freerouter",
+    input_format: Literal["freerouter", "tokenplan", "sxf"] = "freerouter",
 ) -> dict[str, Any]:
     """Decode one capture while discarding sensitive headers immediately.
 
@@ -135,9 +156,35 @@ def decode_capture(
             capture["request_headers"] = {}
         capture.pop("response_headers", None)
         capture.pop("query_string", None)
+    elif input_format == "sxf":
+        # SXF has its own envelope adapter, which also sanitizes headers.
+        pass
     elif input_format != "tokenplan":
         raise ValueError(f"unsupported input format: {input_format!r}")
     return capture
+
+
+def _iter_local_sxf_payloads(capture: LocalCapture) -> Iterator[tuple[str, bytes, str]]:
+    """Yield decompressed SXF JSONL rows from one local zstd object."""
+
+    import zstandard
+
+    digest = hashlib.sha256
+    with (
+        capture.path.open("rb") as compressed,
+        io.BufferedReader(
+            zstandard.ZstdDecompressor().stream_reader(compressed)
+        ) as reader,
+    ):
+        line_no = 0
+        while True:
+            line = reader.readline()
+            if not line:
+                break
+            payload = line.rstrip(b"\r\n")
+            source_ref = f"{capture.source_ref}#L{line_no:08d}"
+            yield source_ref, payload, digest(payload).hexdigest()
+            line_no += 1
 
 
 def load_capture(path: Path) -> dict[str, Any]:

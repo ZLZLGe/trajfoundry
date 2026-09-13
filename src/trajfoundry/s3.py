@@ -8,6 +8,7 @@ local-only jobs.
 from __future__ import annotations
 
 import hashlib
+import io
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -16,8 +17,33 @@ from urllib.parse import urlsplit
 if TYPE_CHECKING:
     from .credentials import S3Credentials
 
-InputFormat = Literal["freerouter", "tokenplan"]
+InputFormat = Literal["freerouter", "tokenplan", "sxf"]
 _READ_CHUNK_BYTES = 1024 * 1024
+
+
+class _CountingBody:
+    """Adapt an S3 body for zstandard while counting compressed bytes."""
+
+    def __init__(self, body: Any) -> None:
+        self.body = body
+        self.bytes_read = 0
+
+    def read(self, size: int = -1) -> bytes:
+        value = self.body.read(size)
+        if not isinstance(value, bytes):
+            raise TypeError("S3 response body must yield bytes")
+        self.bytes_read += len(value)
+        return value
+
+    def readinto(self, buffer: bytearray | memoryview) -> int:
+        value = self.read(len(buffer))
+        buffer[: len(value)] = value
+        return len(value)
+
+    def close(self) -> None:
+        close = getattr(self.body, "close", None)
+        if callable(close):
+            close()
 
 
 def _validate_bucket(bucket: str) -> None:
@@ -180,7 +206,7 @@ class S3CaptureSource:
     def iter_captures(self, input_format: InputFormat) -> Iterator[S3Capture]:
         """Return capture metadata in stable relative-key order."""
 
-        if input_format not in {"freerouter", "tokenplan"}:
+        if input_format not in {"freerouter", "tokenplan", "sxf"}:
             raise ValueError(f"unsupported input format: {input_format!r}")
 
         captures: list[S3Capture] = []
@@ -224,10 +250,12 @@ class S3CaptureSource:
                 basename = source_ref.rsplit("/", 1)[-1]
                 if input_format == "freerouter":
                     selected = basename.endswith(".json")
-                else:
+                elif input_format == "tokenplan":
                     selected = basename.startswith("req_") and basename.endswith(
                         ".json"
                     )
+                else:
+                    selected = basename.endswith(".jsonl.zst")
                 if selected:
                     captures.append(
                         S3Capture(
@@ -239,6 +267,73 @@ class S3CaptureSource:
                     )
 
         return iter(sorted(captures, key=lambda capture: capture.source_ref))
+
+    def iter_capture_payloads(
+        self, input_format: InputFormat
+    ) -> Iterator[tuple[str, bytes, str]]:
+        """Stream decompressed SXF JSONL rows from each immutable S3 object.
+
+        The object itself is never accumulated in memory.  Each yielded hash
+        covers the exact JSONL row (without its line ending), which is the
+        identity used by the local ingest state and lineage records.
+        """
+
+        if input_format != "sxf":
+            raise ValueError(
+                f"streaming payloads are only available for sxf: {input_format!r}"
+            )
+        try:
+            import zstandard
+        except ImportError as error:  # pragma: no cover - environment setup issue
+            raise RuntimeError(
+                "SXF input requires the 'zstandard' package in the runtime environment"
+            ) from error
+
+        for capture in self.iter_captures("sxf"):
+            response = self.client.get_object(
+                Bucket=self.location.bucket,
+                Key=capture.key,
+                IfMatch=capture.etag,
+            )
+            body = response.get("Body")
+            if body is None or not callable(getattr(body, "read", None)):
+                raise OSError("S3 SXF object response has no readable body")
+            response_etag = response.get("ETag")
+            if response_etag != capture.etag:
+                close = getattr(body, "close", None)
+                if callable(close):
+                    close()
+                raise OSError("S3 SXF object ETag changed while it was being read")
+            content_length = response.get("ContentLength")
+            if (
+                not isinstance(content_length, int)
+                or isinstance(content_length, bool)
+                or content_length != capture.size
+            ):
+                close = getattr(body, "close", None)
+                if callable(close):
+                    close()
+                raise OSError("S3 SXF object size changed while it was being read")
+            counted_body = _CountingBody(body)
+            try:
+                with io.BufferedReader(
+                    zstandard.ZstdDecompressor().stream_reader(counted_body)
+                ) as reader:
+                    line_no = 0
+                    while True:
+                        line = reader.readline()
+                        if not line:
+                            break
+                        payload = line.rstrip(b"\r\n")
+                        source_ref = f"{capture.source_ref}#L{line_no:08d}"
+                        yield source_ref, payload, hashlib.sha256(payload).hexdigest()
+                        line_no += 1
+                if counted_body.bytes_read != capture.size:
+                    raise OSError("S3 SXF object ended before its advertised size")
+            finally:
+                close = getattr(body, "close", None)
+                if callable(close):
+                    close()
 
     def read_capture_bytes(self, capture: S3Capture) -> tuple[bytes, str]:
         """Conditionally read, close, length-check, and hash one S3 object."""
