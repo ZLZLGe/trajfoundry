@@ -8,6 +8,7 @@ import orjson
 import zstandard
 
 from trajfoundry.io import LocalCaptureSource
+from trajfoundry.providers.responses import parse_responses_capture
 from trajfoundry.sources.sxf import adapt_sxf_envelope, parse_sse_events
 
 
@@ -28,17 +29,28 @@ def _chat_sse() -> str:
             "object": "chat.completion.chunk",
             "created": 1,
             "model": "m",
-            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "he"}, "finish_reason": None}],
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "he"},
+                    "finish_reason": None,
+                }
+            ],
         },
         {
             "id": "chat-1",
             "object": "chat.completion.chunk",
             "created": 1,
             "model": "m",
-            "choices": [{"index": 0, "delta": {"content": "llo"}, "finish_reason": "stop"}],
+            "choices": [
+                {"index": 0, "delta": {"content": "llo"}, "finish_reason": "stop"}
+            ],
         },
     ]
-    return "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+    return (
+        "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+        + "data: [DONE]\n\n"
+    )
 
 
 def test_parse_sse_events_handles_comments_and_event_data() -> None:
@@ -95,6 +107,43 @@ def test_adapt_sxf_envelope_maps_raw_capture_and_chat_chunks() -> None:
     assert adapted_chat["session_id"] == "session-2"
     assert adapted_chat["response_body"]["object"] == "chat.completion"
     assert adapted_chat["response_body"]["choices"][0]["message"]["content"] == "hello"
+
+
+def test_sxf_promotes_identity_headers_and_ignores_transport_events() -> None:
+    raw = {
+        "schema": "tap_raw_capture_record.v1",
+        "capture_id": "cap-identity",
+        "started_at": "2026-08-21T00:00:00Z",
+        "path": "/v1/responses",
+        "status_code": 200,
+        "request_headers": {
+            "Session-Id": ["session-from-header"],
+            "Thread-Id": ["thread-from-header"],
+        },
+        "request_body": {"model": "m", "input": []},
+        "response_body": (
+            "event: response.created\n"
+            'data: {"type":"response.created","sequence_number":0}\n\n'
+            'data: {"type":"response.metadata","sequence_number":1,"metadata":{"moderation":{}}}\n\n'
+            'data: {"type":"keepalive","sequence_number":2}\n\n'
+            "event: response.completed\n"
+            'data: {"type":"response.completed","sequence_number":3,"response":{"status":"completed","output":[]}}\n\n'
+        ),
+    }
+
+    adapted = adapt_sxf_envelope(raw)
+    assert adapted["session_id"] == "session-from-header"
+    assert adapted["thread_id"] == "thread-from-header"
+    snapshot = parse_responses_capture(
+        adapted,
+        source_path="part-000001.jsonl.zst#L00000000",
+        source_sha256="a" * 64,
+    )
+    assert snapshot.outcome == "success"
+    assert snapshot.wire_complete is True
+    assert not any(issue.code == "unknown_sse_event" for issue in snapshot.issues)
+    assert snapshot.session_id == "session-from-header"
+    assert snapshot.thread_id == "thread-from-header"
 
 
 def test_local_sxf_source_streams_rows_with_line_refs(tmp_path: Path) -> None:

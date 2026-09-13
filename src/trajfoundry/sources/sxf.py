@@ -34,6 +34,14 @@ _IDENTITY_HEADER_ALIASES = {
     "forked-from-thread-id": "forked_from_thread_id",
     "forked_from_thread_id": "forked_from_thread_id",
 }
+_PROMOTED_IDENTITY_FIELDS = (
+    "session_id",
+    "thread_id",
+    "turn_id",
+    "parent_thread_id",
+    "parent_turn_id",
+    "forked_from_thread_id",
+)
 
 
 def _header_scalar(value: Any) -> Any:
@@ -328,9 +336,18 @@ def adapt_sxf_envelope(capture: Mapping[str, Any]) -> dict[str, Any]:
         capture_id = capture.get("capture_id")
         if isinstance(capture_id, str) and capture_id:
             result["request_id"] = capture_id
-        result["request_headers"] = sanitize_identity_headers(
-            capture.get("request_headers")
-        )
+        identity_headers = sanitize_identity_headers(capture.get("request_headers"))
+        result["request_headers"] = identity_headers
+        # The provider adapters intentionally read only a small, explicit
+        # request-header allowlist.  SXF's Session-Id/Thread-Id headers are
+        # semantic identity, not credentials, so expose scalar values at the
+        # capture boundary where every provider can apply the normal fallback
+        # and conflict checks.  Multi-valued headers remain unpromoted rather
+        # than guessing which identity is authoritative.
+        for field in _PROMOTED_IDENTITY_FIELDS:
+            value = identity_headers.get(field)
+            if isinstance(value, str) and value:
+                result.setdefault(field, value)
     elif isinstance(capture.get("capture_meta"), Mapping):
         meta = dict(capture["capture_meta"])
         result = {

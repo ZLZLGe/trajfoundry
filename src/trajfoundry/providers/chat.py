@@ -252,6 +252,12 @@ def _identity_metadata(
             for key, value in raw_headers.items()
             if str(key).lower()
             in {
+                "session_id",
+                "thread_id",
+                "turn_id",
+                "parent_thread_id",
+                "parent_turn_id",
+                "forked_from_thread_id",
                 "x-codex-turn-metadata",
                 "x-codex-parent-thread-id",
                 "x-openai-subagent",

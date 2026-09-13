@@ -97,6 +97,12 @@ _KNOWN_EVENT_PREFIXES = (
     "response.tool_search_call.",
     "response.audio.",
 )
+_IGNORED_EVENT_TYPES = {
+    # SXF/Responses transport metadata.  These events carry no conversational
+    # output and are intentionally omitted from the canonical trajectory.
+    "response.metadata",
+    "keepalive",
+}
 _LIFECYCLE_EVENTS = {
     "response.created",
     "response.queued",
@@ -1579,8 +1585,13 @@ def _extract_events(
             previous_event_seq = sequence
 
         event_type = event.get("type")
-        known = event_type in _LIFECYCLE_EVENTS or (
-            isinstance(event_type, str) and event_type.startswith(_KNOWN_EVENT_PREFIXES)
+        known = (
+            event_type in _LIFECYCLE_EVENTS
+            or event_type in _IGNORED_EVENT_TYPES
+            or (
+                isinstance(event_type, str)
+                and event_type.startswith(_KNOWN_EVENT_PREFIXES)
+            )
         )
         if not known:
             _issue(
@@ -1996,8 +2007,8 @@ def _identity_metadata(
             )
             saw_codex_metadata = True
 
-    # Headers are untrusted transport metadata.  Read only the three explicitly
-    # allowed keys and retain only their decoded identity values.
+    # Headers are untrusted transport metadata. Read only the explicit identity
+    # allowlist and retain only their decoded identity values.
     raw_headers = capture.get("request_headers")
     headers: dict[str, Any] = {}
     if isinstance(raw_headers, Mapping):
@@ -2006,6 +2017,12 @@ def _identity_metadata(
             for key, value in raw_headers.items()
             if str(key).lower()
             in {
+                "session_id",
+                "thread_id",
+                "turn_id",
+                "parent_thread_id",
+                "parent_turn_id",
+                "forked_from_thread_id",
                 "x-codex-turn-metadata",
                 "x-codex-parent-thread-id",
                 "x-openai-subagent",
