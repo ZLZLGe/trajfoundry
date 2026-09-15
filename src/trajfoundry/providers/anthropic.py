@@ -1511,16 +1511,20 @@ def _snapshot_base(
         or _text(capture.get("session_id"))
         or _text(headers.get("x-claude-code-session-id"))
     )
-    explicit_thread_id = _text(metadata.get("thread_id")) or _text(
-        capture.get("thread_id")
+    explicit_thread_id = (
+        _text(metadata.get("thread_id"))
+        or _text(capture.get("thread_id"))
+        or _text(headers.get("x-claude-code-agent-id"))
     )
     marker = _text(metadata.get("subagent_marker")) or _text(
         capture.get("subagent_marker")
     )
     if marker in {"main", "user"}:
         marker = ""
-    parent_thread_id = _text(metadata.get("parent_thread_id")) or _text(
-        capture.get("parent_thread_id")
+    parent_thread_id = (
+        _text(metadata.get("parent_thread_id"))
+        or _text(capture.get("parent_thread_id"))
+        or _text(headers.get("parent_thread_id"))
     )
     parent_turn_id = _text(metadata.get("parent_turn_id")) or _text(
         capture.get("parent_turn_id")

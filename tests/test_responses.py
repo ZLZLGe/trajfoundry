@@ -759,6 +759,117 @@ def test_reconstructs_lossless_custom_call_from_parsed_sse_frames() -> None:
     assert snapshot.issues == []
 
 
+def test_reasoning_part_lifecycle_from_real_responses_stream_is_supported() -> None:
+    reasoning = {
+        "id": "rs-1",
+        "type": "reasoning",
+        "summary": [],
+        "content": [{"type": "reasoning_text", "text": "visible reasoning"}],
+        "encrypted_content": "ciphertext",
+        "status": "completed",
+    }
+    events = [
+        {
+            "type": "response.output_item.added",
+            "sequence_number": 0,
+            "output_index": 0,
+            "item": {
+                "id": "rs-1",
+                "type": "reasoning",
+                "summary": [],
+                "content": [],
+                "encrypted_content": "ciphertext",
+                "status": "in_progress",
+            },
+        },
+        {
+            "type": "response.reasoning_part.added",
+            "sequence_number": 1,
+            "output_index": 0,
+            "content_index": 0,
+            "item_id": "rs-1",
+            "part": {"type": "reasoning_text", "text": ""},
+        },
+        {
+            "type": "response.reasoning_text.done",
+            "sequence_number": 2,
+            "output_index": 0,
+            "content_index": 0,
+            "item_id": "rs-1",
+            "text": "visible reasoning",
+        },
+        {
+            "type": "response.reasoning_part.done",
+            "sequence_number": 3,
+            "output_index": 0,
+            "content_index": 0,
+            "item_id": "rs-1",
+            "part": {"type": "reasoning_text", "text": "visible reasoning"},
+        },
+        {
+            "type": "response.output_item.done",
+            "sequence_number": 4,
+            "output_index": 0,
+            "item": reasoning,
+        },
+        {
+            "type": "response.completed",
+            "sequence_number": 5,
+            "response": {
+                "id": "resp-1",
+                "status": "completed",
+                "model": "gpt-test",
+                "output": [reasoning],
+            },
+        },
+    ]
+
+    snapshot = _parse(
+        _capture(
+            request_body={"model": "gpt-test", "input": [], "tools": []},
+            response_body=events,
+        )
+    )
+
+    assert snapshot.outcome == "success"
+    assert snapshot.wire_complete is True
+    assert snapshot.response[0].reasoning_content == "visible reasoning"
+    assert snapshot.issues == []
+
+
+def test_unclosed_reasoning_part_is_quarantined() -> None:
+    events = [
+        {
+            "type": "response.reasoning_part.added",
+            "sequence_number": 0,
+            "output_index": 0,
+            "content_index": 0,
+            "item_id": "rs-1",
+            "part": {"type": "reasoning_text", "text": ""},
+        },
+        {
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {
+                "status": "completed",
+                "model": "gpt-test",
+                "output": [],
+            },
+        },
+    ]
+
+    snapshot = _parse(
+        _capture(
+            request_body={"model": "gpt-test", "input": [], "tools": []},
+            response_body=events,
+        )
+    )
+
+    assert snapshot.outcome == "capture_invalid"
+    assert snapshot.wire_complete is False
+    assert "unclosed_sse_item" in {issue.code for issue in snapshot.issues}
+
+
 def test_multiple_reasoning_items_start_separate_assistant_segments() -> None:
     first_reasoning = {
         "type": "reasoning",

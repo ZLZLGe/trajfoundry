@@ -363,7 +363,9 @@ class S3OutputSet:
         *,
         input_root: str,
         config_hash: str,
-        input_format: Literal["freerouter", "tokenplan", "sxf"] = "freerouter",
+        input_format: Literal[
+            "freerouter", "tokenplan", "sxf", "deepinfra"
+        ] = "freerouter",
     ) -> bytes:
         if self._manifest_bytes is not None:
             return self._manifest_bytes

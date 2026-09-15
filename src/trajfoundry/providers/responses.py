@@ -82,6 +82,7 @@ _KNOWN_EVENT_PREFIXES = (
     "response.refusal.",
     "response.reasoning_summary_part.",
     "response.reasoning_summary_text.",
+    "response.reasoning_part.",
     "response.reasoning_text.",
     "response.function_call_arguments.",
     "response.custom_tool_call_input.",
@@ -1755,6 +1756,11 @@ def _validate_stream_structure(
             "response.reasoning_summary_part.added",
             "response.reasoning_summary_part.done",
             "summary_index",
+        ),
+        (
+            "response.reasoning_part.added",
+            "response.reasoning_part.done",
+            "content_index",
         ),
     )
     for added_type, done_type, sub_index_field in families:

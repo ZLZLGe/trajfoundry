@@ -172,6 +172,50 @@ def _tokenplan_capture() -> bytes:
     )
 
 
+def _deepinfra_capture() -> bytes:
+    request_body = {
+        "model": "chat-test",
+        "messages": [{"role": "user", "content": "hello"}],
+        "client_metadata": {"session_id": "session-1"},
+    }
+    response_body = {
+        "id": "completion-1",
+        "object": "chat.completion",
+        "model": "chat-test",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "done"},
+            }
+        ],
+    }
+    return orjson.dumps(
+        {
+            "request_id": "request-1",
+            "request_time": "2026-09-14T00:00:00Z",
+            "request": {
+                "method": "POST",
+                "path": "/v1/chat/completions",
+                "headers": {"x-user-id": "deepinfra-user"},
+                "body": orjson.dumps(request_body).decode(),
+                "body_truncated": False,
+            },
+            "response": {
+                "status_code": 200,
+                "headers": {},
+                "body": orjson.dumps(response_body).decode(),
+                "body_truncated": False,
+            },
+            "access_log": {
+                "path": "/v1/chat/completions",
+                "request_id": "request-1",
+                "response_code": 200,
+            },
+        }
+    )
+
+
 def _run(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -247,6 +291,37 @@ def test_run_s3_job_normalizes_tokenplan_directly_between_s3_prefixes(
     manifest_key = "lakehouse/token-plan/normalized/v002/dt=2026-09-09/manifest.json"
     manifest = orjson.loads(client.objects[("agent-trajectory", manifest_key)])
     assert manifest["input_format"] == "tokenplan"
+    assert list(workspace.iterdir()) == []
+    assert client.closed
+
+
+def test_run_s3_job_normalizes_deepinfra_json_objects(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = _MemoryS3Client()
+    input_key = "lakehouse/deep-infra/masked-raw/v001/dt=2026-09-14/capture.json"
+    client.objects[("agent-trajectory", input_key)] = _deepinfra_capture()
+    monkeypatch.setattr(jobs, "create_s3_client", lambda **kwargs: client)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    result = jobs.run_s3_job(
+        "s3://agent-trajectory/lakehouse/deep-infra/masked-raw/v001/dt=2026-09-14/",
+        "s3://agent-trajectory/lakehouse/deep-infra/normalized/v001/dt=2026-09-14/",
+        "deepinfra",
+        "http://s3.example.invalid",
+        workspace_parent=workspace,
+        credentials_path=None,
+    )
+
+    assert result.validation.valid
+    assert result.accepted == 1
+    assert result.stats.discovered == 1
+    assert result.stats.parsed == 1
+    manifest_key = "lakehouse/deep-infra/normalized/v001/dt=2026-09-14/manifest.json"
+    manifest = orjson.loads(client.objects[("agent-trajectory", manifest_key)])
+    assert manifest["input_format"] == "deepinfra"
     assert list(workspace.iterdir()) == []
     assert client.closed
 

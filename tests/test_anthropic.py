@@ -1024,3 +1024,30 @@ def test_subagent_without_explicit_thread_id_ignores_session_header_fallback() -
         if issue.code == "isolated_subagent_missing_thread_id"
     )
     assert warning.severity == Severity.WARNING
+
+
+def test_claude_agent_header_is_a_stable_thread_boundary() -> None:
+    capture = _capture(
+        request_body={
+            "model": "claude-test",
+            "messages": [],
+        },
+        response_body={
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "stop_reason": "end_turn",
+            "content": [],
+        },
+    )
+    capture["request_headers"] = {
+        "x-claude-code-session-id": "shared-session",
+        "x-claude-code-agent-id": "child-agent",
+    }
+    capture.pop("thread_id", None)
+
+    snapshot = _parse(capture)
+
+    assert snapshot.session_id == "session-1"
+    assert snapshot.thread_id == "child-agent"
+    assert snapshot.outcome == "success"

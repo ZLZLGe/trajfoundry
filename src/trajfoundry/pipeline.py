@@ -7,7 +7,7 @@ import hashlib
 import json
 import uuid
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -41,6 +41,7 @@ from .providers.anthropic import parse_anthropic_capture
 from .providers.chat import parse_chat_capture
 from .providers.responses import parse_responses_capture
 from .quality import enrich_trajectory
+from .sources.deepinfra import DeepInfraError, adapt_deepinfra_envelope
 from .sources.sxf import SXFError, adapt_sxf_envelope
 from .sources.tokenplan import TokenPlanError, adapt_tokenplan_envelope
 from .state import StateStore
@@ -48,7 +49,7 @@ from .streaming import streaming_prefix_leaves
 from .subagents import SubagentMountPlan, plan_subagent_mounts
 from .tool_names import is_spawn_tool_name
 
-NORMALIZER_REVISION = "2026-09-15.2"
+NORMALIZER_REVISION = "2026-09-15.5"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 
@@ -116,7 +117,7 @@ def _normalization_locks(config: PipelineConfig) -> Iterable[None]:
 @dataclass(frozen=True, slots=True)
 class PipelineConfig:
     input_root: Path = DEFAULT_INPUT
-    input_format: Literal["freerouter", "tokenplan", "sxf"] = "freerouter"
+    input_format: Literal["freerouter", "tokenplan", "sxf", "deepinfra"] = "freerouter"
     output_root: Path = DEFAULT_OUTPUT
     state_path: Path | None = None
     resume: bool = False
@@ -197,7 +198,7 @@ def parse_capture(
     *,
     source_path: str,
     source_sha256: str,
-    source_name: Literal["freerouter", "tokenplan", "sxf"] = "freerouter",
+    source_name: Literal["freerouter", "tokenplan", "sxf", "deepinfra"] = "freerouter",
     response_is_normalized_final: bool = False,
     multimodal_file_mapping: Sequence[MediaMapping] | None = None,
 ) -> Snapshot:
@@ -527,6 +528,7 @@ def _trajectory_from_leaf(
         "freerouter": ("api-router", "free-router"),
         "tokenplan": ("api-router", "token-plan"),
         "sxf": ("traj-cooperate", "SXF"),
+        "deepinfra": ("api-router", "deep-infra"),
     }[leaf.source_name]
     contributor_user_ids = {
         snapshot.user_id for snapshot in contributor_list if snapshot.user_id
@@ -1100,6 +1102,8 @@ def _export(
                     "tokenplan_empty_envelope",
                     "invalid_tokenplan_envelope",
                     "sxf_error",
+                    "invalid_deepinfra_envelope",
+                    "deepinfra_incomplete_envelope",
                 }:
                     reason_code = "capture_parse_failed"
                 output.write_record(
@@ -1159,12 +1163,21 @@ def _ingest_source(
         try:
             capture = decode_capture(payload, input_format=config.input_format)
             endpoint_value = capture.get("path")
+            if config.input_format == "deepinfra":
+                outer_request = capture.get("request")
+                if isinstance(outer_request, Mapping):
+                    endpoint_value = outer_request.get("path")
+                request_time = capture.get("request_time")
+                if isinstance(request_time, str):
+                    captured_at = request_time
             endpoint = (
                 endpoint_value.split("?", 1)[0].rstrip("/")
                 if isinstance(endpoint_value, str)
                 else ""
             )
-            source_name: Literal["freerouter", "tokenplan", "sxf"] = "freerouter"
+            source_name: Literal["freerouter", "tokenplan", "sxf", "deepinfra"] = (
+                "freerouter"
+            )
             response_is_normalized_final = False
             multimodal_file_mapping: list[MediaMapping] = []
             if config.input_format == "tokenplan":
@@ -1178,6 +1191,9 @@ def _ingest_source(
             elif config.input_format == "sxf":
                 capture = adapt_sxf_envelope(capture)
                 source_name = "sxf"
+            elif config.input_format == "deepinfra":
+                capture = adapt_deepinfra_envelope(capture)
+                source_name = "deepinfra"
             captured_value = capture.get("captured_at")
             captured_at = captured_value if isinstance(captured_value, str) else ""
             snapshot = parse_capture(
@@ -1204,6 +1220,15 @@ def _ingest_source(
                 source_ref,
                 digest,
                 f"sxf_error: {error}",
+                endpoint=endpoint,
+                captured_at=captured_at,
+            )
+            stats.parse_failures += 1
+        except DeepInfraError as error:
+            state.put_failure(
+                source_ref,
+                digest,
+                f"{error.code}: {error.detail}",
                 endpoint=endpoint,
                 captured_at=captured_at,
             )
@@ -1250,7 +1275,7 @@ def _ingest_source(
 def normalize_source(
     source: CaptureSource,
     *,
-    input_format: Literal["freerouter", "tokenplan", "sxf"],
+    input_format: Literal["freerouter", "tokenplan", "sxf", "deepinfra"],
     state_path: Path,
     output_factory: Callable[[], Any],
     max_shard_bytes: int = 512 * 1024 * 1024,
@@ -1263,7 +1288,7 @@ def normalize_source(
     the ephemeral state from the immutable input inventory.
     """
 
-    if input_format not in {"freerouter", "tokenplan", "sxf"}:
+    if input_format not in {"freerouter", "tokenplan", "sxf", "deepinfra"}:
         raise ValueError(f"unsupported input format: {input_format!r}")
     if max_shard_bytes <= 0:
         raise ValueError("max_shard_bytes must be positive")

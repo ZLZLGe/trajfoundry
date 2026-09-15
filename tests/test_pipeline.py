@@ -713,6 +713,7 @@ def test_leaf_messages_stay_exact_while_contributor_evidence_is_unioned() -> Non
         ("freerouter", "api-router", "free-router"),
         ("tokenplan", "api-router", "token-plan"),
         ("sxf", "traj-cooperate", "SXF"),
+        ("deepinfra", "api-router", "deep-infra"),
     ],
 )
 def test_metadata_source_mapping(

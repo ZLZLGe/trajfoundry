@@ -194,6 +194,27 @@ def test_tokenplan_listing_selects_only_request_envelopes_recursively() -> None:
     ]
 
 
+def test_deepinfra_listing_selects_json_objects_recursively() -> None:
+    client = _Client(
+        [
+            {
+                "Contents": [
+                    _listed("input/day/request.json"),
+                    _listed("input/capture.json"),
+                    _listed("input/day/capture.jsonl"),
+                    _listed("input/day/CAPTURE.JSON"),
+                ]
+            }
+        ]
+    )
+    source = S3CaptureSource(client, S3Location("bucket", "input/"))
+
+    assert [item.source_ref for item in source.iter_captures("deepinfra")] == [
+        "capture.json",
+        "day/request.json",
+    ]
+
+
 def test_listing_propagates_service_errors() -> None:
     class _FailingPaginator:
         def paginate(self, **kwargs: str) -> Any:

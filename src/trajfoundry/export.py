@@ -181,7 +181,9 @@ class OutputSet:
         *,
         input_root: str,
         config_hash: str,
-        input_format: Literal["freerouter", "tokenplan", "sxf"] = "freerouter",
+        input_format: Literal[
+            "freerouter", "tokenplan", "sxf", "deepinfra"
+        ] = "freerouter",
     ) -> None:
         self.accepted.close()
         self.quarantined.close()

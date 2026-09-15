@@ -1,9 +1,9 @@
 # TrajFoundry
 
-TrajFoundry normalizes desensitized Freerouter captures, TokenPlan feedback
-envelopes, and SXF `.jsonl.zst` capture streams into deterministic, auditable
-trajectory JSONL. It is an independent project: it does not import, write to,
-or depend on AutoData or DataHarness.
+TrajFoundry normalizes desensitized Freerouter and DeepInfra captures, TokenPlan
+feedback envelopes, and SXF `.jsonl.zst` capture streams into deterministic,
+auditable trajectory JSONL. It is an independent project: it does not import,
+write to, or depend on AutoData or DataHarness.
 
 The first phase implements trajectory standardization. The data contract is
 based on `/root/ailab文档/轨迹标准化/轨迹数据的标准化格式.docx`, with these
@@ -57,6 +57,15 @@ uv run trajfoundry normalize \
   --output /data/trajfoundry-sxf
 ```
 
+DeepInfra partitions contain one envelope per JSON object:
+
+```bash
+uv run trajfoundry normalize \
+  --input-format deepinfra \
+  --input /data/deep-infra/masked-raw/v001 \
+  --output /data/trajfoundry-deepinfra
+```
+
 Scheduler jobs can also normalize directly from one S3 prefix to another with
 `trajfoundry.jobs.run_s3_job`. The S3 mode lists and reads source objects one at
 a time and streams generation JSONL back to S3; it does not copy the complete
@@ -69,7 +78,7 @@ S3 publication writes an immutable `generations/<run-id>/` first, validates it
 by reading the remote objects, and uploads the top-level `manifest.json` last.
 Readers therefore continue to see the previous manifest if generation upload
 or validation fails. See [`docs/dolphinscheduler.md`](docs/dolphinscheduler.md)
-for the FreeRouter, TokenPlan, and SXF workflow configuration.
+for the FreeRouter, TokenPlan, SXF, and DeepInfra workflow configuration.
 
 The input tree is read-only. A non-empty output directory requires `--resume`:
 
@@ -100,6 +109,8 @@ timestamp changes.
   reference, the published trajectory includes the optional
   `multimodal_file_mapping` entry for that part and its stored `object_name`;
   unused attachments are omitted.
+- DeepInfra discovery selects every `*.json` object and adapts each envelope
+  independently before provider parsing.
 - Only a successful, structurally complete terminal response has
   `wire_complete=true`. API errors, transport failures, SSE gaps, truncation,
   and invalid captures are quarantined. Explicit Anthropic

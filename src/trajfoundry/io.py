@@ -36,7 +36,7 @@ class CaptureSource(Protocol):
 
     def iter_captures(
         self,
-        input_format: Literal["freerouter", "tokenplan", "sxf"],
+        input_format: Literal["freerouter", "tokenplan", "sxf", "deepinfra"],
     ) -> Iterator[Any]: ...
 
     def read_capture_bytes(self, capture: Any) -> tuple[bytes, str]: ...
@@ -46,7 +46,8 @@ class StreamingCaptureSource(Protocol):
     """Optional source boundary for line-oriented compressed inputs."""
 
     def iter_capture_payloads(
-        self, input_format: Literal["freerouter", "tokenplan", "sxf"]
+        self,
+        input_format: Literal["freerouter", "tokenplan", "sxf", "deepinfra"],
     ) -> Iterator[tuple[str, bytes, str]]: ...
 
 
@@ -62,7 +63,7 @@ class LocalCaptureSource:
 
     def iter_captures(
         self,
-        input_format: Literal["freerouter", "tokenplan", "sxf"],
+        input_format: Literal["freerouter", "tokenplan", "sxf", "deepinfra"],
     ) -> Iterator[LocalCapture]:
         for path in discover_captures(self.root, input_format=input_format):
             yield LocalCapture(
@@ -74,7 +75,8 @@ class LocalCaptureSource:
         return read_capture_bytes(capture.path)
 
     def iter_capture_payloads(
-        self, input_format: Literal["freerouter", "tokenplan", "sxf"]
+        self,
+        input_format: Literal["freerouter", "tokenplan", "sxf", "deepinfra"],
     ) -> Iterator[tuple[str, bytes, str]]:
         if input_format != "sxf":
             raise ValueError(
@@ -87,7 +89,7 @@ class LocalCaptureSource:
 def discover_captures(
     root: Path,
     *,
-    input_format: Literal["freerouter", "tokenplan", "sxf"] = "freerouter",
+    input_format: Literal["freerouter", "tokenplan", "sxf", "deepinfra"] = "freerouter",
 ) -> Iterator[Path]:
     """Yield only capture files for the selected source format.
 
@@ -98,7 +100,7 @@ def discover_captures(
     choosing an input root that contains it.
     """
 
-    if input_format == "freerouter":
+    if input_format in {"freerouter", "deepinfra"}:
         pattern = "*.json"
     elif input_format == "tokenplan":
         pattern = "req_*.json"
@@ -134,7 +136,7 @@ def read_capture_bytes(path: Path) -> tuple[bytes, str]:
 def decode_capture(
     payload: bytes,
     *,
-    input_format: Literal["freerouter", "tokenplan", "sxf"] = "freerouter",
+    input_format: Literal["freerouter", "tokenplan", "sxf", "deepinfra"] = "freerouter",
 ) -> dict[str, Any]:
     """Decode one capture while discarding sensitive headers immediately.
 
@@ -159,7 +161,7 @@ def decode_capture(
     elif input_format == "sxf":
         # SXF has its own envelope adapter, which also sanitizes headers.
         pass
-    elif input_format != "tokenplan":
+    elif input_format not in {"tokenplan", "deepinfra"}:
         raise ValueError(f"unsupported input format: {input_format!r}")
     return capture
 

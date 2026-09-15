@@ -117,8 +117,9 @@ On the workflow and task definitions:
    the Python task.
 
 `input_root` and `output_root` must be absolute paths. `input_format` must be
-`freerouter`, `tokenplan`, or `sxf`; SXF input roots contain `.jsonl.zst`
-objects. The DolphinScheduler tenant must be able to read
+`freerouter`, `tokenplan`, `sxf`, or `deepinfra`; SXF input roots contain
+`.jsonl.zst` objects, while DeepInfra input roots contain individual `.json`
+envelopes. The DolphinScheduler tenant must be able to read
 and traverse the environment, project, and input paths, and must be able to
 create or write `output_root`.
 
@@ -203,15 +204,16 @@ change and adjust the directory and file owner before running the workflow.
 The example node calls `run_s3_job()` without credential arguments; the client
 loads this fixed file internally.
 
-Create two independent workflows, each containing one Python task based on
+Create one independent workflow per source, each containing one Python task based on
 [`dolphinscheduler_s3_node.py`](../examples/dolphinscheduler_s3_node.py). For
-the first `2026-09-09` run, configure the task parameters as follows:
+an initial one-day run, configure the task parameters as follows:
 
 | Workflow | `input_format` | `input_uri` | `output_uri` |
 | --- | --- | --- | --- |
 | `trajfoundry_tokenplan_v002` | `tokenplan` | `s3://agent-trajectory/lakehouse/token-plan/masked-raw/v001/dt=2026-09-09/` | `s3://agent-trajectory/lakehouse/token-plan/normalized/v002/dt=2026-09-09/` |
 | `trajfoundry_freerouter_v002` | `freerouter` | `s3://agent-trajectory/lakehouse/free-router/masked-raw/v001/dt=2026-09-09/` | `s3://agent-trajectory/lakehouse/free-router/normalized/v002/dt=2026-09-09/` |
 | `trajfoundry_sxf_v001` | `sxf` | `s3://agent-trajectory/lakehouse/SXF/mul-agent-sxf/guixu-data/260821/gpt-5.6-sol/` | `s3://agent-trajectory/lakehouse/SXF/mul-agent-sxf/normalized/v001/dt=2026-08-21/` |
+| `trajfoundry_deepinfra_v001` | `deepinfra` | `s3://agent-trajectory/lakehouse/deep-infra/masked-raw/v001/dt=2026-09-14/` | `s3://agent-trajectory/lakehouse/deep-infra/normalized/v001/dt=2026-09-14/` |
 
 Set the shared `endpoint_url` parameter to:
 

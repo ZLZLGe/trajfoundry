@@ -240,14 +240,16 @@ class ToolCallCheck(StrictModel):
 
 class Metadata(StrictModel):
     source_file: str
-    source_name: Literal["freerouter", "tokenplan", "sxf"] = "freerouter"
+    source_name: Literal["freerouter", "tokenplan", "sxf", "deepinfra"] = "freerouter"
     line_no: int = 0
     created_at: str = ""
     model: str = ""
     user_id: str = ""
     session_id: str = ""
     source_type: Literal["api-router", "traj-cooperate"] = "api-router"
-    specific_source: Literal["free-router", "token-plan", "SXF"] = "free-router"
+    specific_source: Literal["free-router", "token-plan", "SXF", "deep-infra"] = (
+        "free-router"
+    )
 
 
 class MediaMapping(StrictModel):
@@ -314,7 +316,7 @@ class TrajectoryNode(StrictModel):
 class Snapshot(StrictModel):
     source_path: str
     source_sha256: str
-    source_name: Literal["freerouter", "tokenplan", "sxf"] = "freerouter"
+    source_name: Literal["freerouter", "tokenplan", "sxf", "deepinfra"] = "freerouter"
     session_id: str
     thread_id: str
     turn_id: str = ""

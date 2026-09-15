@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 if TYPE_CHECKING:
     from .credentials import S3Credentials
 
-InputFormat = Literal["freerouter", "tokenplan", "sxf"]
+InputFormat = Literal["freerouter", "tokenplan", "sxf", "deepinfra"]
 _READ_CHUNK_BYTES = 1024 * 1024
 
 
@@ -206,7 +206,7 @@ class S3CaptureSource:
     def iter_captures(self, input_format: InputFormat) -> Iterator[S3Capture]:
         """Return capture metadata in stable relative-key order."""
 
-        if input_format not in {"freerouter", "tokenplan", "sxf"}:
+        if input_format not in {"freerouter", "tokenplan", "sxf", "deepinfra"}:
             raise ValueError(f"unsupported input format: {input_format!r}")
 
         captures: list[S3Capture] = []
@@ -248,7 +248,7 @@ class S3CaptureSource:
                 if self.location.key(source_ref) != key:  # Defensive exact join check.
                     raise OSError("S3 listing returned an unsafe relative key")
                 basename = source_ref.rsplit("/", 1)[-1]
-                if input_format == "freerouter":
+                if input_format in {"freerouter", "deepinfra"}:
                     selected = basename.endswith(".json")
                 elif input_format == "tokenplan":
                     selected = basename.startswith("req_") and basename.endswith(

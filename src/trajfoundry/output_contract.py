@@ -615,10 +615,15 @@ def _validate_node(value: object, path: str, *, top_level: bool) -> tuple[bool, 
         or "\\" in source_file
     ):
         _fail(f"{path}/metadata/source_file", "must equal source and be a basename")
-    if metadata["source_name"] not in {"freerouter", "tokenplan", "sxf"}:
+    if metadata["source_name"] not in {
+        "freerouter",
+        "tokenplan",
+        "sxf",
+        "deepinfra",
+    }:
         _fail(
             f"{path}/metadata/source_name",
-            "must equal 'freerouter', 'tokenplan', or 'sxf'",
+            "must equal 'freerouter', 'tokenplan', 'sxf', or 'deepinfra'",
         )
     _integer(metadata["line_no"], f"{path}/metadata/line_no")
     for field in ("created_at", "model", "user_id", "session_id"):
@@ -629,6 +634,7 @@ def _validate_node(value: object, path: str, *, top_level: bool) -> tuple[bool, 
         "freerouter": ("api-router", "free-router"),
         "tokenplan": ("api-router", "token-plan"),
         "sxf": ("traj-cooperate", "SXF"),
+        "deepinfra": ("api-router", "deep-infra"),
     }
     expected_type, expected_specific = expected_sources[metadata["source_name"]]
     if metadata["source_type"] != expected_type:
