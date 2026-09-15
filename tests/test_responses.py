@@ -1844,6 +1844,21 @@ def test_missing_http_status_is_transport_error_even_with_a_body() -> None:
     assert "missing_http_status" in {issue.code for issue in snapshot.issues}
 
 
+@pytest.mark.parametrize("body", ["upstream failure", ""])
+def test_http_error_with_non_json_body_remains_api_error(body: str) -> None:
+    snapshot = _parse(
+        _capture(
+            request_body={"model": "gpt-test", "input": [], "tools": []},
+            status_code=503,
+            response_body=body,
+        )
+    )
+
+    assert snapshot.outcome == "api_error"
+    assert snapshot.wire_complete is False
+    assert "openai_api_error" in {issue.code for issue in snapshot.issues}
+
+
 def test_http_error_body_is_summarized_without_rewriting_trajectory_content() -> None:
     user_content = "Keep this user payload verbatim: Bearer USER-PAYLOAD"
     request = {

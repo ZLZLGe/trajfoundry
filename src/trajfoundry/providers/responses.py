@@ -1808,7 +1808,12 @@ def _parse_response_body(
                 "response_body",
                 "response body is not JSON",
             )
-            return [], "capture_invalid", False, ""
+            outcome = (
+                "api_error"
+                if status_code is not None and not 200 <= status_code < 300
+                else "capture_invalid"
+            )
+            return [], outcome, False, ""
 
     if isinstance(body, Mapping):
         response = dict(body)
@@ -1864,7 +1869,12 @@ def _parse_response_body(
             "response_body",
             f"expected response object or SSE array; got {type(body).__name__}",
         )
-        return [], "capture_invalid", False, ""
+        outcome = (
+            "api_error"
+            if status_code is not None and not 200 <= status_code < 300
+            else "capture_invalid"
+        )
+        return [], outcome, False, ""
 
     events = _extract_events(body, issues)
     _validate_stream_structure(events, issues)
