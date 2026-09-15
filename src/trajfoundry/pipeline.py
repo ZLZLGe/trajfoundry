@@ -48,7 +48,7 @@ from .streaming import streaming_prefix_leaves
 from .subagents import SubagentMountPlan, plan_subagent_mounts
 from .tool_names import is_spawn_tool_name
 
-NORMALIZER_REVISION = "2026-09-03.1"
+NORMALIZER_REVISION = "2026-09-15.2"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 
@@ -523,6 +523,34 @@ def _trajectory_from_leaf(
     )
     multimodal_file_mapping = _merged_multimodal_file_mapping(leaf, contributor_list)
     basename, line_no = _source_file_and_line(leaf.source_path)
+    source_type, specific_source = {
+        "freerouter": ("api-router", "free-router"),
+        "tokenplan": ("api-router", "token-plan"),
+        "sxf": ("traj-cooperate", "SXF"),
+    }[leaf.source_name]
+    contributor_user_ids = {
+        snapshot.user_id for snapshot in contributor_list if snapshot.user_id
+    }
+    if contributor_user_ids and any(
+        snapshot.user_id != leaf.user_id
+        for snapshot in contributor_list
+        if snapshot.user_id
+    ):
+        issues = _merged_issues(
+            issues,
+            [
+                AuditIssue(
+                    code="contributor_user_id_changed",
+                    stage="aggregation",
+                    severity=Severity.WARNING,
+                    path="/user_id",
+                    detail=(
+                        "prefix contributors contain user_id values different "
+                        "from the leaf; the leaf value was retained"
+                    ),
+                )
+            ],
+        )
     return TrajectoryNode(
         messages=[*leaf.history, *leaf.response],
         multimodal_file_mapping=multimodal_file_mapping,
@@ -540,6 +568,11 @@ def _trajectory_from_leaf(
             source_name=leaf.source_name,
             line_no=line_no,
             created_at=leaf.captured_at,
+            model=leaf.model,
+            user_id=leaf.user_id,
+            session_id=leaf.session_id,
+            source_type=source_type,
+            specific_source=specific_source,
         ),
         normalization_audit=_initial_audit(issues),
     )

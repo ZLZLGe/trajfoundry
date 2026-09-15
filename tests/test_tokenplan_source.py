@@ -105,6 +105,7 @@ def test_adapt_tokenplan_envelope_uses_outer_identity_and_received_timestamp_as_
             request_body={"model": "claude-test", "messages": []},
             metadata={
                 "request_id": "request-1",
+                "source_user_id": "tokenplan-user",
                 "session_id": "envelope-session",
                 "task_id": "envelope-task",
                 "received_at_ms": 1000,
@@ -122,7 +123,47 @@ def test_adapt_tokenplan_envelope_uses_outer_identity_and_received_timestamp_as_
 
     assert adapted.capture["session_id"] == "envelope-session"
     assert adapted.capture["turn_id"] == "envelope-task"
+    assert adapted.capture["user_id"] == "tokenplan-user"
     assert adapted.captured_at == "1970-01-01T00:00:01.000Z"
+
+
+def test_source_user_id_precedes_anthropic_account_uuid_compatibility_value() -> None:
+    adapted = adapt_tokenplan_envelope(
+        _envelope(
+            request_body={
+                "model": "claude-test",
+                "metadata": {
+                    "user_id": '{"account_uuid":"provider-account"}',
+                },
+                "messages": [],
+            },
+            metadata={
+                "request_id": "request-1",
+                "source_user_id": "source-user",
+                "session_id": "envelope-session",
+                "task_id": "",
+                "received_at_ms": 1000,
+                "completed_at_ms": 1234,
+                "http_status_code": 200,
+                "data_quality": {
+                    "client_request_complete": True,
+                    "client_response_complete": True,
+                    "all_attachments_available": True,
+                    "truncated": False,
+                },
+            },
+        )
+    )
+
+    snapshot = parse_anthropic_capture(
+        adapted.capture,
+        source_path="tokenplan.json",
+        source_sha256="a" * 64,
+        response_is_normalized_final=True,
+    )
+
+    assert snapshot.user_id == "source-user"
+    assert "metadata_conflict" not in {issue.code for issue in snapshot.issues}
 
 
 def test_empty_tokenplan_envelope_has_a_stable_error_code() -> None:

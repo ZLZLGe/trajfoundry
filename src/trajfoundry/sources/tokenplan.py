@@ -491,6 +491,15 @@ def adapt_tokenplan_envelope(value: object) -> AdaptedCapture:
     request_id = _optional_string(
         metadata.get("request_id"), path="metadata.request_id"
     )
+    source_user = metadata.get("source_user_id")
+    legacy_user = metadata.get("user_id")
+    envelope_user = (
+        source_user
+        if isinstance(source_user, str) and source_user
+        else legacy_user
+        if isinstance(legacy_user, str)
+        else ""
+    )
     envelope_session = _optional_string(
         metadata.get("session_id"), path="metadata.session_id"
     )
@@ -517,6 +526,8 @@ def adapt_tokenplan_envelope(value: object) -> AdaptedCapture:
         capture["session_id"] = envelope_session
     if envelope_task and not has_body_turn:
         capture["turn_id"] = envelope_task
+    if envelope_user:
+        capture["user_id"] = envelope_user
 
     multimodal_file_mapping = _multimodal_file_mapping(
         request,

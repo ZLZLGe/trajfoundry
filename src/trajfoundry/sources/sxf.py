@@ -359,6 +359,7 @@ def adapt_sxf_envelope(capture: Mapping[str, Any]) -> dict[str, Any]:
             "status_code": meta.get("status_code"),
             "captured_at": capture.get("created_at", ""),
             "session_id": capture.get("conversation_session_id", ""),
+            "user_id": capture.get("user_id", ""),
             "request_headers": {},
         }
         agent_kind = meta.get("agent_kind")

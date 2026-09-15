@@ -630,6 +630,7 @@ def test_leaf_messages_stay_exact_while_contributor_evidence_is_unioned() -> Non
         operation="responses",
         outcome="success",
         model="old-model",
+        user_id="old-user",
         harness="old-harness",
         instructions="old instructions",
         termination="old termination",
@@ -656,6 +657,7 @@ def test_leaf_messages_stay_exact_while_contributor_evidence_is_unioned() -> Non
             "source_path": "new/leaf.json",
             "source_sha256": "b" * 64,
             "model": "leaf-model",
+            "user_id": "leaf-user",
             "harness": "leaf-harness",
             "instructions": "leaf instructions",
             "termination": "leaf termination",
@@ -686,6 +688,11 @@ def test_leaf_messages_stay_exact_while_contributor_evidence_is_unioned() -> Non
     }
     assert node.instructions == "leaf instructions"
     assert node.model == "leaf-model"
+    assert node.metadata.model == "leaf-model"
+    assert node.metadata.user_id == "leaf-user"
+    assert node.metadata.session_id == "session"
+    assert node.metadata.source_type == "api-router"
+    assert node.metadata.specific_source == "free-router"
     assert node.harness == "leaf-harness"
     assert node.termination == "leaf termination"
     assert node.normalization_audit is not None
@@ -693,10 +700,39 @@ def test_leaf_messages_stay_exact_while_contributor_evidence_is_unioned() -> Non
         "contributor_evidence",
         "contributor_instructions_changed",
         "contributor_model_changed",
+        "contributor_user_id_changed",
         "contributor_harness_changed",
         "contributor_termination_changed",
     }
     assert node.normalization_audit.tag == AuditTag.PASS
+
+
+@pytest.mark.parametrize(
+    ("source_name", "source_type", "specific_source"),
+    [
+        ("freerouter", "api-router", "free-router"),
+        ("tokenplan", "api-router", "token-plan"),
+        ("sxf", "traj-cooperate", "SXF"),
+    ],
+)
+def test_metadata_source_mapping(
+    source_name: str, source_type: str, specific_source: str
+) -> None:
+    leaf = Snapshot(
+        source_path="capture.json",
+        source_sha256="a" * 64,
+        source_name=source_name,
+        session_id="session",
+        thread_id="thread",
+        provider="openai",
+        operation="responses",
+        outcome="success",
+    )
+
+    metadata = _trajectory_from_leaf(leaf, [leaf]).metadata
+
+    assert metadata.source_type == source_type
+    assert metadata.specific_source == specific_source
 
 
 def test_multimodal_mapping_prefers_leaf_order_and_appends_prefix_only_parts() -> None:
@@ -971,6 +1007,7 @@ def test_duplicate_child_leaf_is_merged_before_mounting(tmp_path: Path) -> None:
             captured_at=captured_at,
             request_id=name,
             model="gpt-test",
+            user_id=f"user-{thread_id}",
             harness="codex",
             history=history,
             response=response,
@@ -1067,6 +1104,15 @@ def test_duplicate_child_leaf_is_merged_before_mounting(tmp_path: Path) -> None:
     assert set(root.sub_agent_trajectory) == {"spawn-1"}
     assert root.sub_agent_relay_mounts == {"spawn-1": "relay-1"}
     assert root.agent_messages[0].item["unknown"] == "preserved"
+    assert root.metadata.model == "gpt-test"
+    assert root.metadata.user_id == "user-main"
+    assert root.metadata.session_id == "session"
+    assert root.metadata.specific_source == "free-router"
+    mounted_child = root.sub_agent_trajectory["spawn-1"]
+    assert mounted_child.metadata.model == "gpt-test"
+    assert mounted_child.metadata.user_id == "user-child"
+    assert mounted_child.metadata.session_id == "session"
+    assert mounted_child.metadata.specific_source == "free-router"
     assert {origin["source_ref"] for origin in origins} == {
         "/input/parent-event.json",
         "/input/parent-leaf.json",

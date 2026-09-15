@@ -63,6 +63,7 @@ def _parse(capture: dict, **kwargs):
 def test_parses_multiturn_nested_tools_and_resolves_result_names() -> None:
     request = {
         "model": "request-model",
+        "client_metadata": {"user_id": "user-1"},
         "messages": [
             {"role": "system", "content": "be exact"},
             {
@@ -160,6 +161,7 @@ def test_parses_multiturn_nested_tools_and_resolves_result_names() -> None:
     assert snapshot.provider == "openai"
     assert snapshot.operation == "chat_completions"
     assert snapshot.model == "request-model"
+    assert snapshot.user_id == "user-1"
     assert snapshot.harness == "qwen-code"
     assert snapshot.session_id == "session-1"
     assert snapshot.thread_id == "thread-1"

@@ -67,6 +67,7 @@ def _envelope(*, request_id: str, media: bool = False) -> dict:
         "metadata": {
             "schema_version": "data_feedback_des.v1",
             "request_id": request_id,
+            "source_user_id": "tokenplan-user",
             "session_id": "session-1",
             "task_id": "",
             "received_at_ms": 1000,
@@ -140,6 +141,11 @@ def test_tokenplan_pipeline_includes_test_and_publishes_media_mapping(
         "source_name": "tokenplan",
         "line_no": 0,
         "created_at": "1970-01-01T00:00:01.234Z",
+        "model": "chat-test",
+        "user_id": "tokenplan-user",
+        "session_id": "session-1",
+        "source_type": "api-router",
+        "specific_source": "token-plan",
     }
 
     accepted_rows = [

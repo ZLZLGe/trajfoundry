@@ -1978,6 +1978,26 @@ def _decoded_turn_metadata(
     return dict(decoded)
 
 
+def _user_id_value(value: Any) -> str:
+    """Extract a scalar user id while preserving ordinary string ids."""
+
+    if not isinstance(value, str) or not value:
+        return ""
+    candidate = value.strip()
+    if candidate.startswith("{"):
+        try:
+            decoded = json.loads(candidate)
+        except (TypeError, ValueError):
+            decoded = None
+        if isinstance(decoded, Mapping):
+            for key in ("user_id", "userId", "id"):
+                nested = decoded.get(key)
+                if isinstance(nested, str) and nested:
+                    return nested
+            return ""
+    return value
+
+
 def _identity_metadata(
     capture: Mapping[str, Any],
     request: Mapping[str, Any],
@@ -2062,6 +2082,7 @@ def _identity_metadata(
             "forked_from_thread_id",
             "forkedFromThreadId",
         ),
+        "user_id": ("user_id", "userId"),
     }
 
     def values_for(keys: tuple[str, ...]) -> list[tuple[str, str]]:
@@ -2077,6 +2098,14 @@ def _identity_metadata(
     identity: dict[str, str] = {}
     for field, field_aliases in aliases.items():
         candidates = values_for(field_aliases)
+        if field == "user_id":
+            candidates = []
+            for source_name, source in all_sources:
+                for key in field_aliases:
+                    value = _user_id_value(source.get(key))
+                    if value:
+                        candidates.append((f"{source_name}.{key}", value))
+                        break
         if candidates:
             identity[field] = candidates[0][1]
         distinct = {value for _, value in candidates}
@@ -2220,6 +2249,16 @@ def parse_responses_capture(
             "session_id",
             "capture session_id conflicts with request metadata session_id",
         )
+    capture_user_id = _user_id_value(capture.get("user_id"))
+    user_id = identity.get("user_id", "")
+    if user_id and capture_user_id and capture_user_id != user_id:
+        _issue(
+            issues,
+            "metadata_conflict",
+            "user_id",
+            "capture user_id conflicts with request metadata user_id",
+        )
+    user_id = user_id or capture_user_id
     turn_id = identity.get("turn_id", "")
     parent_thread_id = identity.get("parent_thread_id", "")
     parent_turn_id = identity.get("parent_turn_id", "")
@@ -2288,6 +2327,7 @@ def parse_responses_capture(
         captured_at=captured_at if isinstance(captured_at, str) else "",
         request_id=request_id if isinstance(request_id, str) else "",
         model=model,
+        user_id=user_id,
         harness=harness,
         instructions=instructions,
         history=history,

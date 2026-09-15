@@ -64,6 +64,7 @@ def test_preserves_developer_and_keeps_instructions_out_of_messages() -> None:
             "session_id": "session-1",
             "thread_id": "thread-1",
             "turn_id": "turn-1",
+            "user_id": "user-1",
         },
         "input": [
             {
@@ -144,6 +145,7 @@ def test_preserves_developer_and_keeps_instructions_out_of_messages() -> None:
     assert snapshot.session_id == "session-1"
     assert snapshot.thread_id == "thread-1"
     assert snapshot.turn_id == "turn-1"
+    assert snapshot.user_id == "user-1"
     assert [message.role for message in snapshot.history] == [
         "developer",
         "user",
@@ -184,6 +186,26 @@ def test_preserves_developer_and_keeps_instructions_out_of_messages() -> None:
     assert snapshot.wire_complete is True
     assert snapshot.termination == ""
     assert snapshot.issues == []
+
+
+def test_user_id_envelope_precedes_capture_fallback_and_reports_conflict() -> None:
+    capture = _capture(
+        request_body={
+            "model": "gpt-test",
+            "metadata": {"user_id": json.dumps({"user_id": "request-user"})},
+            "input": [],
+        },
+        response_body={"status": "completed", "output": []},
+    )
+    capture["user_id"] = "capture-user"
+
+    snapshot = _parse(capture)
+
+    assert snapshot.user_id == "request-user"
+    assert any(
+        issue.code == "metadata_conflict" and issue.path == "user_id"
+        for issue in snapshot.issues
+    )
 
 
 def test_agent_message_is_preserved_raw_without_fabricating_a_role() -> None:

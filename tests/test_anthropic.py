@@ -883,6 +883,74 @@ def test_count_tokens_is_marked_as_non_trajectory_operation() -> None:
     assert snapshot.response == []
 
 
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        ({"user_id": "plain-user"}, "plain-user"),
+        ({"user_id": json.dumps({"user_id": "encoded-user"})}, "encoded-user"),
+        (
+            {
+                "user_id": json.dumps(
+                    {"account_uuid": "account-user", "session_id": "session-1"}
+                )
+            },
+            "account-user",
+        ),
+        (
+            {"x-codex-turn-metadata": json.dumps({"user_id": "turn-user"})},
+            "turn-user",
+        ),
+    ],
+)
+def test_user_id_supports_plain_and_compatibility_metadata(
+    metadata: dict[str, str], expected: str
+) -> None:
+    snapshot = _parse(
+        _capture(
+            request_body={
+                "model": "claude-test",
+                "metadata": metadata,
+                "messages": [],
+            },
+            response_body={
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-test",
+                "stop_reason": "end_turn",
+                "content": [],
+            },
+        )
+    )
+
+    assert snapshot.user_id == expected
+
+
+def test_user_id_request_metadata_precedes_conflicting_capture_fallback() -> None:
+    capture = _capture(
+        request_body={
+            "model": "claude-test",
+            "metadata": {"user_id": "request-user"},
+            "messages": [],
+        },
+        response_body={
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "stop_reason": "end_turn",
+            "content": [],
+        },
+    )
+    capture["user_id"] = "capture-user"
+
+    snapshot = _parse(capture)
+
+    assert snapshot.user_id == "request-user"
+    assert any(
+        issue.code == "metadata_conflict" and issue.path == "user_id"
+        for issue in snapshot.issues
+    )
+
+
 def test_unknown_endpoint_is_rejected() -> None:
     with pytest.raises(AnthropicCaptureError):
         _parse(_capture(path="/v1/complete", response_body={}))

@@ -320,6 +320,36 @@ def test_compaction_items_is_a_required_array_on_every_node() -> None:
     assert mounted["sub_agent_trajectory"]["spawn-1"]["compaction_items"] == []
 
 
+def test_metadata_extensions_are_required_and_source_mapping_is_strict() -> None:
+    projected = project_trajectory(_trajectory())
+    assert projected["metadata"] == {
+        "source_file": "source.json",
+        "source_name": "freerouter",
+        "line_no": 0,
+        "created_at": "",
+        "model": "",
+        "user_id": "",
+        "session_id": "",
+        "source_type": "api-router",
+        "specific_source": "free-router",
+    }
+
+    missing = orjson.loads(orjson.dumps(projected))
+    del missing["metadata"]["user_id"]
+    with pytest.raises(OutputContractError, match="user_id"):
+        parse_trajectory_record(missing)
+
+    mismatched = orjson.loads(orjson.dumps(projected))
+    mismatched["metadata"]["specific_source"] = "token-plan"
+    with pytest.raises(OutputContractError, match="specific_source"):
+        parse_trajectory_record(mismatched)
+
+    mismatched_model = orjson.loads(orjson.dumps(projected))
+    mismatched_model["metadata"]["model"] = "different-model"
+    with pytest.raises(OutputContractError, match="trajectory model"):
+        parse_trajectory_record(mismatched_model)
+
+
 def test_media_mapping_projection_round_trips_in_first_use_order() -> None:
     node = _trajectory_with_media_mapping()
 

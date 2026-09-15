@@ -207,6 +207,26 @@ def _decoded_turn_metadata(
     return dict(decoded)
 
 
+def _user_id_value(value: Any) -> str:
+    """Extract a scalar user id while preserving ordinary string ids."""
+
+    if not isinstance(value, str) or not value:
+        return ""
+    candidate = value.strip()
+    if candidate.startswith("{"):
+        try:
+            decoded = json.loads(candidate)
+        except (TypeError, ValueError):
+            decoded = None
+        if isinstance(decoded, Mapping):
+            for key in ("user_id", "userId", "id"):
+                nested = decoded.get(key)
+                if isinstance(nested, str) and nested:
+                    return nested
+            return ""
+    return value
+
+
 def _identity_metadata(
     capture: Mapping[str, Any],
     request: Mapping[str, Any],
@@ -292,6 +312,7 @@ def _identity_metadata(
             "forked_from_thread_id",
             "forkedFromThreadId",
         ),
+        "user_id": ("user_id", "userId"),
     }
 
     def values_for(keys: tuple[str, ...]) -> list[tuple[str, str]]:
@@ -307,6 +328,14 @@ def _identity_metadata(
     identity: dict[str, str] = {}
     for identity_field, field_aliases in aliases.items():
         candidates = values_for(field_aliases)
+        if identity_field == "user_id":
+            candidates = []
+            for source_name, source in sources:
+                for key in field_aliases:
+                    value = _user_id_value(source.get(key))
+                    if value:
+                        candidates.append((f"{source_name}.{key}", value))
+                        break
         if candidates:
             identity[identity_field] = candidates[0][1]
         if len({value for _, value in candidates}) > 1:
@@ -853,7 +882,11 @@ def parse_chat_capture(
 
     def identity_value(field: str) -> str:
         selected = identity.get(field, "")
-        fallback = _text(capture.get(field))
+        fallback = (
+            _user_id_value(capture.get(field))
+            if field == "user_id"
+            else _text(capture.get(field))
+        )
         if selected and fallback and selected != fallback:
             _issue(
                 context.issues,
@@ -864,6 +897,7 @@ def parse_chat_capture(
         return selected or fallback
 
     session_id = identity_value("session_id")
+    user_id = identity_value("user_id")
     turn_id = identity_value("turn_id")
     parent_thread_id = identity_value("parent_thread_id")
     parent_turn_id = identity_value("parent_turn_id")
@@ -964,6 +998,7 @@ def parse_chat_capture(
         captured_at=_text(capture.get("captured_at")),
         request_id=_text(capture.get("request_id")),
         model=model,
+        user_id=user_id,
         harness=harness,
         instructions="",
         history=history,

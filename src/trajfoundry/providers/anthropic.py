@@ -9,7 +9,7 @@ recorder and keeps all wire-completeness checks in one place.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -1426,6 +1426,74 @@ def _request_metadata(request: dict[str, Any]) -> dict[str, Any]:
     return metadata
 
 
+def _user_id_value(value: Any) -> str:
+    """Read a plain user id or the scalar id inside a JSON envelope."""
+
+    if not isinstance(value, str) or not value:
+        return ""
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError):
+        return value
+    if isinstance(decoded, Mapping):
+        for key in ("user_id", "userId", "id"):
+            nested = decoded.get(key)
+            if isinstance(nested, str) and nested:
+                return nested
+        return ""
+    return value
+
+
+def _account_uuid_value(value: Any) -> str:
+    """Read Claude Code's account identity only as a compatibility fallback."""
+
+    if not isinstance(value, str) or not value:
+        return ""
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError):
+        return ""
+    account_uuid = decoded.get("account_uuid") if isinstance(decoded, Mapping) else None
+    return account_uuid if isinstance(account_uuid, str) and account_uuid else ""
+
+
+def _user_id_candidates(
+    request: Mapping[str, Any], capture: Mapping[str, Any]
+) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+    account_candidates: list[tuple[str, str]] = []
+    for container_name in ("client_metadata", "metadata"):
+        container = request.get(container_name)
+        if not isinstance(container, Mapping):
+            continue
+        direct = _user_id_value(container.get("user_id"))
+        if direct:
+            candidates.append((f"request_body.{container_name}.user_id", direct))
+        account_uuid = _account_uuid_value(container.get("user_id"))
+        if account_uuid:
+            account_candidates.append(
+                (f"request_body.{container_name}.user_id.account_uuid", account_uuid)
+            )
+        encoded = container.get("x-codex-turn-metadata")
+        if isinstance(encoded, str):
+            try:
+                encoded = json.loads(encoded)
+            except (TypeError, ValueError):
+                encoded = None
+        if isinstance(encoded, Mapping):
+            nested = _user_id_value(encoded.get("user_id") or encoded.get("userId"))
+            if nested:
+                candidates.append(
+                    (f"request_body.{container_name}.x-codex-turn-metadata", nested)
+                )
+    fallback = _user_id_value(capture.get("user_id"))
+    if not candidates and not fallback:
+        candidates.extend(account_candidates)
+    if fallback:
+        candidates.append(("capture.user_id", fallback))
+    return candidates
+
+
 def _snapshot_base(
     capture: dict[str, Any],
     *,
@@ -1488,6 +1556,7 @@ def _snapshot_base(
         "captured_at": _text(capture.get("captured_at")),
         "request_id": _text(capture.get("request_id")),
         "model": _text(request.get("model")),
+        "user_id": "",
         "harness": harness,
         "instructions": "",
         "termination": "",
@@ -1539,10 +1608,23 @@ def parse_anthropic_capture(
         operation=operation,
         request=request,
     )
+    user_id_candidates = _user_id_candidates(request, capture)
+    if user_id_candidates:
+        base["user_id"] = user_id_candidates[0][1]
+    user_id_issue = None
+    if len({value for _, value in user_id_candidates}) > 1:
+        detail = "; ".join(
+            f"{source}={value!r}" for source, value in user_id_candidates
+        )
+        user_id_issue = _issue(
+            "metadata_conflict",
+            f"conflicting user_id: {detail}",
+            path="user_id",
+        )
     status = capture.get("status_code")
 
     if operation == "count_tokens":
-        issues = [request_issue] if request_issue else []
+        issues = [issue for issue in (request_issue, user_id_issue) if issue]
         body = capture.get("response_body")
         if not isinstance(status, int) or isinstance(status, bool) or status <= 0:
             outcome = "transport_error"
@@ -1587,6 +1669,8 @@ def parse_anthropic_capture(
     context = _ParseContext()
     if request_issue:
         context.issues.append(request_issue)
+    if user_id_issue:
+        context.issues.append(user_id_issue)
     if not base["session_id"]:
         context.issues.append(
             _issue("missing_session_id", "capture has no session id", path="session_id")

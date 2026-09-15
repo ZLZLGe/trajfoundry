@@ -243,6 +243,11 @@ class Metadata(StrictModel):
     source_name: Literal["freerouter", "tokenplan", "sxf"] = "freerouter"
     line_no: int = 0
     created_at: str = ""
+    model: str = ""
+    user_id: str = ""
+    session_id: str = ""
+    source_type: Literal["api-router", "traj-cooperate"] = "api-router"
+    specific_source: Literal["free-router", "token-plan", "SXF"] = "free-router"
 
 
 class MediaMapping(StrictModel):
@@ -325,6 +330,7 @@ class Snapshot(StrictModel):
     captured_at: str = ""
     request_id: str = ""
     model: str = ""
+    user_id: str = ""
     harness: str = "unknown"
     instructions: str = ""
     multimodal_file_mapping: list[MediaMapping] = Field(default_factory=list)

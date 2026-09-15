@@ -593,7 +593,17 @@ def _validate_node(value: object, path: str, *, top_level: bool) -> tuple[bool, 
     _keys(
         metadata,
         f"{path}/metadata",
-        required={"source_file", "source_name", "line_no", "created_at"},
+        required={
+            "source_file",
+            "source_name",
+            "line_no",
+            "created_at",
+            "model",
+            "user_id",
+            "session_id",
+            "source_type",
+            "specific_source",
+        },
     )
     source_file = _string(
         metadata["source_file"], f"{path}/metadata/source_file", nonempty=True
@@ -611,7 +621,20 @@ def _validate_node(value: object, path: str, *, top_level: bool) -> tuple[bool, 
             "must equal 'freerouter', 'tokenplan', or 'sxf'",
         )
     _integer(metadata["line_no"], f"{path}/metadata/line_no")
-    _string(metadata["created_at"], f"{path}/metadata/created_at")
+    for field in ("created_at", "model", "user_id", "session_id"):
+        _string(metadata[field], f"{path}/metadata/{field}")
+    if metadata["model"] != node["model"]:
+        _fail(f"{path}/metadata/model", "must equal the trajectory model")
+    expected_sources = {
+        "freerouter": ("api-router", "free-router"),
+        "tokenplan": ("api-router", "token-plan"),
+        "sxf": ("traj-cooperate", "SXF"),
+    }
+    expected_type, expected_specific = expected_sources[metadata["source_name"]]
+    if metadata["source_type"] != expected_type:
+        _fail(f"{path}/metadata/source_type", "does not match source_name")
+    if metadata["specific_source"] != expected_specific:
+        _fail(f"{path}/metadata/specific_source", "does not match source_name")
     _validate_audit(node["normalization_audit"], f"{path}/normalization_audit")
 
     children: dict[str, Any] = {}
@@ -949,6 +972,11 @@ def _project_trajectory(
             "source_name": node.metadata.source_name,
             "line_no": node.metadata.line_no,
             "created_at": node.metadata.created_at,
+            "model": node.metadata.model or node.model,
+            "user_id": node.metadata.user_id,
+            "session_id": node.metadata.session_id,
+            "source_type": node.metadata.source_type,
+            "specific_source": node.metadata.specific_source,
         },
         "normalization_audit": _project_audit(node.normalization_audit),
     }

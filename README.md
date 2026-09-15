@@ -12,8 +12,8 @@ confirmed project-level extensions and overrides:
 - native `developer` messages remain `developer` messages;
 - Responses `instructions` remain an independent string field on the final
   trajectory and are not converted into a message;
-- every node includes `instructions`, `metadata.source_name`, and
-  `normalization_audit`;
+- every node includes `instructions`, `normalization_audit`, and metadata for
+  model, user/session identity, and normalized source classification;
 - Responses reasoning items are preserved in `assistant.reasoning`, while
   Anthropic thinking blocks remain in `assistant.reasoning_details`.
 - Responses `agent_message` items are not promoted to a conversational role;

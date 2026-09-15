@@ -95,6 +95,7 @@ def test_adapt_sxf_envelope_maps_raw_capture_and_chat_chunks() -> None:
             "user_agent": "test",
         },
         "conversation_session_id": "session-2",
+        "user_id": "sxf-user",
         "created_at": "2026-08-21T00:00:00Z",
         "method": "POST",
         "model": "m",
@@ -105,6 +106,7 @@ def test_adapt_sxf_envelope_maps_raw_capture_and_chat_chunks() -> None:
     }
     adapted_chat = adapt_sxf_envelope(chat)
     assert adapted_chat["session_id"] == "session-2"
+    assert adapted_chat["user_id"] == "sxf-user"
     assert adapted_chat["response_body"]["object"] == "chat.completion"
     assert adapted_chat["response_body"]["choices"][0]["message"]["content"] == "hello"
 
