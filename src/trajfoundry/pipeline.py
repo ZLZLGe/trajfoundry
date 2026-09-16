@@ -49,9 +49,11 @@ from .streaming import streaming_prefix_leaves
 from .subagents import SubagentMountPlan, plan_subagent_mounts
 from .tool_names import is_spawn_tool_name
 
-NORMALIZER_REVISION = "2026-09-15.6"
+NORMALIZER_REVISION = "2026-09-16.2"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
+_INGEST_BATCH_ITEMS = 512
+_INGEST_BATCH_BYTES = 64 * 1024 * 1024
 
 # These defects are fully representable in the canonical trajectory.  They
 # remain error-level audit evidence (and therefore quarantine the trajectory),
@@ -168,7 +170,10 @@ def config_hash(config: PipelineConfig) -> str:
             if config.input_format == "tokenplan"
             else "not_applicable"
         ),
-        "aggregation_scope": ["session_id", "thread_id"],
+        "aggregation_scope": {
+            "with_session": ["session_id", "thread_id"],
+            "without_session": ["user_id_or_no_user_id"],
+        },
         "prefix_message_fields": {
             "system_developer_user": ["role", "content"],
             "assistant": ["role", "content", "tool_calls"],
@@ -522,6 +527,28 @@ def _trajectory_from_leaf(
         contributor_issues,
         _contributor_leaf_warnings(leaf, contributor_list),
     )
+    synthesized_identity_issues: list[AuditIssue] = []
+    if not leaf.user_id:
+        synthesized_identity_issues.append(
+            AuditIssue(
+                code="metadata_user_id_synthesized",
+                stage="aggregation",
+                severity=Severity.WARNING,
+                path="/metadata/user_id",
+                detail="missing user id was published as no_user_id",
+            )
+        )
+    if not leaf.session_id:
+        synthesized_identity_issues.append(
+            AuditIssue(
+                code="metadata_session_id_synthesized",
+                stage="aggregation",
+                severity=Severity.WARNING,
+                path="/metadata/session_id",
+                detail="missing session id was published as no_session_id",
+            )
+        )
+    issues = _merged_issues(issues, synthesized_identity_issues)
     multimodal_file_mapping = _merged_multimodal_file_mapping(leaf, contributor_list)
     basename, line_no = _source_file_and_line(leaf.source_path)
     source_type, specific_source = {
@@ -571,8 +598,8 @@ def _trajectory_from_leaf(
             line_no=line_no,
             created_at=leaf.captured_at,
             model=leaf.model,
-            user_id=leaf.user_id,
-            session_id=leaf.session_id,
+            user_id=leaf.user_id or "no_user_id",
+            session_id=leaf.session_id or "no_session_id",
             source_type=source_type,
             specific_source=specific_source,
         ),
@@ -798,27 +825,20 @@ def _merged_issues(*groups: Iterable[AuditIssue]) -> list[AuditIssue]:
 
 
 def _origin_rows(state: StateStore, paths: Iterable[str]) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
-    for path in sorted(set(paths)):
-        metadata = state.source_metadata(path)
-        if metadata is None:
-            continue
-        sha256, captured_at = metadata
-        rows.append(
-            {
-                "source_ref": path,
-                "sha256": sha256,
-                "captured_at": captured_at,
-            }
-        )
-    return rows
+    return [
+        {
+            "source_ref": path,
+            "sha256": sha256,
+            "captured_at": captured_at,
+        }
+        for path, (sha256, captured_at) in state.source_metadata_for_paths(
+            paths
+        ).items()
+    ]
 
 
 def _snapshots_for_paths(state: StateStore, paths: Iterable[str]) -> Iterable[Snapshot]:
-    for path in sorted(set(paths)):
-        snapshot = state.get_snapshot(path)
-        if snapshot is not None:
-            yield snapshot
+    yield from state.iter_snapshots_for_paths(paths)
 
 
 def _descendants(plan: SubagentMountPlan, root_index: int) -> set[int]:
@@ -926,53 +946,54 @@ def _materialize_tree(
 
 def _build_trajectories(state: StateStore, stats: PipelineStats) -> None:
     state.clear_trajectories()
-    for session_id in state.sessions():
+    # A real session is one mount-planning universe; the prefix index itself
+    # keeps its threads separate.  Captures without a session are partitioned
+    # by user (or the explicit no-user bucket) so they can merge across noisy
+    # thread/request labels without ever crossing user boundaries.
+    for scope in state.aggregation_scopes():
         stats.sessions += 1
         flat_leaves: dict[str, _FlatLeaf] = {}
         evidence_by_path: dict[str, Snapshot] = {}
-        for thread_id in state.threads_for_session(session_id):
-            eligible = (
-                snapshot
-                for snapshot in state.snapshots_for_thread(session_id, thread_id)
-                if _eligible(snapshot)
+        eligible = (
+            snapshot
+            for snapshot in state.snapshots_for_aggregation_scope(scope)
+            if _eligible(snapshot)
+        )
+        result = streaming_prefix_leaves(eligible)
+        stats.prefix_intermediates += len(result.intermediate_paths)
+        stats.leaf_snapshots += len(result.leaves)
+        stats.eligible_snapshots += len(result.intermediate_paths) + len(result.leaves)
+        for evidence in result.spawn_evidence:
+            evidence_by_path[evidence.source_path] = evidence
+        for leaf in result.leaves:
+            evidence_by_path.setdefault(leaf.source_path, _minimal_evidence(leaf))
+            contributor_paths = result.contributor_paths.get(
+                leaf.source_path, (leaf.source_path,)
             )
-            result = streaming_prefix_leaves(eligible)
-            stats.prefix_intermediates += len(result.intermediate_paths)
-            stats.leaf_snapshots += len(result.leaves)
-            stats.eligible_snapshots += len(result.intermediate_paths) + len(
-                result.leaves
+            candidate = _trajectory_from_leaf(
+                leaf, _snapshots_for_paths(state, contributor_paths)
             )
-            for evidence in result.spawn_evidence:
-                evidence_by_path[evidence.source_path] = evidence
-            for leaf in result.leaves:
-                evidence_by_path.setdefault(leaf.source_path, _minimal_evidence(leaf))
-                contributor_paths = result.contributor_paths.get(
-                    leaf.source_path, (leaf.source_path,)
+            semantic_key = _flat_semantic_key(leaf, candidate)
+            candidate_issues = (
+                candidate.normalization_audit.issues
+                if candidate.normalization_audit
+                else ()
+            )
+            existing = flat_leaves.get(semantic_key)
+            if existing is None:
+                flat_leaves[semantic_key] = _FlatLeaf(
+                    routing_snapshot=_routing_snapshot(leaf),
+                    contributor_paths=set(contributor_paths),
+                    issues={_issue_key(issue): issue for issue in candidate_issues},
                 )
-                candidate = _trajectory_from_leaf(
-                    leaf, _snapshots_for_paths(state, contributor_paths)
-                )
-                semantic_key = _flat_semantic_key(leaf, candidate)
-                candidate_issues = (
-                    candidate.normalization_audit.issues
-                    if candidate.normalization_audit
-                    else ()
-                )
-                existing = flat_leaves.get(semantic_key)
-                if existing is None:
-                    flat_leaves[semantic_key] = _FlatLeaf(
-                        routing_snapshot=_routing_snapshot(leaf),
-                        contributor_paths=set(contributor_paths),
-                        issues={_issue_key(issue): issue for issue in candidate_issues},
-                    )
-                    continue
-                existing.contributor_paths.update(contributor_paths)
-                for issue in candidate_issues:
-                    existing.issues[_issue_key(issue)] = issue
-                if _snapshot_order_key(leaf) < _snapshot_order_key(
-                    existing.routing_snapshot
-                ):
-                    existing.routing_snapshot = _routing_snapshot(leaf)
+                continue
+            existing.contributor_paths.update(contributor_paths)
+            for issue in candidate_issues:
+                existing.issues[_issue_key(issue)] = issue
+            if _snapshot_order_key(leaf) < _snapshot_order_key(
+                existing.routing_snapshot
+            ):
+                existing.routing_snapshot = _routing_snapshot(leaf)
 
         if not flat_leaves:
             continue
@@ -1151,6 +1172,38 @@ def _ingest_source(
     source_errors_fatal: bool = False,
 ) -> None:
     state.begin_scan(uuid.uuid4().hex)
+    batch_items = 0
+    batch_bytes = 0
+    batch: Any | None = None
+
+    def open_batch() -> None:
+        nonlocal batch
+        context = state.write_batch()
+        context.__enter__()
+        batch = context
+
+    def close_batch(
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: Any = None,
+    ) -> None:
+        nonlocal batch
+        context, batch = batch, None
+        if context is not None:
+            context.__exit__(exc_type, exc_value, traceback)
+
+    open_batch()
+
+    def rotate_batch(payload_bytes: int) -> None:
+        nonlocal batch_items, batch_bytes
+        batch_items += 1
+        batch_bytes += payload_bytes
+        if batch_items < _INGEST_BATCH_ITEMS and batch_bytes < _INGEST_BATCH_BYTES:
+            return
+        close_batch()
+        open_batch()
+        batch_items = 0
+        batch_bytes = 0
 
     def process_payload(source_ref: str, payload: bytes, digest: str) -> None:
         stats.discovered += 1
@@ -1243,29 +1296,39 @@ def _ingest_source(
             )
             stats.parse_failures += 1
 
-    streaming = getattr(source, "iter_capture_payloads", None)
-    if config.input_format == "sxf" and callable(streaming):
-        for source_ref, payload, digest in streaming(config.input_format):
-            process_payload(source_ref, payload, digest)
+    try:
+        streaming = getattr(source, "iter_capture_payloads", None)
+        payload_formats = getattr(source, "payload_formats", frozenset({"sxf"}))
+        if config.input_format in payload_formats and callable(streaming):
+            for source_ref, payload, digest in streaming(config.input_format):
+                process_payload(source_ref, payload, digest)
+                rotate_batch(len(payload))
+        else:
+            for capture_ref in source.iter_captures(config.input_format):
+                source_ref = capture_ref.source_ref
+                try:
+                    payload, digest = source.read_capture_bytes(capture_ref)
+                except Exception as error:
+                    if source_errors_fatal:
+                        raise
+                    stats.discovered += 1
+                    state.put_failure(
+                        source_ref,
+                        "",
+                        f"{type(error).__name__}: capture could not be normalized",
+                        endpoint="",
+                        captured_at="",
+                    )
+                    stats.parse_failures += 1
+                    rotate_batch(0)
+                    continue
+                process_payload(source_ref, payload, digest)
+                rotate_batch(len(payload))
+    except BaseException as error:
+        close_batch(type(error), error, error.__traceback__)
+        raise
     else:
-        for capture_ref in source.iter_captures(config.input_format):
-            source_ref = capture_ref.source_ref
-            try:
-                payload, digest = source.read_capture_bytes(capture_ref)
-            except Exception as error:
-                if source_errors_fatal:
-                    raise
-                stats.discovered += 1
-                state.put_failure(
-                    source_ref,
-                    "",
-                    f"{type(error).__name__}: capture could not be normalized",
-                    endpoint="",
-                    captured_at="",
-                )
-                stats.parse_failures += 1
-                continue
-            process_payload(source_ref, payload, digest)
+        close_batch()
     state.finish_scan()
     stats.skipped_inputs = sum(
         status == "skipped" for _, _, status, _, _, _ in state.capture_records()
@@ -1308,7 +1371,7 @@ def normalize_source(
     stats = PipelineStats()
     with (
         _exclusive_lock(resolved_state.with_suffix(".lock")),
-        StateStore(resolved_state) as state,
+        StateStore(resolved_state, ephemeral=True) as state,
     ):
         state.reset_ingest()
         state.set_meta("config_hash", configuration_hash)

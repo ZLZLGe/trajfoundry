@@ -85,6 +85,28 @@ def semantic_payload(node: TrajectoryNode) -> dict[str, Any]:
     )
     payload = project_trajectory(node, top_level=has_completeness)
     provider_evidence = _semantic_provider_evidence(node)
+    issue_codes = {
+        issue.code
+        for issue in (
+            node.normalization_audit.issues if node.normalization_audit else ()
+        )
+    }
+    aggregation_identity = {
+        "user_id": {
+            "value": node.metadata.user_id or "no_user_id",
+            "synthesized": (
+                not node.metadata.user_id
+                or "metadata_user_id_synthesized" in issue_codes
+            ),
+        },
+        "session_id": {
+            "value": node.metadata.session_id or "no_session_id",
+            "synthesized": (
+                not node.metadata.session_id
+                or "metadata_session_id_synthesized" in issue_codes
+            ),
+        },
+    }
     for key in (
         "source",
         "metadata",
@@ -103,6 +125,12 @@ def semantic_payload(node: TrajectoryNode) -> dict[str, Any]:
         payload.pop(key, None)
     if provider_evidence:
         payload["provider_evidence"] = provider_evidence
+    # Identity is not file provenance. Keeping it in the semantic key prevents
+    # identical conversations from different users or sessions from collapsing
+    # into one stored row whose metadata can represent only one of them. The
+    # synthesized bit keeps a missing identity distinct from a real provider id
+    # whose literal value happens to equal a public no_* sentinel.
+    payload["aggregation_identity"] = aggregation_identity
     children = payload.get("sub_agent_trajectory")
     if isinstance(children, dict):
         payload["sub_agent_trajectory"] = {

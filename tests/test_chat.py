@@ -214,6 +214,38 @@ def test_parses_multiturn_nested_tools_and_resolves_result_names() -> None:
     assert snapshot.issues == []
 
 
+def test_missing_session_and_thread_ids_are_warnings_not_capture_failures() -> None:
+    capture = _capture(
+        request_body={"model": "chat-model", "messages": []},
+        response_body=_completion({"role": "assistant", "content": "done"}),
+    )
+    for field in (
+        "session_id",
+        "thread_id",
+        "turn_id",
+        "parent_thread_id",
+        "parent_turn_id",
+        "forked_from_thread_id",
+        "subagent_marker",
+    ):
+        capture.pop(field, None)
+
+    snapshot = _parse(capture)
+
+    assert snapshot.session_id == ""
+    assert snapshot.thread_id == ""
+    identity_issues = {
+        issue.code: issue
+        for issue in snapshot.issues
+        if issue.code in {"missing_session_id", "missing_thread_id"}
+    }
+    assert set(identity_issues) == {"missing_session_id", "missing_thread_id"}
+    assert all(issue.severity.value == "warning" for issue in identity_issues.values())
+    assert snapshot.request_id == "request-1"
+    assert snapshot.outcome == "success"
+    assert snapshot.wire_complete is True
+
+
 def test_normalized_stream_is_parsed_as_one_final_object_with_array_content() -> None:
     request = {
         "model": "stream-model",

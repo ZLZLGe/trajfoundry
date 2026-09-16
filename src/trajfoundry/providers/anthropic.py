@@ -1626,9 +1626,40 @@ def parse_anthropic_capture(
             path="user_id",
         )
     status = capture.get("status_code")
+    identity_issues: list[AuditIssue] = []
+    if not base["session_id"]:
+        identity_issues.append(
+            _issue(
+                "missing_session_id",
+                "capture has no session id",
+                path="session_id",
+                severity=Severity.WARNING,
+            )
+        )
+    if not base["thread_id"]:
+        identity_issues.append(
+            _issue(
+                "missing_thread_id",
+                "capture has no thread id",
+                path="request_body",
+                severity=Severity.WARNING,
+            )
+        )
+    elif str(base["thread_id"]).startswith("__isolated_subagent__:"):
+        identity_issues.append(
+            _issue(
+                "isolated_subagent_missing_thread_id",
+                "sub-agent linkage has no explicit thread id; capture was isolated",
+                path="request_body",
+                severity=Severity.WARNING,
+            )
+        )
 
     if operation == "count_tokens":
-        issues = [issue for issue in (request_issue, user_id_issue) if issue]
+        issues = [
+            *[issue for issue in (request_issue, user_id_issue) if issue],
+            *identity_issues,
+        ]
         body = capture.get("response_body")
         if not isinstance(status, int) or isinstance(status, bool) or status <= 0:
             outcome = "transport_error"
@@ -1675,23 +1706,7 @@ def parse_anthropic_capture(
         context.issues.append(request_issue)
     if user_id_issue:
         context.issues.append(user_id_issue)
-    if not base["session_id"]:
-        context.issues.append(
-            _issue("missing_session_id", "capture has no session id", path="session_id")
-        )
-    if not base["thread_id"]:
-        context.issues.append(
-            _issue("missing_thread_id", "capture has no thread id", path="request_body")
-        )
-    elif str(base["thread_id"]).startswith("__isolated_subagent__:"):
-        context.issues.append(
-            _issue(
-                "isolated_subagent_missing_thread_id",
-                "sub-agent linkage has no explicit thread id; capture was isolated",
-                path="request_body",
-                severity=Severity.WARNING,
-            )
-        )
+    context.issues.extend(identity_issues)
     history = _parse_history(request, context)
     tools = _parse_tools(request, context.issues)
 

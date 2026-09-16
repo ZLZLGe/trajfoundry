@@ -1043,20 +1043,35 @@ def plan_subagent_mounts(
                 )
             )
 
-    # More than one maximal leaf for one child thread means a genuine branch
-    # (or incompatible configurations).  Metadata at thread granularity cannot
-    # tell which leaf is the spawned execution, so none is guessed.
+    # A child thread may have several divergent maximal leaves. The first
+    # version deliberately ignores context-compaction semantics and mounts the
+    # leaf with the most complete messages. Stable leaf order breaks ties; the
+    # other branches remain explicit orphans instead of being discarded.
     for thread_key, indices in sorted(thread_leaves.items()):
         child_indices = [index for index in indices if index in subagent_indices]
         if len(child_indices) > 1:
-            invalid_children.update(child_indices)
-            for index in child_indices:
+            selected = min(
+                child_indices,
+                key=lambda index: (
+                    -(
+                        len(canonical_leaves[index].history)
+                        + len(canonical_leaves[index].response)
+                    ),
+                    _leaf_key(canonical_leaves[index]),
+                ),
+            )
+            unselected = [index for index in child_indices if index != selected]
+            invalid_children.update(unselected)
+            for index in unselected:
                 diagnostics.append(
                     MountDiagnostic(
-                        code="duplicate_child_leaves",
-                        detail="multiple maximal leaves share this sub-agent thread identity",
+                        code="unselected_child_branch",
+                        detail=(
+                            "a longer maximal leaf from the same sub-agent thread "
+                            f"was selected for mounting: "
+                            f"{canonical_leaves[selected].source_path!r}"
+                        ),
                         leaf_index=index,
-                        related_leaf_indices=tuple(child_indices),
                         parent_thread_id=canonical_leaves[index].parent_thread_id,
                         parent_turn_id=canonical_leaves[index].parent_turn_id,
                     )

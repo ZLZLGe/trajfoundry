@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import sys
+import threading
 import types
 from typing import Any
 
@@ -328,6 +329,95 @@ def test_read_capture_closes_body_when_stream_fails() -> None:
     assert body.was_closed
 
 
+def test_json_payload_prefetch_is_bounded_and_preserves_source_order() -> None:
+    payloads = {f"input/{name}.json": name.encode() for name in ("d", "b", "a", "c")}
+    barrier = threading.Barrier(len(payloads), timeout=2)
+    lock = threading.Lock()
+    active = 0
+    peak_active = 0
+
+    class _ConcurrentClient(_Client):
+        def __init__(self) -> None:
+            super().__init__(
+                [
+                    {
+                        "Contents": [
+                            _listed(key, size=len(value))
+                            for key, value in payloads.items()
+                        ]
+                    }
+                ]
+            )
+
+        def get_object(self, **kwargs: str) -> dict[str, Any]:
+            nonlocal active, peak_active
+            key = kwargs["Key"]
+            with lock:
+                active += 1
+                peak_active = max(peak_active, active)
+            try:
+                barrier.wait()
+                payload = payloads[key]
+                etag = f'"{key}"'
+                return {
+                    "Body": _Body(payload),
+                    "ContentLength": len(payload),
+                    "ETag": etag,
+                }
+            finally:
+                with lock:
+                    active -= 1
+
+    source = S3CaptureSource(_ConcurrentClient(), S3Location("bucket", "input/"))
+
+    rows = list(source.iter_capture_payloads("deepinfra"))
+
+    assert [source_ref for source_ref, _, _ in rows] == [
+        "a.json",
+        "b.json",
+        "c.json",
+        "d.json",
+    ]
+    assert [payload for _, payload, _ in rows] == [b"a", b"b", b"c", b"d"]
+    assert all(
+        digest == hashlib.sha256(payload).hexdigest() for _, payload, digest in rows
+    )
+    assert peak_active == 4
+
+
+def test_json_payload_prefetch_propagates_read_failure_and_shuts_down_workers() -> None:
+    payloads = {f"input/{name}.json": name.encode() for name in ("a", "b", "c", "d")}
+
+    class _FailingClient(_Client):
+        def __init__(self) -> None:
+            super().__init__(
+                [
+                    {
+                        "Contents": [
+                            _listed(key, size=len(value))
+                            for key, value in payloads.items()
+                        ]
+                    }
+                ]
+            )
+
+        def get_object(self, **kwargs: str) -> dict[str, Any]:
+            key = kwargs["Key"]
+            if key.endswith("/b.json"):
+                raise OSError("injected read failure")
+            payload = payloads[key]
+            return {
+                "Body": _Body(payload),
+                "ContentLength": len(payload),
+                "ETag": f'"{key}"',
+            }
+
+    source = S3CaptureSource(_FailingClient(), S3Location("bucket", "input/"))
+
+    with pytest.raises(OSError, match="injected read failure"):
+        list(source.iter_capture_payloads("deepinfra"))
+
+
 def test_create_s3_client_uses_configuration_and_optional_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -382,6 +472,7 @@ def test_create_s3_client_uses_configuration_and_optional_credentials(
         "signature_version": "s3v4",
         "s3": {"addressing_style": "path"},
         "retries": {"mode": "standard", "max_attempts": 10},
+        "max_pool_connections": 8,
     }
     assert not any(name.startswith("aws_") for name in kwargs)
 

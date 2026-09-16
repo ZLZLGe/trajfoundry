@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import io
+from collections import deque
 from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
@@ -19,6 +21,9 @@ if TYPE_CHECKING:
 
 InputFormat = Literal["freerouter", "tokenplan", "sxf", "deepinfra"]
 _READ_CHUNK_BYTES = 1024 * 1024
+_READ_WORKERS = 4
+_READ_PREFETCH = 4
+_MAX_POOL_CONNECTIONS = 8
 
 
 class _CountingBody:
@@ -167,6 +172,7 @@ def create_s3_client(
         signature_version="s3v4",
         s3={"addressing_style": "path"},
         retries={"mode": "standard", "max_attempts": 10},
+        max_pool_connections=_MAX_POOL_CONNECTIONS,
     )
     client_kwargs: dict[str, Any] = {
         "endpoint_url": endpoint_url,
@@ -202,6 +208,12 @@ class S3CaptureSource:
     @property
     def label(self) -> str:
         return self.location.uri
+
+    @property
+    def payload_formats(self) -> frozenset[InputFormat]:
+        """Formats this source can yield directly to the ingest pipeline."""
+
+        return frozenset({"freerouter", "tokenplan", "sxf", "deepinfra"})
 
     def iter_captures(self, input_format: InputFormat) -> Iterator[S3Capture]:
         """Return capture metadata in stable relative-key order."""
@@ -271,17 +283,18 @@ class S3CaptureSource:
     def iter_capture_payloads(
         self, input_format: InputFormat
     ) -> Iterator[tuple[str, bytes, str]]:
-        """Stream decompressed SXF JSONL rows from each immutable S3 object.
+        """Yield stable payloads with bounded prefetch for ordinary objects.
 
-        The object itself is never accumulated in memory.  Each yielded hash
-        covers the exact JSONL row (without its line ending), which is the
-        identity used by the local ingest state and lineage records.
+        Ordinary JSON captures are fetched by four workers while results remain
+        ordered by source reference.  At most four completed object payloads
+        can wait in memory.  SXF remains a sequential decompression stream so a
+        compressed object is never accumulated in memory.  Each SXF hash covers
+        the exact JSONL row without its line ending.
         """
 
         if input_format != "sxf":
-            raise ValueError(
-                f"streaming payloads are only available for sxf: {input_format!r}"
-            )
+            yield from self._iter_prefetched_capture_payloads(input_format)
+            return
         try:
             import zstandard
         except ImportError as error:  # pragma: no cover - environment setup issue
@@ -334,6 +347,38 @@ class S3CaptureSource:
                 close = getattr(body, "close", None)
                 if callable(close):
                     close()
+
+    def _iter_prefetched_capture_payloads(
+        self, input_format: InputFormat
+    ) -> Iterator[tuple[str, bytes, str]]:
+        captures = iter(self.iter_captures(input_format))
+        executor = ThreadPoolExecutor(
+            max_workers=_READ_WORKERS,
+            thread_name_prefix="trajfoundry-s3-read",
+        )
+        pending: deque[tuple[S3Capture, Future[tuple[bytes, str]]]] = deque()
+
+        def fill() -> None:
+            while len(pending) < _READ_PREFETCH:
+                try:
+                    capture = next(captures)
+                except StopIteration:
+                    return
+                pending.append(
+                    (capture, executor.submit(self.read_capture_bytes, capture))
+                )
+
+        try:
+            fill()
+            while pending:
+                capture, future = pending.popleft()
+                payload, digest = future.result()
+                fill()
+                yield capture.source_ref, payload, digest
+        finally:
+            for _, future in pending:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
 
     def read_capture_bytes(self, capture: S3Capture) -> tuple[bytes, str]:
         """Conditionally read, close, length-check, and hash one S3 object."""

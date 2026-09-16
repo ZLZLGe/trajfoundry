@@ -1026,6 +1026,36 @@ def test_subagent_without_explicit_thread_id_ignores_session_header_fallback() -
     assert warning.severity == Severity.WARNING
 
 
+def test_missing_session_and_thread_ids_are_warnings_not_capture_failures() -> None:
+    capture = _capture(
+        request_body={"model": "claude-test", "messages": []},
+        response_body={
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "stop_reason": "end_turn",
+            "content": [],
+        },
+    )
+    capture.pop("session_id", None)
+    capture["request_headers"] = {}
+
+    snapshot = _parse(capture)
+
+    assert snapshot.session_id == ""
+    assert snapshot.thread_id == ""
+    identity_issues = {
+        issue.code: issue
+        for issue in snapshot.issues
+        if issue.code in {"missing_session_id", "missing_thread_id"}
+    }
+    assert set(identity_issues) == {"missing_session_id", "missing_thread_id"}
+    assert all(issue.severity == Severity.WARNING for issue in identity_issues.values())
+    assert snapshot.request_id == "req-1"
+    assert snapshot.outcome == "success"
+    assert snapshot.wire_complete is True
+
+
 def test_claude_agent_header_is_a_stable_thread_boundary() -> None:
     capture = _capture(
         request_body={

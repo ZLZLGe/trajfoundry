@@ -135,8 +135,15 @@ def test_tokenplan_pipeline_includes_test_and_publishes_media_mapping(
     assert manifest["counts"]["skip_reason_counts"] == {}
 
     accepted_path = _manifest_file(output_root, "/accepted/trajectories-00000.jsonl")
-    accepted = orjson.loads(accepted_path.read_bytes().splitlines()[0])
-    assert accepted["metadata"] == {
+    accepted_rows = [
+        orjson.loads(line) for line in accepted_path.read_bytes().splitlines()
+    ]
+    good_row = next(
+        row
+        for row in accepted_rows
+        if row["metadata"]["source_file"] == "req_good.json"
+    )
+    assert good_row["metadata"] == {
         "source_file": "req_good.json",
         "source_name": "tokenplan",
         "line_no": 0,
@@ -148,9 +155,6 @@ def test_tokenplan_pipeline_includes_test_and_publishes_media_mapping(
         "specific_source": "token-plan",
     }
 
-    accepted_rows = [
-        orjson.loads(line) for line in accepted_path.read_bytes().splitlines()
-    ]
     media_row = next(
         row
         for row in accepted_rows

@@ -120,11 +120,18 @@ timestamp changes.
 - New runs use manifest schema `trajfoundry-v3`, which records `input_format`,
   `skipped_inputs`, and `skip_reason_counts`; validation remains backward
   compatible with existing v2 manifests.
-- `--input` defines the dataset boundary. Cumulative snapshots are grouped only
-  by `(session_id, thread_id)`; storage directories are provenance, not
-  trajectory identity. A snapshot is suppressed only when its complete
-  transcript is an exact prefix of a later request history. Every divergent
-  maximal leaf is retained.
+- `--input` defines the dataset boundary. Storage directories are provenance,
+  not trajectory identity. Captures with a real `session_id` are aggregated in
+  a session scope while keeping `(session_id, thread_id)` as the prefix
+  boundary. Captures without a session are aggregated by `user_id` across
+  request/thread labels; missing users use the shared `no_user_id` scope.
+  `request_id` is never promoted to a session. Published metadata projects
+  missing identities as `session_id="no_session_id"` and
+  `user_id="no_user_id"`; audit markers keep those synthesized values distinct
+  from provider IDs that literally use either sentinel string.
+- A snapshot is suppressed only when its complete transcript is an exact prefix
+  of a later request history in the same scope. Every divergent maximal leaf is
+  retained.
 - Prefix matching compares stable conversational fields: role and content for
   system/developer/user messages; role, content, and tool calls for assistant
   messages; and role, call ID, name, and content for tool results. Reasoning
@@ -133,10 +140,12 @@ timestamp changes.
 - Compaction evidence is position-sensitive prefix identity. Snapshots can be
   folded only when their complete compaction records are identical; differing
   contents, positions, origins, or presence form separate branches.
-- Prefix aggregation uses a canonical-message trie. SHA-256 is only a lookup
-  accelerator; canonical token bytes remain the equality authority. Memory
-  grows with the unique transcript and active branches, not with all repeated
-  cumulative histories.
+- Prefix aggregation uses a canonical-message trie with separate postings for
+  active history extenders and complete transcript endpoints. A current full
+  transcript probes extenders; each current history prefix probes endpoints.
+  SHA-256 is only a lookup accelerator; canonical token bytes remain the
+  equality authority. This avoids scanning unrelated active leaves and keeps
+  memory tied to unique transcript structure and active branches.
 - Final messages, instructions, model, harness, and termination are taken from
   the selected leaf capture. Prefix contributors never backfill or rewrite the
   leaf conversation; only tool definitions, server-tool records, agent-message
@@ -148,8 +157,8 @@ timestamp changes.
   richer compatible definition wins deterministically; incompatible same-name
   schemas quarantine the trajectory.
 - Tool definitions are merged only among prefix contributors to the same
-  `(session_id, thread_id, compaction signature)` trajectory group. There is no
-  cross-session tool registry: a tool seen in a different trajectory cannot
+  aggregation scope and compaction signature. There is no cross-session or
+  cross-user tool registry: a tool seen in a different trajectory cannot
   backfill this one.
 - Server tools remain in `server_tool_calls` and never become client tools or
   tool messages. Their provider result blocks are preserved verbatim, and a
@@ -160,6 +169,10 @@ timestamp changes.
   canonical recipient; task-name basename matching is allowed only for a spawn
   without a canonical result name. Explicit marker/recipient conflicts remain
   orphaned. Time, file order, and free-form text are never routing signals.
+- When one child thread has divergent maximal leaves, the first version mounts
+  only the leaf with the largest `history + response` message count. Stable leaf
+  order breaks ties; unselected branches remain explicit orphan trajectories.
+  Child context-compaction semantics are not interpreted yet.
 - `thread_source` is ignored completely for sub-agent detection and mounting;
   only explicit marker/kind, parent, fork, and spawn evidence participate.
 - Responses relay mounts additionally require the canonical agent name returned
@@ -167,8 +180,10 @@ timestamp changes.
   `agent_message` after the corresponding call/result pair has completed.
   Missing or conflicting relay evidence never removes an otherwise proven
   parent/child mount. Raw relay content is retained but never parsed for routing.
-- Global semantic hashes deduplicate completed trajectory trees while
-  `lineage.jsonl` retains every contributing source capture.
+- Semantic hashes deduplicate completed trajectory trees within their normalized
+  identity boundary (`user_id` and `session_id`); source file, timestamp, and
+  other provenance remain outside the hash. `lineage.jsonl` retains every
+  contributing source capture.
 - Session-wide sub-agent planning retains only compact routing evidence. Full
   nodes are reloaded and materialized one connected root at a time.
 

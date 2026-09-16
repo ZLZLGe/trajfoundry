@@ -4,6 +4,7 @@ from typing import Any
 
 import orjson
 import pytest
+import zstandard
 
 from trajfoundry.audit_codes import RESPONSES_UNSUPPORTED_CALL_EVIDENCE
 from trajfoundry.canonical import trajectory_id
@@ -462,6 +463,57 @@ def test_media_mapping_changes_canonical_trajectory_id() -> None:
     assert trajectory_id(mapped) != trajectory_id(plain)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("user_id", "different-user"), ("session_id", "different-session")],
+)
+def test_aggregation_identity_changes_canonical_trajectory_id(
+    field: str, value: str
+) -> None:
+    plain = _trajectory()
+    changed = plain.model_copy(deep=True)
+    setattr(changed.metadata, field, value)
+
+    assert trajectory_id(changed) != trajectory_id(plain)
+
+
+def test_child_aggregation_identity_changes_parent_trajectory_id() -> None:
+    plain = _trajectory_with_relay_mount()
+    changed = plain.model_copy(deep=True)
+    assert changed.sub_agent_trajectory is not None
+    changed.sub_agent_trajectory["spawn-1"].metadata.user_id = "different-user"
+
+    assert trajectory_id(changed) != trajectory_id(plain)
+
+
+@pytest.mark.parametrize(
+    ("field", "sentinel", "issue_code"),
+    [
+        ("user_id", "no_user_id", "metadata_user_id_synthesized"),
+        ("session_id", "no_session_id", "metadata_session_id_synthesized"),
+    ],
+)
+def test_synthesized_identity_sentinel_does_not_collide_with_literal_provider_id(
+    field: str, sentinel: str, issue_code: str
+) -> None:
+    literal = _trajectory()
+    setattr(literal.metadata, field, sentinel)
+    synthesized = literal.model_copy(deep=True)
+    assert synthesized.normalization_audit is not None
+    synthesized.normalization_audit.issues.append(
+        AuditIssue(
+            code=issue_code,
+            stage="aggregation",
+            severity=Severity.WARNING,
+            path=f"/metadata/{field}",
+            detail="identity sentinel was synthesized",
+        )
+    )
+
+    assert literal.metadata.model_dump() == synthesized.metadata.model_dump()
+    assert trajectory_id(literal) != trajectory_id(synthesized)
+
+
 def test_trajectory_projection_rejects_invalid_assignment() -> None:
     node = _trajectory()
     node.total_rounds = "3"  # type: ignore[assignment]
@@ -771,11 +823,19 @@ def test_state_rejects_stale_derived_fields_during_restore(tmp_path: Path) -> No
         (compressed,) = state.connection.execute(
             "SELECT payload FROM trajectories WHERE trajectory_id=?", (identifier,)
         ).fetchone()
-        payload = orjson.loads(zlib.decompress(compressed))
+        if compressed.startswith(b"TFZ1"):
+            payload_bytes = zstandard.ZstdDecompressor().decompress(compressed[4:])
+        else:
+            payload_bytes = zlib.decompress(compressed)
+        payload = orjson.loads(payload_bytes)
         payload["tool_call_check"]["total_calls"] = 777
         state.connection.execute(
             "UPDATE trajectories SET payload=? WHERE trajectory_id=?",
-            (zlib.compress(orjson.dumps(payload)), identifier),
+            (
+                b"TFZ1"
+                + zstandard.ZstdCompressor(level=1).compress(orjson.dumps(payload)),
+                identifier,
+            ),
         )
 
         with pytest.raises(StaleDerivedFieldsError):

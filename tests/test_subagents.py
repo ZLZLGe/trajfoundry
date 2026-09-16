@@ -1292,6 +1292,84 @@ def test_multiple_children_claiming_one_call_are_all_orphaned() -> None:
     }
 
 
+def test_longest_branch_of_one_child_thread_is_mounted_and_others_are_orphans() -> None:
+    parent = snapshot(
+        "parent",
+        thread="main",
+        turn="turn-1",
+        response=[assistant(calls=[spawn("call", "task")])],
+    )
+    short = snapshot(
+        "child-short",
+        thread="child",
+        turn="child-turn-short",
+        response=[assistant("short")],
+        parent_thread="main",
+        parent_turn="turn-1",
+        forked_from="main",
+        marker="call",
+    )
+    long = snapshot(
+        "child-long",
+        thread="child",
+        turn="child-turn-long",
+        history=[user("one"), assistant("two"), user("three")],
+        response=[assistant("long")],
+        parent_thread="main",
+        parent_turn="turn-1",
+        forked_from="main",
+        marker="call",
+    )
+
+    plan = plan_subagent_mounts([short, parent, long])
+
+    assert len(plan.edges) == 1
+    edge = plan.edges[0]
+    assert plan.leaves[edge.child_index].source_path == "/child-long.json"
+    assert tuple(plan.leaves[index].source_path for index in plan.orphan_indices) == (
+        "/child-short.json",
+    )
+    assert "unselected_child_branch" in codes(plan)
+    assert "duplicate_child_leaves" not in codes(plan)
+
+
+def test_equal_length_child_branches_use_stable_leaf_order() -> None:
+    parent = snapshot(
+        "parent",
+        thread="main",
+        turn="turn-1",
+        response=[assistant(calls=[spawn("call", "task")])],
+    )
+    branch_b = snapshot(
+        "child-b",
+        thread="child",
+        turn="turn-b",
+        response=[assistant("b")],
+        parent_thread="main",
+        parent_turn="turn-1",
+        forked_from="main",
+        marker="call",
+    )
+    branch_a = snapshot(
+        "child-a",
+        thread="child",
+        turn="turn-a",
+        response=[assistant("a")],
+        parent_thread="main",
+        parent_turn="turn-1",
+        forked_from="main",
+        marker="call",
+    )
+
+    plan = plan_subagent_mounts([branch_b, parent, branch_a])
+
+    assert len(plan.edges) == 1
+    assert plan.leaves[plan.edges[0].child_index].source_path == "/child-a.json"
+    assert tuple(plan.leaves[index].source_path for index in plan.orphan_indices) == (
+        "/child-b.json",
+    )
+
+
 def test_cycle_is_reported_and_never_materialized() -> None:
     leaf_a = snapshot(
         "a",

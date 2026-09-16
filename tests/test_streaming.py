@@ -1,5 +1,8 @@
+import gc
+import weakref
 from typing import Literal
 
+from trajfoundry import streaming
 from trajfoundry.models import (
     AgentMessageEvidence,
     CompactionRecord,
@@ -451,3 +454,215 @@ def test_late_empty_snapshot_is_covered_by_existing_response() -> None:
     )
     assert [leaf.source_path for leaf in result.leaves] == ["long"]
     assert result.contributor_paths["long"] == ("empty", "long")
+
+
+def test_missing_session_uses_user_scope_and_can_merge_across_threads() -> None:
+    question = Message(role="user", content="q")
+    answer = Message(role="assistant", content="a", reasoning_content="")
+    short = snap("short-no-session", [question], [answer]).model_copy(
+        update={"session_id": "", "user_id": "user-a", "thread_id": "thread-1"}
+    )
+    long = snap(
+        "long-no-session",
+        [question, answer, Message(role="user", content="next")],
+        [Message(role="assistant", content="done", reasoning_content="")],
+    ).model_copy(
+        update={"session_id": "", "user_id": "user-a", "thread_id": "thread-2"}
+    )
+
+    result = streaming_prefix_leaves(item for item in (short, long))
+
+    assert [leaf.source_path for leaf in result.leaves] == ["long-no-session"]
+    assert result.contributor_paths["long-no-session"] == (
+        "long-no-session",
+        "short-no-session",
+    )
+
+
+def test_missing_session_does_not_merge_different_users_or_known_sessions() -> None:
+    question = Message(role="user", content="q")
+    answer = Message(role="assistant", content="a", reasoning_content="")
+    base = snap("base", [question], [answer]).model_copy(
+        update={"session_id": "", "user_id": "user-a"}
+    )
+    other_user = snap(
+        "other-user",
+        [question, answer, Message(role="user", content="next")],
+        [Message(role="assistant", content="done", reasoning_content="")],
+    ).model_copy(update={"session_id": "", "user_id": "user-b"})
+    known_session = snap(
+        "known-session",
+        [question, answer, Message(role="user", content="next")],
+        [Message(role="assistant", content="done", reasoning_content="")],
+    ).model_copy(update={"session_id": "session-known", "user_id": "user-a"})
+
+    result = streaming_prefix_leaves([base, other_user, known_session])
+
+    assert {leaf.source_path for leaf in result.leaves} == {
+        "base",
+        "other-user",
+        "known-session",
+    }
+    assert result.intermediate_paths == ()
+
+
+def test_public_identity_sentinel_strings_remain_explicit_internal_ids() -> None:
+    question = Message(role="user", content="q")
+    answer = Message(role="assistant", content="a", reasoning_content="")
+    short = snap("short", [question], [answer]).model_copy(
+        update={"session_id": "", "user_id": ""}
+    )
+    literal_user = snap(
+        "literal-user",
+        [question, answer, Message(role="user", content="next")],
+        [Message(role="assistant", content="done", reasoning_content="")],
+    ).model_copy(update={"session_id": "", "user_id": "no_user_id"})
+    literal_session = literal_user.model_copy(
+        update={
+            "source_path": "literal-session",
+            "session_id": "no_session_id",
+            "user_id": "",
+        }
+    )
+
+    result = streaming_prefix_leaves([short, literal_user, literal_session])
+
+    assert {leaf.source_path for leaf in result.leaves} == {
+        "short",
+        "literal-user",
+        "literal-session",
+    }
+    assert result.intermediate_paths == ()
+
+
+def test_explicit_request_id_session_is_a_real_session_scope() -> None:
+    question = Message(role="user", content="q")
+    answer = Message(role="assistant", content="a", reasoning_content="")
+    first = snap("request-1", [question], [answer]).model_copy(
+        update={"session_id": "request-1", "request_id": "request-1", "user_id": "u"}
+    )
+    second = snap(
+        "request-2",
+        [question, answer, Message(role="user", content="next")],
+        [Message(role="assistant", content="done", reasoning_content="")],
+    ).model_copy(
+        update={"session_id": "request-2", "request_id": "request-2", "user_id": "u"}
+    )
+
+    result = streaming_prefix_leaves([first, second])
+
+    assert {leaf.source_path for leaf in result.leaves} == {"request-1", "request-2"}
+
+
+def test_custom_scope_function_overrides_default_session_scope() -> None:
+    question = Message(role="user", content="q")
+    answer = Message(role="assistant", content="a", reasoning_content="")
+    first = snap("first", [question], [answer]).model_copy(
+        update={"session_id": "session-a"}
+    )
+    second = snap(
+        "second",
+        [question, answer, Message(role="user", content="next")],
+        [Message(role="assistant", content="done", reasoning_content="")],
+    ).model_copy(update={"session_id": "session-b"})
+
+    result = streaming_prefix_leaves([first, second], scope_fn=lambda _: "shared")
+
+    assert [leaf.source_path for leaf in result.leaves] == ["second"]
+    assert result.contributor_paths["second"] == ("first", "second")
+
+
+def test_generator_releases_covered_snapshot_before_input_is_exhausted() -> None:
+    question = Message(role="user", content="q")
+    answer = Message(role="assistant", content="a", reasoning_content="")
+    references: list[weakref.ReferenceType[Snapshot]] = []
+
+    def source():
+        short = snap("short", [question], [answer])
+        references.append(weakref.ref(short))
+        yield short
+        del short
+
+        long = snap(
+            "long",
+            [question, answer, Message(role="user", content="next")],
+            [Message(role="assistant", content="done", reasoning_content="")],
+        )
+        yield long
+        del long
+
+        gc.collect()
+        assert references[0]() is None
+
+    result = streaming_prefix_leaves(source())
+
+    assert [leaf.source_path for leaf in result.leaves] == ["long"]
+
+
+def test_short_prefix_contributes_to_every_divergent_maximal_leaf() -> None:
+    question = Message(role="user", content="q")
+    answer = Message(role="assistant", content="a", reasoning_content="")
+    follow_up = Message(role="user", content="next")
+    short = snap("short", [question], [answer])
+    middle = snap(
+        "middle",
+        [question, answer, follow_up],
+        [Message(role="assistant", content="middle", reasoning_content="")],
+    )
+    branch_a = snap(
+        "branch-a",
+        [
+            question,
+            answer,
+            follow_up,
+            Message(role="assistant", content="middle", reasoning_content=""),
+            Message(role="user", content="branch"),
+        ],
+        [Message(role="assistant", content="a", reasoning_content="")],
+    )
+    branch_b = snap(
+        "branch-b",
+        [question, answer, follow_up],
+        [Message(role="assistant", content="other", reasoning_content="")],
+    )
+
+    result = streaming_prefix_leaves([short, middle, branch_a, branch_b])
+
+    assert [leaf.source_path for leaf in result.leaves] == ["branch-a", "branch-b"]
+    assert result.contributor_paths == {
+        "branch-a": ("branch-a", "middle", "short"),
+        "branch-b": ("branch-b", "short"),
+    }
+
+
+def test_unrelated_leaves_do_not_scan_the_active_frontier(monkeypatch) -> None:
+    advance_calls = 0
+    original_advance = streaming._TranscriptTrie.advance
+
+    def counted_advance(node, token):
+        nonlocal advance_calls
+        advance_calls += 1
+        return original_advance(node, token)
+
+    monkeypatch.setattr(
+        streaming._TranscriptTrie, "advance", staticmethod(counted_advance)
+    )
+    snapshots = [
+        snap(
+            f"leaf-{index}",
+            [Message(role="user", content=f"question-{index}")],
+            [
+                Message(
+                    role="assistant", content=f"answer-{index}", reasoning_content=""
+                )
+            ],
+        )
+        for index in range(500)
+    ]
+
+    result = streaming_prefix_leaves(snapshots)
+
+    assert len(result.leaves) == len(snapshots)
+    assert advance_calls == sum(
+        len(snapshot.history) + len(snapshot.response) for snapshot in snapshots
+    )

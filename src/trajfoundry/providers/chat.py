@@ -930,6 +930,7 @@ def parse_chat_capture(
             "missing_session_id",
             "session_id",
             "capture has no session id",
+            severity=Severity.WARNING,
         )
     if not thread_id:
         _issue(
@@ -937,6 +938,7 @@ def parse_chat_capture(
             "missing_thread_id",
             "thread_id",
             "capture has no thread id",
+            severity=Severity.WARNING,
         )
 
     status = capture.get("status_code")

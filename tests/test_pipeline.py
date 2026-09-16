@@ -736,6 +736,129 @@ def test_metadata_source_mapping(
     assert metadata.specific_source == specific_source
 
 
+def test_missing_identity_uses_explicit_metadata_sentinels() -> None:
+    leaf = Snapshot(
+        source_path="capture.json",
+        source_sha256="a" * 64,
+        source_name="deepinfra",
+        session_id="",
+        thread_id="",
+        provider="openai",
+        operation="chat_completions",
+        outcome="success",
+    )
+
+    node = _trajectory_from_leaf(leaf, [leaf])
+    metadata = node.metadata
+
+    assert leaf.session_id == ""
+    assert leaf.user_id == ""
+    assert metadata.session_id == "no_session_id"
+    assert metadata.user_id == "no_user_id"
+    assert node.normalization_audit is not None
+    assert {
+        issue.code
+        for issue in node.normalization_audit.issues
+        if issue.stage == "aggregation"
+    } >= {
+        "metadata_session_id_synthesized",
+        "metadata_user_id_synthesized",
+    }
+
+
+def test_missing_session_prefixes_merge_by_user_across_threads(tmp_path: Path) -> None:
+    question = Message(role="user", content="question")
+    answer = Message(role="assistant", content="answer", reasoning_content="")
+    follow_up = Message(role="user", content="follow-up")
+    final = Message(role="assistant", content="done", reasoning_content="")
+
+    def snapshot(
+        path: str,
+        *,
+        user_id: str,
+        thread_id: str,
+        history: list[Message],
+        response: list[Message],
+        captured_at: str,
+    ) -> Snapshot:
+        return Snapshot(
+            source_path=path,
+            source_sha256=(path.encode().hex() + "0" * 64)[:64],
+            source_name="deepinfra",
+            session_id="",
+            thread_id=thread_id,
+            request_id=path,
+            user_id=user_id,
+            captured_at=captured_at,
+            provider="openai",
+            operation="chat_completions",
+            outcome="success",
+            history=history,
+            response=response,
+            termination="stop",
+            wire_complete=True,
+        )
+
+    alice_short = snapshot(
+        "alice-short.json",
+        user_id="alice",
+        thread_id="request-1",
+        history=[question],
+        response=[answer],
+        captured_at="2026-09-16T00:00:00Z",
+    )
+    alice_long = snapshot(
+        "alice-long.json",
+        user_id="alice",
+        thread_id="request-2",
+        history=[question, answer, follow_up],
+        response=[final],
+        captured_at="2026-09-16T00:01:00Z",
+    )
+    bob_long = snapshot(
+        "bob-long.json",
+        user_id="bob",
+        thread_id="request-3",
+        history=[question, answer, follow_up],
+        response=[final],
+        captured_at="2026-09-16T00:02:00Z",
+    )
+    anonymous = snapshot(
+        "anonymous.json",
+        user_id="",
+        thread_id="request-4",
+        history=[Message(role="user", content="anonymous")],
+        response=[final],
+        captured_at="2026-09-16T00:03:00Z",
+    )
+
+    with StateStore(tmp_path / "state.sqlite") as state:
+        with state.write_batch():
+            for item in (alice_short, alice_long, bob_long, anonymous):
+                state.put_snapshot(item, endpoint="/v1/chat/completions")
+        stats = PipelineStats()
+        _build_trajectories(state, stats)
+        stored = list(state.iter_trajectories())
+
+    assert stats.sessions == 3
+    assert stats.eligible_snapshots == 4
+    assert stats.prefix_intermediates == 1
+    assert stats.leaf_snapshots == 3
+    assert stats.stored_trajectories == 3
+
+    by_user = {node.metadata.user_id: (node, origins) for _, node, origins in stored}
+    assert set(by_user) == {"alice", "bob", "no_user_id"}
+    assert all(
+        node.metadata.session_id == "no_session_id" for node, _ in by_user.values()
+    )
+    assert {row["source_ref"] for row in by_user["alice"][1]} == {
+        "alice-short.json",
+        "alice-long.json",
+    }
+    assert {row["source_ref"] for row in by_user["bob"][1]} == {"bob-long.json"}
+    assert {row["source_ref"] for row in by_user["no_user_id"][1]} == {"anonymous.json"}
+
+
 def test_multimodal_mapping_prefers_leaf_order_and_appends_prefix_only_parts() -> None:
     contributor = Snapshot(
         source_path="old/short.json",

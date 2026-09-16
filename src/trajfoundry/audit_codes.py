@@ -14,6 +14,7 @@ MountDiagnosticCode: TypeAlias = Literal[
     "conflicting_parent_thread",
     "conflicting_marker_metadata",
     "duplicate_child_leaves",
+    "unselected_child_branch",
     "missing_spawn_call",
     "spawn_routing_mismatch",
     "ambiguous_spawn_call",

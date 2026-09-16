@@ -112,8 +112,16 @@ def test_adapt_deepinfra_json_projects_only_provider_capture_fields() -> None:
         "request_id": "request-1",
         "request_headers": {},
         "is_stream": False,
-        "session_id": "request-1",
     }
+    assert capture["request_id"] == "request-1"
+    assert "session_id" not in capture
+
+
+def test_adapt_deepinfra_does_not_promote_request_id_to_session_id() -> None:
+    capture = adapt_deepinfra_envelope(_envelope())
+
+    assert capture["request_id"] == "request-1"
+    assert "session_id" not in capture
 
 
 def test_adapt_deepinfra_aggregates_chat_sse_to_final_response() -> None:

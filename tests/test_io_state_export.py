@@ -1,7 +1,9 @@
 import sqlite3
+import zlib
 from pathlib import Path
 
 import orjson
+import zstandard
 
 from trajfoundry.canonical import trajectory_id
 from trajfoundry.export import OutputSet
@@ -68,8 +70,426 @@ def test_state_round_trip_compresses_snapshot(tmp_path: Path) -> None:
     )
     with StateStore(tmp_path / "state.sqlite") as state:
         state.put_snapshot(snapshot)
+        payload = state.connection.execute(
+            "SELECT payload FROM snapshots WHERE source_path=?",
+            (snapshot.source_path,),
+        ).fetchone()[0]
+        assert payload.startswith(b"TFZ1")
+        assert zstandard.ZstdDecompressor().decompress(payload[4:])
         restored = list(state.iter_snapshots())
     assert restored == [snapshot]
+
+
+def test_state_reads_legacy_zlib_snapshot_payload_in_v2_database(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite"
+    snapshot = Snapshot(
+        source_path="legacy.json",
+        source_sha256="a" * 64,
+        session_id="s",
+        thread_id="t",
+        provider="openai",
+        operation="responses",
+        outcome="success",
+    )
+    legacy = zlib.compress(snapshot.model_dump_json(exclude_none=True).encode())
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE captures (
+                source_path TEXT PRIMARY KEY,
+                sha256 TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                endpoint TEXT NOT NULL DEFAULT '',
+                captured_at TEXT NOT NULL DEFAULT '',
+                scan_id TEXT NOT NULL DEFAULT '',
+                user_id TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE snapshots (
+                source_path TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                captured_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE INDEX idx_snapshots_group
+            ON snapshots(session_id, thread_id, captured_at, source_path);
+            PRAGMA user_version=2;
+            """
+        )
+        connection.execute(
+            "INSERT INTO snapshots("
+            "source_path,session_id,thread_id,captured_at,payload"
+            ") VALUES(?,?,?,?,?)",
+            (
+                snapshot.source_path,
+                snapshot.session_id,
+                snapshot.thread_id,
+                snapshot.captured_at,
+                legacy,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO captures(source_path,sha256,status) VALUES(?,?,?)",
+            (snapshot.source_path, snapshot.source_sha256, "parsed"),
+        )
+
+    with StateStore(path) as state:
+        assert state.connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert state.connection.execute("PRAGMA page_size").fetchone()[0] == 4096
+        assert list(state.iter_snapshots()) == [snapshot]
+        assert (
+            state.connection.execute("SELECT payload FROM snapshots").fetchone()[0]
+            == legacy
+        )
+
+        state.put_snapshot(snapshot)
+        assert (
+            state.connection.execute("SELECT payload FROM snapshots")
+            .fetchone()[0]
+            .startswith(b"TFZ1")
+        )
+
+
+def test_state_rebuilds_v1_cache_before_sessionless_user_aggregation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite"
+    snapshots = [
+        Snapshot(
+            source_path=f"{user}.json",
+            source_sha256=character * 64,
+            session_id="",
+            thread_id=f"request-{user}",
+            user_id=user,
+            provider="openai",
+            operation="responses",
+            outcome="success",
+        )
+        for user, character in (("alice", "a"), ("bob", "b"))
+    ]
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE captures (
+                source_path TEXT PRIMARY KEY,
+                sha256 TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                endpoint TEXT NOT NULL DEFAULT '',
+                captured_at TEXT NOT NULL DEFAULT '',
+                scan_id TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE snapshots (
+                source_path TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                captured_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            PRAGMA user_version=1;
+            """
+        )
+        for snapshot in snapshots:
+            connection.execute(
+                "INSERT INTO captures(source_path,sha256,status) VALUES(?,?,?)",
+                (snapshot.source_path, snapshot.source_sha256, "parsed"),
+            )
+            connection.execute(
+                "INSERT INTO snapshots VALUES(?,?,?,?,?)",
+                (
+                    snapshot.source_path,
+                    snapshot.session_id,
+                    snapshot.thread_id,
+                    snapshot.captured_at,
+                    zlib.compress(snapshot.model_dump_json().encode()),
+                ),
+            )
+
+    with StateStore(path) as state:
+        assert state.connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert state.capture_count() == 0
+        assert list(state.iter_snapshots()) == []
+        assert list(state.aggregation_scopes()) == []
+
+
+def test_state_write_batch_commits_and_rolls_back(tmp_path: Path) -> None:
+    def make_snapshot(path: str) -> Snapshot:
+        return Snapshot(
+            source_path=path,
+            source_sha256="a" * 64,
+            session_id="s",
+            thread_id="t",
+            provider="openai",
+            operation="responses",
+            outcome="success",
+        )
+
+    with StateStore(tmp_path / "state.sqlite") as state:
+        with state.write_batch():
+            state.put_snapshot(make_snapshot("one.json"))
+            state.put_snapshot(make_snapshot("two.json"))
+        assert state.capture_count() == 2
+
+        try:
+            with state.write_batch():
+                state.put_snapshot(make_snapshot("three.json"))
+                raise RuntimeError("abort batch")
+        except RuntimeError:
+            pass
+        assert state.capture_count() == 2
+        assert state.get_snapshot("three.json") is None
+
+    with StateStore(tmp_path / "state.sqlite") as state:
+        assert [snapshot.source_path for snapshot in state.iter_snapshots()] == [
+            "one.json",
+            "two.json",
+        ]
+
+
+def test_state_configures_page_size_and_ephemeral_pragmas(tmp_path: Path) -> None:
+    durable_path = tmp_path / "durable.sqlite"
+    with StateStore(durable_path) as state:
+        assert state.connection.execute("PRAGMA page_size").fetchone()[0] == 32 * 1024
+        assert state.connection.execute("PRAGMA cache_size").fetchone()[0] == -(
+            128 * 1024
+        )
+        assert state.connection.execute("PRAGMA mmap_size").fetchone()[0] >= (
+            256 * 1024 * 1024
+        )
+        assert (
+            state.connection.execute("PRAGMA journal_mode").fetchone()[0].lower()
+            == "wal"
+        )
+        assert state.connection.execute("PRAGMA synchronous").fetchone()[0] == 1
+
+    ephemeral_path = tmp_path / "ephemeral.sqlite"
+    with StateStore(ephemeral_path, ephemeral=True) as state:
+        assert state.connection.execute("PRAGMA page_size").fetchone()[0] == 32 * 1024
+        assert (
+            state.connection.execute("PRAGMA journal_mode").fetchone()[0].lower()
+            == "memory"
+        )
+        assert state.connection.execute("PRAGMA synchronous").fetchone()[0] == 0
+
+
+def test_iter_snapshot_groups_uses_ordered_groups(tmp_path: Path) -> None:
+    def make_snapshot(path: str, session: str, thread: str) -> Snapshot:
+        return Snapshot(
+            source_path=path,
+            source_sha256="a" * 64,
+            session_id=session,
+            thread_id=thread,
+            provider="openai",
+            operation="responses",
+            outcome="success",
+        )
+
+    with StateStore(tmp_path / "state.sqlite") as state:
+        for snapshot in (
+            make_snapshot("b.json", "s2", "t1"),
+            make_snapshot("a.json", "s1", "t2"),
+            make_snapshot("c.json", "s1", "t1"),
+            make_snapshot("empty.json", "s3", ""),
+        ):
+            state.put_snapshot(snapshot)
+        groups = list(state.iter_snapshot_groups())
+        assert [(session, thread) for session, thread, _ in groups] == [
+            ("s1", "t1"),
+            ("s1", "t2"),
+            ("s2", "t1"),
+        ]
+        assert [snapshot.source_path for snapshot in groups[0][2]] == ["c.json"]
+        all_groups = list(state.iter_snapshot_groups(include_empty_threads=True))
+        assert ("s3", "") in [(session, thread) for session, thread, _ in all_groups]
+
+
+def test_state_streams_session_and_missing_session_user_scopes(
+    tmp_path: Path,
+) -> None:
+    def make_snapshot(
+        path: str,
+        *,
+        session: str,
+        thread: str,
+        user: str,
+        captured_at: str,
+    ) -> Snapshot:
+        return Snapshot(
+            source_path=path,
+            source_sha256="a" * 64,
+            session_id=session,
+            thread_id=thread,
+            user_id=user,
+            captured_at=captured_at,
+            provider="openai",
+            operation="responses",
+            outcome="success",
+        )
+
+    snapshots = (
+        make_snapshot(
+            "session-thread-2.json",
+            session="session-1",
+            thread="thread-2",
+            user="ignored-user",
+            captured_at="2026-09-16T00:00:02Z",
+        ),
+        make_snapshot(
+            "session-thread-1.json",
+            session="session-1",
+            thread="thread-1",
+            user="different-ignored-user",
+            captured_at="2026-09-16T00:00:01Z",
+        ),
+        make_snapshot(
+            "alice-later.json",
+            session="",
+            thread="ignored-2",
+            user="alice",
+            captured_at="2026-09-16T00:00:04Z",
+        ),
+        make_snapshot(
+            "alice-earlier.json",
+            session="",
+            thread="ignored-1",
+            user="alice",
+            captured_at="2026-09-16T00:00:03Z",
+        ),
+        make_snapshot(
+            "bob.json",
+            session="",
+            thread="",
+            user="bob",
+            captured_at="2026-09-16T00:00:05Z",
+        ),
+        make_snapshot(
+            "missing-user.json",
+            session="",
+            thread="",
+            user="",
+            captured_at="2026-09-16T00:00:06Z",
+        ),
+        make_snapshot(
+            "literal-sentinel-session.json",
+            session="no_session_id",
+            thread="",
+            user="ignored-user",
+            captured_at="2026-09-16T00:00:07Z",
+        ),
+        make_snapshot(
+            "literal-sentinel-user.json",
+            session="",
+            thread="",
+            user="no_user_id",
+            captured_at="2026-09-16T00:00:08Z",
+        ),
+    )
+
+    with StateStore(tmp_path / "state.sqlite") as state:
+        with state.write_batch():
+            for snapshot in snapshots:
+                state.put_snapshot(snapshot)
+
+        assert list(state.aggregation_scopes()) == [
+            ("session", "no_session_id"),
+            ("session", "session-1"),
+            ("user", ""),
+            ("user", "alice"),
+            ("user", "bob"),
+            ("user", "no_user_id"),
+        ]
+        assert [
+            snapshot.source_path
+            for snapshot in state.snapshots_for_aggregation_scope(
+                ("session", "session-1")
+            )
+        ] == ["session-thread-1.json", "session-thread-2.json"]
+        assert [
+            snapshot.source_path
+            for snapshot in state.snapshots_for_aggregation_scope(("user", "alice"))
+        ] == ["alice-earlier.json", "alice-later.json"]
+        assert [
+            snapshot.source_path
+            for snapshot in state.snapshots_for_aggregation_scope(
+                ("session", "no_session_id")
+            )
+        ] == ["literal-sentinel-session.json"]
+        assert [
+            snapshot.source_path
+            for snapshot in state.snapshots_for_aggregation_scope(("user", ""))
+        ] == ["missing-user.json"]
+        assert [
+            snapshot.source_path
+            for snapshot in state.snapshots_for_aggregation_scope(
+                ("user", "no_user_id")
+            )
+        ] == ["literal-sentinel-user.json"]
+
+
+def test_state_updates_capture_user_id_with_snapshot_status(tmp_path: Path) -> None:
+    snapshot = Snapshot(
+        source_path="capture.json",
+        source_sha256="a" * 64,
+        session_id="",
+        thread_id="",
+        user_id="user-1",
+        provider="openai",
+        operation="responses",
+        outcome="success",
+    )
+    with StateStore(tmp_path / "state.sqlite") as state:
+        state.put_snapshot(snapshot)
+        assert state.connection.execute(
+            "SELECT user_id FROM captures WHERE source_path=?",
+            (snapshot.source_path,),
+        ).fetchone() == ("user-1",)
+
+        state.put_failure(snapshot.source_path, "b" * 64, "invalid json")
+        assert state.connection.execute(
+            "SELECT user_id FROM captures WHERE source_path=?",
+            (snapshot.source_path,),
+        ).fetchone() == ("",)
+
+
+def test_state_batch_path_reads_are_ordered_and_chunked(tmp_path: Path) -> None:
+    snapshots = [
+        Snapshot(
+            source_path=f"capture-{index:04d}.json",
+            source_sha256=f"{index:064x}",
+            session_id="session",
+            thread_id="thread",
+            captured_at=f"2026-09-16T00:{index // 60:02d}:{index % 60:02d}Z",
+            provider="openai",
+            operation="responses",
+            outcome="success",
+        )
+        for index in range(514)
+    ]
+    requested_paths = [
+        snapshots[-1].source_path,
+        "missing.json",
+        *(snapshot.source_path for snapshot in reversed(snapshots)),
+        snapshots[0].source_path,
+    ]
+
+    with StateStore(tmp_path / "state.sqlite") as state:
+        with state.write_batch():
+            for snapshot in snapshots:
+                state.put_snapshot(snapshot)
+
+        restored = list(state.iter_snapshots_for_paths(requested_paths))
+        metadata = state.source_metadata_for_paths(requested_paths)
+
+    expected_paths = [snapshot.source_path for snapshot in snapshots]
+    assert [snapshot.source_path for snapshot in restored] == expected_paths
+    assert list(metadata) == expected_paths
+    assert metadata[snapshots[0].source_path] == (
+        snapshots[0].source_sha256,
+        snapshots[0].captured_at,
+    )
 
 
 def test_state_round_trip_preserves_trajectory_media_mapping(tmp_path: Path) -> None:
@@ -227,7 +647,7 @@ def test_old_partitioned_state_is_rebuilt_before_resume(tmp_path: Path) -> None:
             "captured_at",
             "payload",
         )
-        assert version == 1
+        assert version == 2
         assert state.capture_count() == 0
         assert list(state.iter_snapshots()) == []
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Any
@@ -50,12 +50,25 @@ def message_prefix_token(message: Message) -> bytes:
     ).encode("utf-8")
 
 
-def _compatibility(snapshot: Snapshot) -> tuple[str | bytes, ...]:
-    return (
-        snapshot.session_id,
-        snapshot.thread_id,
-        compaction_signature(snapshot.compaction_items),
-    )
+def _compatibility(snapshot: Snapshot) -> tuple[Hashable, bytes]:
+    """Return the scope in which a capture may be a cumulative prefix.
+
+    A real session is deliberately paired with its thread.  Captures whose
+    session is absent are allowed to merge by user, but never across users;
+    using a distinct scope tag also prevents a user id from colliding with a
+    session id. Public ``no_*`` sentinels are projected only after aggregation;
+    internally, only the empty string means missing.
+    """
+
+    if snapshot.session_id:
+        scope: Hashable = (
+            "session",
+            snapshot.session_id,
+            snapshot.thread_id,
+        )
+    else:
+        scope = ("user", snapshot.user_id)
+    return scope, compaction_signature(snapshot.compaction_items)
 
 
 def _stable_key(snapshot: Snapshot) -> tuple[str, ...]:
@@ -70,26 +83,36 @@ def _stable_key(snapshot: Snapshot) -> tuple[str, ...]:
 
 @dataclass(slots=True)
 class _TrieNode:
-    # A digest is only a lookup accelerator. Each bucket retains the exact
-    # canonical token so a synthetic or accidental collision cannot merge data.
-    children: dict[bytes, list[tuple[bytes, int]]] = field(default_factory=dict)
+    # SHA-256 selects a tiny collision bucket; the canonical token comparison
+    # in ``advance`` remains authoritative.
+    children: dict[bytes, list[tuple[bytes, _TrieNode]]] = field(default_factory=dict)
     ending_paths: set[str] = field(default_factory=set)
+    # Only presence is queried. A refcount avoids one set entry per active leaf
+    # at every history prefix while still allowing covered leaves to be removed.
+    extender_count: int = 0
+    endpoint_leaf_ids: set[int] = field(default_factory=set)
 
 
 class _TranscriptTrie:
     def __init__(self) -> None:
-        self.nodes = [_TrieNode()]
+        self.root = _TrieNode()
 
-    def advance(self, node_index: int, token: bytes) -> int:
-        digest = sha256(token).digest()
-        bucket = self.nodes[node_index].children.setdefault(digest, [])
-        for existing, child_index in bucket:
+    @staticmethod
+    def advance(node: _TrieNode, token: bytes) -> _TrieNode:
+        bucket = node.children.setdefault(sha256(token).digest(), [])
+        for existing, child in bucket:
             if existing == token:
-                return child_index
-        child_index = len(self.nodes)
-        self.nodes.append(_TrieNode())
-        bucket.append((token, child_index))
-        return child_index
+                return child
+        child = _TrieNode()
+        bucket.append((token, child))
+        return child
+
+
+@dataclass(slots=True)
+class _IndexedLeaf:
+    snapshot: Snapshot
+    prefix_nodes: tuple[_TrieNode, ...]
+    endpoint_node: _TrieNode
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,34 +222,29 @@ def _evidence_copy(snapshot: Snapshot) -> Snapshot:
     )
 
 
-def _strict_history_prefix(prefix: list[bytes], candidate: Snapshot) -> bool:
-    complete_length = len(candidate.history) + len(candidate.response)
-    candidate_history = [message_prefix_token(message) for message in candidate.history]
-    return (
-        len(prefix) < complete_length
-        and len(prefix) <= len(candidate.history)
-        and candidate_history[: len(prefix)] == prefix
-    )
-
-
 def streaming_prefix_leaves(
     snapshots: Iterable[Snapshot],
+    *,
+    scope_fn: Callable[[Snapshot], Hashable] | None = None,
 ) -> StreamingAggregationResult:
-    """Return maximal exact-prefix leaves without retaining repeated histories.
+    """Return maximal exact-prefix leaves without scanning the active frontier.
 
-    A trie interns each distinct canonical message once per transcript prefix.
-    Active full snapshots are retained because they are the only possible
-    leaves. Late, out-of-order shorter captures are checked exactly against
-    those active leaves. Thus a long cumulative chain uses memory proportional
-    to its unique transcript plus its branch frontier, rather than the sum of
-    every repeated request history.
+    The trie is an online equivalent of processing captures from longest to
+    shortest. Each node indexes active leaves that end there and active leaves
+    whose history extends through it, so no active-frontier scan is required.
+    Exact canonical tokens remain on trie edges; SHA-256 is only a child lookup
+    accelerator. ``scope_fn`` can override the default session/user scope;
+    compaction signatures are still part of compatibility.
     """
 
-    tries: dict[tuple[str | bytes, ...], _TranscriptTrie] = {}
-    active: dict[tuple[tuple[str | bytes, ...], int], list[Snapshot]] = {}
-    contributors: dict[str, set[str]] = {}
     all_paths: list[str] = []
     evidence: list[Snapshot] = []
+    tries: dict[tuple[Hashable, bytes], _TranscriptTrie] = {}
+    # Only active leaves remain here. Prefix postings store integer ids, so a
+    # covered leaf's complete Snapshot and contributor set can be released
+    # immediately instead of leaving one list slot per processed capture.
+    leaves: dict[int, _IndexedLeaf] = {}
+    next_leaf_id = 0
 
     for snapshot in snapshots:
         all_paths.append(snapshot.source_path)
@@ -237,56 +255,91 @@ def streaming_prefix_leaves(
         ):
             evidence.append(_evidence_copy(snapshot))
 
-        compatibility = _compatibility(snapshot)
+        if scope_fn is None:
+            compatibility = _compatibility(snapshot)
+        else:
+            compatibility = (
+                scope_fn(snapshot),
+                compaction_signature(snapshot.compaction_items),
+            )
+        history_length = len(snapshot.history)
+        full_tokens = tuple(
+            message_prefix_token(message)
+            for message in (*snapshot.history, *snapshot.response)
+        )
+        complete_length = len(full_tokens)
+
         trie = tries.setdefault(compatibility, _TranscriptTrie())
-        full_messages = [*snapshot.history, *snapshot.response]
-        full_tokens = [message_prefix_token(message) for message in full_messages]
-        inherited: set[str] = set()
+        path_nodes = [trie.root]
+        for token in full_tokens:
+            path_nodes.append(trie.advance(path_nodes[-1], token))
+        endpoint_node = path_nodes[-1]
 
-        node_index = 0
-        if full_messages:
-            inherited.update(trie.nodes[0].ending_paths)
-            removed = active.pop((compatibility, 0), ())
-            for ancestor in removed:
-                contributors.pop(ancestor.source_path, None)
-        for depth, message in enumerate(snapshot.history, start=1):
-            node_index = trie.advance(node_index, message_prefix_token(message))
-            if depth < len(full_messages):
-                inherited.update(trie.nodes[node_index].ending_paths)
-                removed = active.pop((compatibility, node_index), ())
-                for ancestor in removed:
-                    contributors.pop(ancestor.source_path, None)
-
-        for message in snapshot.response:
-            node_index = trie.advance(node_index, message_prefix_token(message))
-        full_node = trie.nodes[node_index]
-        inherited.add(snapshot.source_path)
-        full_node.ending_paths.add(snapshot.source_path)
-        active_key = (compatibility, node_index)
-
-        descendants = [
-            candidate
-            for key, candidates in active.items()
-            if key[0] == compatibility
-            for candidate in candidates
-            if _strict_history_prefix(full_tokens, candidate)
-        ]
-        if descendants:
-            for candidate in descendants:
-                contributors[candidate.source_path].update(inherited)
+        # These postings are exact because reaching the same trie node proves
+        # equality of every canonical token along the path. Equal terminal
+        # transcripts remain separate: only strict history extenders are here.
+        if endpoint_node.extender_count:
+            endpoint_node.ending_paths.add(snapshot.source_path)
             continue
 
-        active.setdefault(active_key, []).append(snapshot)
-        contributors[snapshot.source_path] = inherited
+        # Only strict history-prefix nodes can cover an earlier leaf. For an
+        # empty terminal capture this tuple is empty; for any non-empty capture
+        # it includes the root and stops before the complete transcript.
+        prefix_count = min(history_length, complete_length - 1) + 1
+        prefix_nodes = tuple(path_nodes[:prefix_count]) if complete_length else ()
+        covered_leaf_ids = {
+            leaf_id for node in prefix_nodes for leaf_id in node.endpoint_leaf_ids
+        }
 
-    leaves = [snapshot for candidates in active.values() for snapshot in candidates]
-    ordered = sorted(leaves, key=_stable_key)
+        # Remove covered leaves from the index before inserting the new leaf.
+        # Endpoint paths stay on trie nodes because later divergent branches
+        # must inherit them, but the heavy Snapshot is released immediately.
+        for leaf_id in covered_leaf_ids:
+            candidate = leaves.pop(leaf_id, None)
+            if candidate is None:
+                continue
+            for node in candidate.prefix_nodes:
+                node.extender_count -= 1
+            candidate.endpoint_node.endpoint_leaf_ids.discard(leaf_id)
+        if covered_leaf_ids:
+            del candidate
+
+        leaf_id = next_leaf_id
+        next_leaf_id += 1
+        leaves[leaf_id] = _IndexedLeaf(
+            snapshot=snapshot,
+            prefix_nodes=prefix_nodes,
+            endpoint_node=endpoint_node,
+        )
+        for node in prefix_nodes:
+            node.extender_count += 1
+        endpoint_node.endpoint_leaf_ids.add(leaf_id)
+        # Each input path is stored at exactly one endpoint. This is the
+        # irreducible lineage payload required by the return contract; unlike
+        # the old active-leaf representation it does not retain the Snapshot.
+        endpoint_node.ending_paths.add(snapshot.source_path)
+
+    active_leaves = sorted(
+        leaves.items(), key=lambda item: _stable_key(item[1].snapshot)
+    )
+    ordered = [leaf.snapshot for _, leaf in active_leaves]
     leaf_paths = {snapshot.source_path for snapshot in ordered}
     return StreamingAggregationResult(
         leaves=tuple(ordered),
         contributor_paths={
-            snapshot.source_path: tuple(sorted(contributors[snapshot.source_path]))
-            for snapshot in ordered
+            leaf.snapshot.source_path: tuple(
+                sorted(
+                    {
+                        leaf.snapshot.source_path,
+                        *(
+                            path
+                            for node in leaf.prefix_nodes
+                            for path in node.ending_paths
+                        ),
+                    }
+                )
+            )
+            for _, leaf in active_leaves
         },
         intermediate_paths=tuple(
             sorted(path for path in all_paths if path not in leaf_paths)

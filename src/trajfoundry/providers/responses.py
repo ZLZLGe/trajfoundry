@@ -2315,9 +2315,21 @@ def parse_responses_capture(
         harness = "unknown"
 
     if not session_id:
-        _issue(issues, "missing_session_id", "session_id", "capture has no session id")
+        _issue(
+            issues,
+            "missing_session_id",
+            "session_id",
+            "capture has no session id",
+            severity=Severity.WARNING,
+        )
     if not thread_id:
-        _issue(issues, "missing_thread_id", "request_body", "capture has no thread id")
+        _issue(
+            issues,
+            "missing_thread_id",
+            "request_body",
+            "capture has no thread id",
+            severity=Severity.WARNING,
+        )
 
     if transport_error:
         outcome = "transport_error"

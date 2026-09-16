@@ -207,9 +207,9 @@ def adapt_deepinfra_envelope(value: object) -> dict[str, Any]:
     """Validate and project one Deep Infra archive record.
 
     Request metadata remains inside the provider body and is authoritative.
-    Sanitized transport identity is used only as a fallback.  Captures with no
-    semantic session are isolated by request id so unrelated users or requests
-    can never be merged accidentally.
+    Sanitized transport identity is used only as a fallback.  A request id is
+    retained only as request identity; it must never stand in for a missing
+    semantic session.
     """
 
     root = _mapping(value, path="$")
@@ -288,8 +288,8 @@ def adapt_deepinfra_envelope(value: object) -> dict[str, Any]:
 
     body_session = _body_identity(request_body, "session_id")
     header_session = _header_identity(request_headers, "session_id")
-    if not body_session:
-        capture["session_id"] = header_session or request_id
+    if not body_session and header_session:
+        capture["session_id"] = header_session
 
     body_thread = _body_identity(request_body, "thread_id")
     header_thread = _header_identity(request_headers, "thread_id")

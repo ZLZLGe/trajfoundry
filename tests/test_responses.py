@@ -2018,3 +2018,26 @@ def test_main_thread_without_explicit_thread_id_uses_session_id() -> None:
     )
 
     assert snapshot.thread_id == "capture-session"
+
+
+def test_missing_session_and_thread_ids_are_warnings_not_capture_failures() -> None:
+    capture = _capture(
+        request_body={"model": "gpt-test", "input": [], "tools": []},
+        response_body={"status": "completed", "output": []},
+    )
+    capture.pop("session_id", None)
+
+    snapshot = _parse(capture)
+
+    assert snapshot.session_id == ""
+    assert snapshot.thread_id == ""
+    identity_issues = {
+        issue.code: issue
+        for issue in snapshot.issues
+        if issue.code in {"missing_session_id", "missing_thread_id"}
+    }
+    assert set(identity_issues) == {"missing_session_id", "missing_thread_id"}
+    assert all(issue.severity == Severity.WARNING for issue in identity_issues.values())
+    assert snapshot.request_id == "request-1"
+    assert snapshot.outcome == "success"
+    assert snapshot.wire_complete is True
