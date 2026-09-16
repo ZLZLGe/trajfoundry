@@ -1089,6 +1089,293 @@ def test_agent_alias_is_valid_spawn_evidence() -> None:
     assert plan.orphan_indices == ()
 
 
+def test_missing_spawn_turn_id_with_empty_call_id_is_not_thread_wide() -> None:
+    call = anthropic_spawn("", "research")
+    event = snapshot(
+        "event",
+        thread="main",
+        turn="",
+        response=[assistant(calls=[call])],
+    )
+    affected = snapshot(
+        "affected",
+        thread="main",
+        turn="",
+        history=[user("affected"), assistant(calls=[call])],
+        response=[assistant("done")],
+    )
+    unaffected = snapshot(
+        "unaffected",
+        thread="main",
+        turn="",
+        history=[user("unaffected")],
+        response=[assistant("done")],
+    )
+
+    result = mount_subagents(
+        [
+            SnapshotTrajectory(affected, node(affected)),
+            SnapshotTrajectory(unaffected, node(unaffected)),
+        ],
+        all_snapshots=[event, affected, unaffected],
+    )
+
+    by_source = {root.source: root for root in result.roots}
+    assert "spawn_missing_turn_id" in (
+        by_source["affected.json"].normalization_audit.reason_codes
+    )
+    assert by_source["unaffected.json"].normalization_audit is not None
+    assert by_source["unaffected.json"].normalization_audit.tag.value == "pass"
+
+
+def test_missing_spawn_turn_id_marks_every_branch_containing_same_call() -> None:
+    call = anthropic_spawn("shared-call", "research")
+    event = snapshot(
+        "event",
+        thread="main",
+        turn="",
+        response=[assistant(calls=[call])],
+    )
+    branches = [
+        snapshot(
+            f"branch-{suffix}",
+            thread="main",
+            turn="",
+            history=[
+                user("shared"),
+                assistant(calls=[call]),
+                user(f"branch {suffix}"),
+            ],
+            response=[assistant("done")],
+        )
+        for suffix in ("a", "b")
+    ]
+
+    result = mount_subagents(
+        [SnapshotTrajectory(item, node(item)) for item in branches],
+        all_snapshots=[event, *branches],
+    )
+
+    assert result.plan.edges == ()
+    diagnostics = [
+        diagnostic
+        for diagnostic in result.plan.diagnostics
+        if diagnostic.code == "spawn_missing_turn_id"
+    ]
+    assert [diagnostic.spawn_call_id for diagnostic in diagnostics] == ["shared-call"]
+    assert all(
+        root.normalization_audit is not None
+        and "spawn_missing_turn_id" in root.normalization_audit.reason_codes
+        for root in result.roots
+    )
+
+
+def test_spawn_diagnostics_are_scoped_to_session() -> None:
+    call = anthropic_spawn("same-call", "research")
+
+    session_a_event = snapshot(
+        "session-a-event",
+        thread="main",
+        turn="",
+        response=[assistant(calls=[call])],
+    ).model_copy(update={"session_id": "session-a"})
+    session_a_leaf = snapshot(
+        "session-a-leaf",
+        thread="main",
+        turn="",
+        history=[user("session a"), assistant(calls=[call])],
+        response=[assistant("done")],
+    ).model_copy(update={"session_id": "session-a"})
+
+    session_b_event = snapshot(
+        "session-b-event",
+        thread="main",
+        turn="turn-b",
+        response=[assistant(calls=[call])],
+    ).model_copy(update={"session_id": "session-b"})
+    session_b_parent = snapshot(
+        "session-b-parent",
+        thread="main",
+        turn="turn-b-next",
+        history=[user("session b"), assistant(calls=[call])],
+        response=[assistant("done")],
+    ).model_copy(update={"session_id": "session-b"})
+    session_b_child = snapshot(
+        "session-b-child",
+        thread="child-b",
+        turn="child-turn",
+        response=[assistant("child done")],
+        parent_thread="main",
+        parent_turn="turn-b",
+        forked_from="main",
+        marker="same-call",
+    ).model_copy(update={"session_id": "session-b"})
+
+    result = mount_subagents(
+        [
+            SnapshotTrajectory(session_a_leaf, node(session_a_leaf)),
+            SnapshotTrajectory(session_b_parent, node(session_b_parent)),
+            SnapshotTrajectory(session_b_child, node(session_b_child)),
+        ],
+        all_snapshots=[
+            session_a_event,
+            session_a_leaf,
+            session_b_event,
+            session_b_parent,
+            session_b_child,
+        ],
+    )
+
+    by_source = {root.source: root for root in result.roots}
+    assert "spawn_missing_turn_id" in (
+        by_source["session-a-leaf.json"].normalization_audit.reason_codes
+    )
+    session_b_root = by_source["session-b-parent.json"]
+    assert session_b_root.normalization_audit is not None
+    assert (
+        "spawn_missing_turn_id" not in session_b_root.normalization_audit.reason_codes
+    )
+    assert session_b_root.sub_agent_trajectory
+
+
+def test_missing_spawn_call_id_is_scoped_to_call_signature() -> None:
+    affected_call = anthropic_spawn("", "research")
+    unrelated_call = anthropic_spawn("", "tests")
+    event = snapshot(
+        "missing-call-event",
+        thread="main",
+        turn="turn-1",
+        response=[assistant(calls=[affected_call])],
+    )
+    affected = snapshot(
+        "missing-call-affected",
+        thread="main",
+        turn="turn-2",
+        history=[user("affected"), assistant(calls=[affected_call])],
+        response=[assistant("done")],
+    )
+    unrelated = snapshot(
+        "missing-call-unrelated",
+        thread="main",
+        turn="turn-3",
+        history=[user("unrelated"), assistant(calls=[unrelated_call])],
+        response=[assistant("done")],
+    )
+
+    result = mount_subagents(
+        [
+            SnapshotTrajectory(affected, node(affected)),
+            SnapshotTrajectory(unrelated, node(unrelated)),
+        ],
+        all_snapshots=[event, affected, unrelated],
+    )
+
+    by_source = {root.source: root for root in result.roots}
+    assert "spawn_missing_call_id" in (
+        by_source["missing-call-affected.json"].normalization_audit.reason_codes
+    )
+    unrelated_audit = by_source["missing-call-unrelated.json"].normalization_audit
+    assert unrelated_audit is not None
+    assert "spawn_missing_call_id" not in unrelated_audit.reason_codes
+
+
+def test_missing_spawn_call_id_conservatively_marks_same_signature() -> None:
+    call = anthropic_spawn("", "research")
+    event = snapshot(
+        "same-signature-event",
+        thread="main",
+        turn="turn-1",
+        response=[assistant(calls=[call])],
+    )
+    branches = [
+        snapshot(
+            f"same-signature-{suffix}",
+            thread="main",
+            turn=f"turn-{suffix}",
+            history=[user(suffix), assistant(calls=[call])],
+            response=[assistant("done")],
+        )
+        for suffix in ("a", "b")
+    ]
+
+    result = mount_subagents(
+        [SnapshotTrajectory(item, node(item)) for item in branches],
+        all_snapshots=[event, *branches],
+    )
+
+    assert all(
+        root.normalization_audit is not None
+        and "spawn_missing_call_id" in root.normalization_audit.reason_codes
+        for root in result.roots
+    )
+
+
+def test_missing_parent_leaf_keeps_same_turn_leaf_quarantined() -> None:
+    call = spawn("lost-call", "research")
+    event = snapshot(
+        "lost-parent-event",
+        thread="main",
+        turn="turn-1",
+        response=[assistant(calls=[call])],
+    )
+    leaf = snapshot(
+        "lost-parent-leaf",
+        thread="main",
+        turn="turn-1",
+        response=[assistant("done")],
+    )
+
+    result = mount_subagents(
+        [SnapshotTrajectory(leaf, node(leaf))],
+        all_snapshots=[event, leaf],
+    )
+
+    root = result.roots[0]
+    assert root.normalization_audit is not None
+    assert "missing_parent_leaf" in root.normalization_audit.reason_codes
+
+
+def test_missing_spawn_turn_id_does_not_match_same_signature_with_valid_id() -> None:
+    missing_id_call = anthropic_spawn("", "research")
+    valid_id_call = anthropic_spawn("valid-call", "research")
+    event = snapshot(
+        "missing-turn-event",
+        thread="main",
+        turn="",
+        response=[assistant(calls=[missing_id_call])],
+    )
+    affected = snapshot(
+        "missing-turn-affected",
+        thread="main",
+        turn="turn-1",
+        history=[user("affected"), assistant(calls=[missing_id_call])],
+        response=[assistant("done")],
+    )
+    valid = snapshot(
+        "missing-turn-valid-id",
+        thread="main",
+        turn="turn-2",
+        history=[user("valid"), assistant(calls=[valid_id_call])],
+        response=[assistant("done")],
+    )
+
+    result = mount_subagents(
+        [
+            SnapshotTrajectory(affected, node(affected)),
+            SnapshotTrajectory(valid, node(valid)),
+        ],
+        all_snapshots=[event, affected, valid],
+    )
+
+    by_source = {root.source: root for root in result.roots}
+    assert "spawn_missing_turn_id" in (
+        by_source["missing-turn-affected.json"].normalization_audit.reason_codes
+    )
+    valid_audit = by_source["missing-turn-valid-id.json"].normalization_audit
+    assert valid_audit is not None
+    assert "spawn_missing_turn_id" not in valid_audit.reason_codes
+
+
 def test_opaque_marker_does_not_guess_between_multiple_spawn_calls() -> None:
     calls = [spawn("call-a", "a"), spawn("call-b", "b")]
     parent = snapshot(

@@ -46,10 +46,14 @@ from .sources.sxf import SXFError, adapt_sxf_envelope
 from .sources.tokenplan import TokenPlanError, adapt_tokenplan_envelope
 from .state import StateStore
 from .streaming import streaming_prefix_leaves
-from .subagents import SubagentMountPlan, plan_subagent_mounts
+from .subagents import (
+    SubagentMountPlan,
+    diagnostic_applies_to_snapshot,
+    plan_subagent_mounts,
+)
 from .tool_names import is_spawn_tool_name
 
-NORMALIZER_REVISION = "2026-09-16.2"
+NORMALIZER_REVISION = "2026-09-17.1"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 _INGEST_BATCH_ITEMS = 512
@@ -632,16 +636,7 @@ def _mount_issues_by_index(
             targets.update(
                 index
                 for index, leaf in enumerate(plan.leaves)
-                if leaf.thread_id == diagnostic.parent_thread_id
-                and (
-                    not diagnostic.parent_turn_id
-                    or leaf.turn_id == diagnostic.parent_turn_id
-                    or any(
-                        call.id == diagnostic.spawn_call_id
-                        for message in (*leaf.history, *leaf.response)
-                        for call in (message.tool_calls or [])
-                    )
-                )
+                if diagnostic_applies_to_snapshot(diagnostic, leaf)
             )
         for index in targets:
             issues_by_index[index].append(

@@ -1067,6 +1067,110 @@ def test_normalization_lock_rejects_a_concurrent_writer(tmp_path: Path) -> None:
         pass
 
 
+def test_missing_spawn_turn_id_only_quarantines_affected_branch(
+    tmp_path: Path,
+) -> None:
+    spawn = ToolCall(
+        id="spawn-a",
+        function=FunctionCall(
+            name="Agent",
+            arguments={"task_name": "child", "message": "do work"},
+        ),
+    )
+    spawn_message = Message(
+        role="assistant",
+        content="",
+        reasoning_content="",
+        tool_calls=[spawn],
+    )
+    spawn_result = Message(
+        role="tool",
+        content="done",
+        tool_call_id="spawn-a",
+        name="Agent",
+    )
+    final = Message(role="assistant", content="finished", reasoning_content="")
+    spawn_definition = ToolDefinition(
+        name="Agent",
+        parameters={
+            "type": "object",
+            "properties": {
+                "task_name": {"type": "string"},
+                "message": {"type": "string"},
+            },
+            "required": ["task_name", "message"],
+        },
+    )
+
+    def snapshot(
+        name: str,
+        *,
+        history: list[Message],
+        response: list[Message],
+        tools: list[ToolDefinition] | None = None,
+    ) -> Snapshot:
+        return Snapshot(
+            source_path=f"/input/{name}.json",
+            source_sha256=name,
+            session_id="session",
+            thread_id="main",
+            turn_id="",
+            provider="anthropic",
+            operation="messages",
+            outcome="success",
+            captured_at=f"2026-08-24T00:00:0{len(history)}Z",
+            request_id=name,
+            model="test-model",
+            user_id="user",
+            history=history,
+            response=response,
+            tools=tools or [],
+            termination="end_turn",
+            wire_complete=True,
+        )
+
+    spawn_user = Message(role="user", content="spawn branch")
+    event = snapshot(
+        "spawn-event",
+        history=[spawn_user],
+        response=[spawn_message],
+        tools=[spawn_definition],
+    )
+    spawn_leaf = snapshot(
+        "spawn-leaf",
+        history=[spawn_user, spawn_message, spawn_result],
+        response=[final],
+        tools=[spawn_definition],
+    )
+    plain_leaf = snapshot(
+        "plain-leaf",
+        history=[Message(role="user", content="plain branch")],
+        response=[final],
+    )
+
+    with StateStore(tmp_path / "state.sqlite") as state:
+        for item in (event, spawn_leaf, plain_leaf):
+            state.put_snapshot(item, endpoint="/v1/messages")
+        stats = PipelineStats()
+        _build_trajectories(state, stats)
+        stored = list(state.iter_trajectories())
+
+    assert stats.prefix_intermediates == 1
+    assert stats.leaf_snapshots == 2
+    assert stats.stored_trajectories == 2
+    by_first_message = {node.messages[0].content: node for _, node, _ in stored}
+    affected = by_first_message["spawn branch"]
+    unaffected = by_first_message["plain branch"]
+    assert affected.normalization_audit is not None
+    assert affected.normalization_audit.reason_codes == [
+        "incomplete_subagent_mount",
+        "spawn_missing_turn_id",
+    ]
+    assert unaffected.normalization_audit is not None
+    assert unaffected.normalization_audit.tag == AuditTag.PASS
+    assert unaffected.normalization_audit.reason_codes == []
+
+
 def test_duplicate_child_leaf_is_merged_before_mounting(tmp_path: Path) -> None:
     spawn = ToolCall(
         id="spawn-1",

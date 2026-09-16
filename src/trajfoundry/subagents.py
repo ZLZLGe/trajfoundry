@@ -41,6 +41,13 @@ class MountDiagnostic:
     parent_thread_id: str = ""
     parent_turn_id: str = ""
     spawn_call_id: str = ""
+    # The fields below are appended to preserve compatibility with older
+    # positional construction of this internal diagnostic type.  A diagnostic
+    # without a session remains usable as a legacy wildcard; newly emitted
+    # diagnostics always carry the session that supplied the evidence.
+    session_id: str = ""
+    spawn_call_name: str = ""
+    spawn_arguments_json: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +63,7 @@ class SpawnEvidence:
     agent_name_conflicted: bool
     arguments_json: str
     source_path: str
+    spawn_call_name: str = ""
 
     @property
     def key(self) -> tuple[str, str, str, str]:
@@ -248,6 +256,25 @@ def _spawn_calls(messages: Sequence[Message]) -> list[ToolCall]:
     return result
 
 
+def _spawn_call_signature(call: ToolCall) -> tuple[str, str]:
+    """Return the stable function/arguments fingerprint for one spawn call."""
+
+    # Providers use ``Agent``, ``spawn_agent``, and namespaced spawn-agent
+    # aliases for the same operation.  Treat those names as one signature so
+    # a replay from a different provider adapter remains attributable.
+    name = (
+        "spawn_agent" if is_spawn_tool_name(call.function.name) else call.function.name
+    )
+    arguments, malformed = _as_object(call.function.arguments)
+    if malformed or arguments is None:
+        # Preserve malformed values in the fingerprint instead of collapsing
+        # every invalid call to the same empty object.
+        arguments_payload: Any = {"raw": call.function.arguments}
+    else:
+        arguments_payload = arguments
+    return name, _canonical_json(arguments_payload)
+
+
 def _spawn_agent_result_names(
     snapshots: Sequence[Snapshot],
 ) -> dict[tuple[str, str, str, str], set[str]]:
@@ -366,6 +393,7 @@ def _agent_message_index(
                 leaf_index=targets[0] if len(targets) == 1 else None,
                 related_leaf_indices=tuple(targets) if len(targets) > 1 else (),
                 parent_thread_id=thread_id,
+                session_id=session_id,
             )
         )
     for key in sorted(conflict_ids):
@@ -382,6 +410,7 @@ def _agent_message_index(
                 leaf_index=targets[0] if len(targets) == 1 else None,
                 related_leaf_indices=tuple(targets) if len(targets) > 1 else (),
                 parent_thread_id=thread_id,
+                session_id=session_id,
             )
         )
     return (
@@ -414,14 +443,83 @@ def _is_subagent(snapshot: Snapshot) -> bool:
     )
 
 
+def diagnostic_applies_to_snapshot(
+    diagnostic: MountDiagnostic, snapshot: Snapshot
+) -> bool:
+    """Return whether a thread-level mount diagnostic affects one leaf."""
+
+    if diagnostic.session_id and diagnostic.session_id != snapshot.session_id:
+        return False
+    if (
+        not diagnostic.parent_thread_id
+        or diagnostic.parent_thread_id != snapshot.thread_id
+    ):
+        return False
+
+    spawn_calls = _spawn_calls((*snapshot.history, *snapshot.response))
+    if diagnostic.spawn_call_id:
+        # A provider call id is the primary identity.  Do not additionally
+        # require equal arguments: conflicting replays with the same id are
+        # precisely the branches that conflict diagnostics must still reach.
+        if any(call.id == diagnostic.spawn_call_id for call in spawn_calls):
+            return True
+        # ``missing_parent_leaf`` means the indexed intermediate event was
+        # lost before maximal-leaf selection.  There is no call to match in
+        # that leaf, so retain the historical same-turn fallback; otherwise a
+        # missing parent would silently become a clean main trajectory.
+        if diagnostic.code == "missing_parent_leaf" and diagnostic.parent_turn_id:
+            return diagnostic.parent_turn_id == snapshot.turn_id
+        return False
+
+    has_spawn_signature = bool(diagnostic.spawn_call_name) and bool(
+        diagnostic.spawn_arguments_json
+    )
+
+    def matches_spawn(call: ToolCall) -> bool:
+        if (
+            diagnostic.code in {"spawn_missing_call_id", "spawn_missing_turn_id"}
+            and call.id
+        ):
+            return False
+        name, arguments_json = _spawn_call_signature(call)
+        return (
+            name == diagnostic.spawn_call_name
+            and arguments_json == diagnostic.spawn_arguments_json
+        )
+
+    if has_spawn_signature:
+        # Without a call id, identical structured calls cannot be distinguished
+        # across branches.  Mark every leaf containing that signature rather
+        # than guessing which branch supplied the diagnostic.
+        return any(matches_spawn(call) for call in spawn_calls)
+    if diagnostic.code == "spawn_missing_call_id":
+        # Older callers may construct a diagnostic without a signature.  In
+        # that compatibility path, a known parent turn is still a useful
+        # boundary; newly emitted diagnostics use the signature above so a
+        # cumulative leaf can be matched even when its own turn_id advanced.
+        if diagnostic.parent_turn_id and diagnostic.parent_turn_id != snapshot.turn_id:
+            return False
+        return any(not call.id for call in spawn_calls)
+    if diagnostic.code == "spawn_missing_turn_id":
+        # New diagnostics always carry a call id or signature.  A legacy
+        # diagnostic without either cannot be attributed to a branch safely.
+        return False
+    if diagnostic.parent_turn_id:
+        return diagnostic.parent_turn_id == snapshot.turn_id
+    return True
+
+
 def _diagnostic_sort_key(diagnostic: MountDiagnostic) -> tuple[Any, ...]:
     return (
         diagnostic.code,
         -1 if diagnostic.leaf_index is None else diagnostic.leaf_index,
         diagnostic.related_leaf_indices,
+        diagnostic.session_id,
         diagnostic.parent_thread_id,
         diagnostic.parent_turn_id,
         diagnostic.spawn_call_id,
+        diagnostic.spawn_call_name,
+        diagnostic.spawn_arguments_json,
         diagnostic.detail,
     )
 
@@ -438,15 +536,25 @@ def _extract_spawn_evidence(
     for snapshot in sorted(snapshots, key=_leaf_key):
         calls = _spawn_calls(snapshot.response)
         if calls and not snapshot.turn_id:
-            diagnostics.append(
-                MountDiagnostic(
-                    code="spawn_missing_turn_id",
-                    detail=f"spawn response in {snapshot.source_path!r} has no turn_id",
-                    parent_thread_id=snapshot.thread_id,
+            for call in calls:
+                call_name, call_arguments_json = _spawn_call_signature(call)
+                diagnostics.append(
+                    MountDiagnostic(
+                        code="spawn_missing_turn_id",
+                        detail=(
+                            f"spawn call {call.id!r} in {snapshot.source_path!r} "
+                            "has no turn_id"
+                        ),
+                        parent_thread_id=snapshot.thread_id,
+                        spawn_call_id=call.id,
+                        session_id=snapshot.session_id,
+                        spawn_call_name=call_name,
+                        spawn_arguments_json=call_arguments_json,
+                    )
                 )
-            )
             continue
         for call in calls:
+            call_name, call_arguments_json = _spawn_call_signature(call)
             if not call.id:
                 diagnostics.append(
                     MountDiagnostic(
@@ -454,6 +562,9 @@ def _extract_spawn_evidence(
                         detail=f"spawn response in {snapshot.source_path!r} has no call id",
                         parent_thread_id=snapshot.thread_id,
                         parent_turn_id=snapshot.turn_id,
+                        session_id=snapshot.session_id,
+                        spawn_call_name=call_name,
+                        spawn_arguments_json=call_arguments_json,
                     )
                 )
                 continue
@@ -466,6 +577,9 @@ def _extract_spawn_evidence(
                         parent_thread_id=snapshot.thread_id,
                         parent_turn_id=snapshot.turn_id,
                         spawn_call_id=call.id,
+                        session_id=snapshot.session_id,
+                        spawn_call_name=call_name,
+                        spawn_arguments_json=call_arguments_json,
                     )
                 )
                 arguments = {}
@@ -490,6 +604,9 @@ def _extract_spawn_evidence(
                         parent_thread_id=snapshot.thread_id,
                         parent_turn_id=snapshot.turn_id,
                         spawn_call_id=call.id,
+                        session_id=snapshot.session_id,
+                        spawn_call_name=call_name,
+                        spawn_arguments_json=call_arguments_json,
                     )
                 )
             agent_name = (
@@ -505,6 +622,7 @@ def _extract_spawn_evidence(
                 agent_name_conflicted=len(canonical_names) > 1,
                 arguments_json=_canonical_json(arguments),
                 source_path=snapshot.source_path,
+                spawn_call_name=call_name,
             )
             existing = by_key.get(event.key)
             if existing is None:
@@ -512,6 +630,7 @@ def _extract_spawn_evidence(
             elif (
                 existing.arguments_json != event.arguments_json
                 or existing.task_name != event.task_name
+                or existing.spawn_call_name != event.spawn_call_name
             ):
                 conflicts.add(event.key)
 
@@ -524,6 +643,9 @@ def _extract_spawn_evidence(
                 parent_thread_id=event.parent_thread_id,
                 parent_turn_id=event.parent_turn_id,
                 spawn_call_id=event.spawn_call_id,
+                session_id=event.session_id,
+                spawn_call_name=event.spawn_call_name,
+                spawn_arguments_json=event.arguments_json,
             )
         )
     events = tuple(
@@ -557,6 +679,7 @@ def _validate_child(
                 parent_thread_id=snapshot.parent_thread_id,
                 parent_turn_id=snapshot.parent_turn_id,
                 spawn_call_id=marker.spawn_call_id,
+                session_id=snapshot.session_id,
             )
         )
 
@@ -694,6 +817,7 @@ def _attach_relay_ids(
                         parent_thread_id=parent.thread_id,
                         parent_turn_id=edge.parent_turn_id,
                         spawn_call_id=edge.spawn_call_id,
+                        session_id=parent.session_id,
                     )
                 )
                 continue
@@ -710,6 +834,7 @@ def _attach_relay_ids(
                         parent_thread_id=parent.thread_id,
                         parent_turn_id=edge.parent_turn_id,
                         spawn_call_id=edge.spawn_call_id,
+                        session_id=parent.session_id,
                     )
                 )
                 continue
@@ -725,6 +850,7 @@ def _attach_relay_ids(
                         parent_thread_id=parent.thread_id,
                         parent_turn_id=edge.parent_turn_id,
                         spawn_call_id=edge.spawn_call_id,
+                        session_id=parent.session_id,
                     )
                 )
                 continue
@@ -760,6 +886,7 @@ def _attach_relay_ids(
                         ),
                         leaf_index=parent_index,
                         parent_thread_id=parent.thread_id,
+                        session_id=parent.session_id,
                     )
                 )
 
@@ -793,6 +920,7 @@ def _attach_relay_ids(
                         parent_thread_id=parent.thread_id,
                         parent_turn_id=edge.parent_turn_id,
                         spawn_call_id=edge.spawn_call_id,
+                        session_id=parent.session_id,
                     )
                 )
                 updated.append(edge)
@@ -814,6 +942,7 @@ def _attach_relay_ids(
                         parent_thread_id=parent.thread_id,
                         parent_turn_id=edge.parent_turn_id,
                         spawn_call_id=edge.spawn_call_id,
+                        session_id=parent.session_id,
                     )
                 )
                 updated.append(edge)
@@ -830,6 +959,7 @@ def _attach_relay_ids(
                         parent_thread_id=parent.thread_id,
                         parent_turn_id=edge.parent_turn_id,
                         spawn_call_id=edge.spawn_call_id,
+                        session_id=parent.session_id,
                     )
                 )
                 updated.append(edge)
@@ -847,6 +977,7 @@ def _attach_relay_ids(
                         parent_thread_id=parent.thread_id,
                         parent_turn_id=edge.parent_turn_id,
                         spawn_call_id=edge.spawn_call_id,
+                        session_id=parent.session_id,
                     )
                 )
                 updated.append(edge)
@@ -877,6 +1008,7 @@ def _attach_relay_ids(
                         sorted(edge.child_index for edge in values)
                     ),
                     parent_thread_id=leaves[parent_index].thread_id,
+                    session_id=leaves[parent_index].session_id,
                 )
             )
         updated = [
@@ -964,6 +1096,9 @@ def plan_subagent_mounts(
                     parent_thread_id=event.parent_thread_id,
                     parent_turn_id=event.parent_turn_id,
                     spawn_call_id=event.spawn_call_id,
+                    session_id=event.session_id,
+                    spawn_call_name=event.spawn_call_name,
+                    spawn_arguments_json=event.arguments_json,
                 )
             )
         elif len(candidates) > 1:
@@ -978,6 +1113,9 @@ def plan_subagent_mounts(
                     parent_thread_id=event.parent_thread_id,
                     parent_turn_id=event.parent_turn_id,
                     spawn_call_id=event.spawn_call_id,
+                    session_id=event.session_id,
+                    spawn_call_name=event.spawn_call_name,
+                    spawn_arguments_json=event.arguments_json,
                 )
             )
         else:
@@ -1040,6 +1178,7 @@ def plan_subagent_mounts(
                     leaf_index=child_index,
                     parent_thread_id=child.parent_thread_id,
                     parent_turn_id=child.parent_turn_id,
+                    session_id=child.session_id,
                 )
             )
 
@@ -1074,6 +1213,7 @@ def plan_subagent_mounts(
                         leaf_index=index,
                         parent_thread_id=canonical_leaves[index].parent_thread_id,
                         parent_turn_id=canonical_leaves[index].parent_turn_id,
+                        session_id=canonical_leaves[index].session_id,
                     )
                 )
 
@@ -1101,6 +1241,7 @@ def plan_subagent_mounts(
                     leaf_index=child_index,
                     parent_thread_id=child.parent_thread_id,
                     parent_turn_id=child.parent_turn_id,
+                    session_id=child.session_id,
                 )
             )
             invalid_children.add(child_index)
@@ -1137,6 +1278,7 @@ def plan_subagent_mounts(
                     parent_thread_id=child.parent_thread_id,
                     parent_turn_id=child.parent_turn_id,
                     spawn_call_id=marker.spawn_call_id,
+                    session_id=child.session_id,
                 )
             )
             invalid_children.add(child_index)
@@ -1161,6 +1303,7 @@ def plan_subagent_mounts(
                     parent_thread_id=child.parent_thread_id,
                     parent_turn_id=child.parent_turn_id,
                     spawn_call_id=marker.spawn_call_id,
+                    session_id=child.session_id,
                 )
             )
             invalid_children.add(child_index)
@@ -1185,6 +1328,7 @@ def plan_subagent_mounts(
                         parent_thread_id=child.parent_thread_id,
                         parent_turn_id=child.parent_turn_id,
                         spawn_call_id=marker.spawn_call_id,
+                        session_id=child.session_id,
                     )
                 )
                 invalid_children.add(child_index)
@@ -1199,6 +1343,7 @@ def plan_subagent_mounts(
                     leaf_index=child_index,
                     parent_thread_id=child.parent_thread_id,
                     parent_turn_id=child.parent_turn_id,
+                    session_id=child.session_id,
                 )
             )
             invalid_children.add(child_index)
@@ -1244,6 +1389,7 @@ def plan_subagent_mounts(
                     parent_thread_id=canonical_leaves[parent_index].thread_id,
                     parent_turn_id=edge.parent_turn_id,
                     spawn_call_id=call_id,
+                    session_id=canonical_leaves[parent_index].session_id,
                 )
             )
 
@@ -1258,6 +1404,7 @@ def plan_subagent_mounts(
                     related_leaf_indices=tuple(sorted(cycle_members)),
                     parent_thread_id=canonical_leaves[index].parent_thread_id,
                     parent_turn_id=canonical_leaves[index].parent_turn_id,
+                    session_id=canonical_leaves[index].session_id,
                 )
             )
         invalid_children.update(cycle_members)
@@ -1299,6 +1446,7 @@ def plan_subagent_mounts(
                 leaf_index=index,
                 parent_thread_id=canonical_leaves[index].parent_thread_id,
                 parent_turn_id=canonical_leaves[index].parent_turn_id,
+                session_id=canonical_leaves[index].session_id,
             )
         )
     # Do not silently preserve edges into an orphan component as if mounted.
@@ -1331,6 +1479,9 @@ def plan_subagent_mounts(
                 parent_thread_id=event.parent_thread_id,
                 parent_turn_id=event.parent_turn_id,
                 spawn_call_id=event.spawn_call_id,
+                session_id=event.session_id,
+                spawn_call_name=event.spawn_call_name,
+                spawn_arguments_json=event.arguments_json,
             )
         )
 
@@ -1426,6 +1577,7 @@ def mount_subagents(
                     leaf_index=index,
                     parent_thread_id=plan.leaves[index].thread_id,
                     spawn_call_id=call_id,
+                    session_id=plan.leaves[index].session_id,
                 )
             )
     if materialization_diagnostics:
@@ -1450,19 +1602,7 @@ def mount_subagents(
                 or (
                     diagnostic.leaf_index is None
                     and not diagnostic.related_leaf_indices
-                    and diagnostic.parent_thread_id == plan.leaves[index].thread_id
-                    and (
-                        not diagnostic.parent_turn_id
-                        or diagnostic.parent_turn_id == plan.leaves[index].turn_id
-                        or any(
-                            call.id == diagnostic.spawn_call_id
-                            for message in (
-                                *plan.leaves[index].history,
-                                *plan.leaves[index].response,
-                            )
-                            for call in (message.tool_calls or ())
-                        )
-                    )
+                    and diagnostic_applies_to_snapshot(diagnostic, plan.leaves[index])
                 )
             )
         ]
@@ -1538,6 +1678,7 @@ __all__ = [
     "SnapshotTrajectory",
     "SpawnEvidence",
     "SubagentMountPlan",
+    "diagnostic_applies_to_snapshot",
     "mount_subagents",
     "plan_subagent_mounts",
 ]
