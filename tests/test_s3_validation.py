@@ -199,12 +199,29 @@ def test_generated_paths_are_filtered_and_stably_sorted_across_generations() -> 
     ]
 
 
-def test_generated_paths_accept_an_empty_generation_set_without_listing() -> None:
-    client = _Client()
+def test_generated_paths_list_flat_root_for_an_empty_generation_set() -> None:
+    prefix = "normalized/dt=day/"
+    client = _Client(
+        pages_by_prefix={
+            prefix: [
+                {
+                    "Contents": [
+                        {"Key": f"{prefix}session_sub_0.jsonl"},
+                        {"Key": f"{prefix}lineage.jsonl"},
+                        {"Key": f"{prefix}manifest.json"},
+                        {"Key": f"{prefix}generations/{_GEN_A}/lineage.jsonl"},
+                    ]
+                }
+            ]
+        }
+    )
     backend = _backend(client)
 
-    assert tuple(backend.iter_generated_jsonl_paths(frozenset())) == ()
-    assert client.paginator.calls == []
+    assert tuple(backend.iter_generated_jsonl_paths(frozenset())) == (
+        "lineage.jsonl",
+        "session_sub_0.jsonl",
+    )
+    assert client.paginator.calls == [{"Bucket": "bucket", "Prefix": prefix}]
 
 
 @pytest.mark.parametrize("generation_id", ["", "A" * 32, "a" * 31, "../unsafe"])

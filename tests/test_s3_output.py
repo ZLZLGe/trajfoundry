@@ -1,5 +1,4 @@
 import hashlib
-import re
 from typing import Any
 
 import orjson
@@ -7,11 +6,13 @@ import pytest
 
 from trajfoundry.export import SCHEMA_VERSION
 from trajfoundry.models import (
+    AuditIssue,
     AuditTag,
     Message,
     Metadata,
     NormalizationAudit,
     QuarantineRecord,
+    Severity,
     TrajectoryNode,
 )
 from trajfoundry.quality import enrich_trajectory
@@ -163,8 +164,7 @@ def test_small_generation_uses_put_and_returns_unpublished_manifest() -> None:
     )
     manifest = orjson.loads(manifest_bytes)
 
-    assert re.fullmatch(r"[0-9a-f]{32}", output.generation_id)
-    assert manifest["schema_version"] == SCHEMA_VERSION == "trajfoundry-v3"
+    assert manifest["schema_version"] == SCHEMA_VERSION == "trajfoundry-v4"
     assert manifest["counts"] == {
         "accepted": 1,
         "duplicate_trajectories": 1,
@@ -179,11 +179,9 @@ def test_small_generation_uses_put_and_returns_unpublished_manifest() -> None:
     assert manifest["files"] == [
         item.manifest_entry() for item in output.written_objects
     ]
-    assert len(manifest["files"]) == 4
-    assert all(
-        item["path"].startswith(f"generations/{output.generation_id}/")
-        for item in manifest["files"]
-    )
+    assert len(manifest["files"]) == 3
+    assert all("/" not in item["path"] for item in manifest["files"])
+    assert not any("invalid" in item["path"] for item in manifest["files"])
     assert all(name == "put_object" for name, _ in client.calls)
     assert (
         _location().bucket,
@@ -203,9 +201,7 @@ def test_empty_generation_creates_only_empty_lineage() -> None:
         output.close(input_root="s3://bucket/input/", config_hash="config")
     )
 
-    assert [item["path"] for item in manifest["files"]] == [
-        f"generations/{output.generation_id}/lineage.jsonl"
-    ]
+    assert [item["path"] for item in manifest["files"]] == ["lineage.jsonl"]
     description = output.written_objects[0]
     assert description.bytes == 0
     assert client.objects[(description.bucket, description.key)] == b""
@@ -214,26 +210,79 @@ def test_empty_generation_creates_only_empty_lineage() -> None:
     )
 
 
-def test_jsonl_rollover_does_not_split_lines() -> None:
+def test_each_trajectory_is_one_root_jsonl_object() -> None:
     client = FakeS3Client()
-    output = S3OutputSet(client, _location(), max_shard_bytes=1)
+    output = S3OutputSet(client, _location())
     output.write_trajectory(_trajectory("one.json"), [_origin("one.json")])
     output.write_trajectory(_trajectory("two.json"), [_origin("two.json")])
 
     output.close(input_root="s3://bucket/input/", config_hash="config")
 
-    accepted = [
-        item
-        for item in output.written_objects
-        if "/accepted/trajectories-" in item.path
+    trajectories = [
+        item for item in output.written_objects if item.path != "lineage.jsonl"
     ]
-    assert [item.path.rsplit("/", 1)[-1] for item in accepted] == [
-        "trajectories-00000.jsonl",
-        "trajectories-00001.jsonl",
-    ]
+    assert len(trajectories) == 2
+    assert all("/" not in item.path for item in trajectories)
+    assert all(item.path.endswith("_sub_0.jsonl") for item in trajectories)
     assert all(
-        client.objects[(item.bucket, item.key)].count(b"\n") == 1 for item in accepted
+        client.objects[(item.bucket, item.key)].count(b"\n") == 1
+        for item in trajectories
     )
+
+
+def test_s3_rejects_trajectory_over_max_shard_bytes_before_upload() -> None:
+    client = FakeS3Client()
+    output = S3OutputSet(client, _location(), max_shard_bytes=1)
+
+    with pytest.raises(ValueError, match="exceeds max_shard_bytes"):
+        output.write_trajectory(
+            _trajectory("oversized.json"), [_origin("oversized.json")]
+        )
+
+    assert client.calls == []
+    assert output.written_objects == ()
+    output.abort()
+
+
+def test_real_and_synthesized_no_session_ids_have_unambiguous_names() -> None:
+    client = FakeS3Client()
+    output = S3OutputSet(client, _location())
+    literal = _trajectory("literal.json")
+    literal.metadata.session_id = "no_session_id"
+    synthesized = _trajectory("missing.json")
+    synthesized.metadata.session_id = "no_session_id"
+    assert synthesized.normalization_audit is not None
+    synthesized.normalization_audit.issues.append(
+        AuditIssue(
+            code="metadata_session_id_synthesized",
+            stage="aggregation",
+            severity=Severity.WARNING,
+            path="/metadata/session_id",
+        )
+    )
+
+    output.write_trajectory(literal, [_origin("literal.json")])
+    output.write_trajectory(synthesized, [_origin("missing.json")])
+    output.close(input_root="s3://bucket/input/", config_hash="config")
+
+    paths = {item.path for item in output.written_objects}
+    assert "no_session_id_sub_0.jsonl" in paths
+    assert any(
+        path.startswith("no_session_id_")
+        and path != "no_session_id_sub_0.jsonl"
+        and path.endswith("_sub_0.jsonl")
+        for path in paths
+    )
+
+
+def test_unsafe_real_session_id_is_rejected() -> None:
+    node = _trajectory("unsafe.json")
+    node.metadata.session_id = "bad/session"
+
+    with pytest.raises(ValueError, match="session_id must contain"):
+        S3OutputSet(FakeS3Client(), _location()).write_trajectory(
+            node, [_origin("unsafe.json")]
+        )
 
 
 def test_large_object_uses_multipart_and_records_streaming_digest() -> None:

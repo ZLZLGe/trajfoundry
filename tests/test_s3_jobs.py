@@ -35,6 +35,7 @@ class _MemoryS3Client:
     def __init__(self) -> None:
         self.objects: dict[tuple[str, str], bytes] = {}
         self.calls: list[tuple[str, str]] = []
+        self.delete_failures = 0
         self.closed = False
 
     @staticmethod
@@ -71,6 +72,14 @@ class _MemoryS3Client:
         self.calls.append(("put_object", Key))
         self.objects[(Bucket, Key)] = payload
         return {"ETag": self.etag(payload)}
+
+    def delete_object(self, *, Bucket: str, Key: str) -> dict[str, str]:
+        self.calls.append(("delete_object", Key))
+        if self.delete_failures:
+            self.delete_failures -= 1
+            raise OSError("injected delete failure")
+        self.objects.pop((Bucket, Key), None)
+        return {}
 
     def close(self) -> None:
         self.calls.append(("close", ""))
@@ -254,10 +263,22 @@ def test_run_s3_job_streams_valid_generation_then_publishes_manifest_last(
     assert manifest["input_root"].endswith("masked-raw/v001/dt=2026-09-09/")
     assert manifest["input_format"] == "freerouter"
     assert len(manifest["files"]) == 2
-    assert all(path["path"].startswith("generations/") for path in manifest["files"])
+    assert all("/" not in path["path"] for path in manifest["files"])
+    assert any(path["path"] == "session_sub_0.jsonl" for path in manifest["files"])
     put_calls = [call for call in client.calls if call[0] == "put_object"]
     assert put_calls[-1] == ("put_object", manifest_key)
-    assert client.calls[-2] == ("get_object", manifest_key)
+    manifest_get_indices = [
+        index
+        for index, call in enumerate(client.calls)
+        if call == ("get_object", manifest_key)
+    ]
+    assert manifest_get_indices
+    manifest_put_index = max(
+        index
+        for index, call in enumerate(client.calls)
+        if call == ("put_object", manifest_key)
+    )
+    assert manifest_get_indices[-1] == manifest_put_index + 1
     assert client.calls[-1] == ("close", "")
     assert client.closed
 
@@ -350,8 +371,73 @@ def test_run_s3_job_does_not_publish_manifest_when_validation_fails(
         _run(monkeypatch, tmp_path, client)
 
     assert client.objects[("agent-trajectory", manifest_key)] == previous_manifest
-    assert any("/generations/" in key for _, key in client.objects)
+    assert any(key.endswith("_sub_0.jsonl") for _, key in client.objects)
     assert client.closed
+
+
+def test_run_s3_job_removes_only_stale_previous_manifest_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = _MemoryS3Client()
+    bucket = "agent-trajectory"
+    input_key = "lakehouse/free-router/masked-raw/v001/dt=2026-09-09/capture.json"
+    output_prefix = "lakehouse/free-router/normalized/v002/dt=2026-09-09/"
+    old_path = "old-session_sub_0.jsonl"
+    client.objects[(bucket, input_key)] = _capture()
+    client.objects[(bucket, f"{output_prefix}{old_path}")] = b"old\n"
+    client.objects[(bucket, f"{output_prefix}lineage.jsonl")] = b"old lineage\n"
+    client.objects[(bucket, f"{output_prefix}keep.txt")] = b"unrelated"
+    client.objects[(bucket, f"{output_prefix}manifest.json")] = orjson.dumps(
+        {
+            "schema_version": "trajfoundry-v4",
+            "files": [{"path": old_path}, {"path": "lineage.jsonl"}],
+        }
+    )
+
+    result = _run(monkeypatch, tmp_path, client)
+
+    assert result.validation.valid
+    assert (bucket, f"{output_prefix}{old_path}") not in client.objects
+    assert client.objects[(bucket, f"{output_prefix}keep.txt")] == b"unrelated"
+    assert ("delete_object", f"{output_prefix}{old_path}") in client.calls
+
+
+def test_run_s3_job_recovers_after_post_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = _MemoryS3Client()
+    bucket = "agent-trajectory"
+    input_key = "lakehouse/free-router/masked-raw/v001/dt=2026-09-09/capture.json"
+    output_prefix = "lakehouse/free-router/normalized/v002/dt=2026-09-09/"
+    manifest_key = f"{output_prefix}manifest.json"
+    old_path = "old-session_sub_0.jsonl"
+    client.objects[(bucket, input_key)] = _capture()
+    client.objects[(bucket, f"{output_prefix}{old_path}")] = b"old\n"
+    client.objects[(bucket, f"{output_prefix}lineage.jsonl")] = b"old lineage\n"
+    client.objects[(bucket, manifest_key)] = orjson.dumps(
+        {
+            "schema_version": "trajfoundry-v4",
+            "files": [{"path": old_path}, {"path": "lineage.jsonl"}],
+        }
+    )
+    client.delete_failures = 1
+
+    with pytest.raises(OSError, match="post-publication cleanup"):
+        _run(monkeypatch, tmp_path, client)
+
+    # Publication happened, but the failed stale delete must fail the task.
+    published = orjson.loads(client.objects[(bucket, manifest_key)])
+    assert any(entry["path"] == "session_sub_0.jsonl" for entry in published["files"])
+    assert (bucket, f"{output_prefix}{old_path}") in client.objects
+
+    # The next run treats the old object as preflight stale against the now
+    # published manifest and can complete once deletion succeeds.
+    (tmp_path / "retry").mkdir()
+    result = _run(monkeypatch, tmp_path / "retry", client)
+    assert result.validation.valid
+    assert (bucket, f"{output_prefix}{old_path}") not in client.objects
 
 
 def test_run_s3_job_rejects_empty_input_without_writing_output(

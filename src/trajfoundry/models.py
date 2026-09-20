@@ -246,6 +246,7 @@ class Metadata(StrictModel):
     model: str = ""
     user_id: str = ""
     session_id: str = ""
+    sub_session_id: int = Field(default=0, ge=0)
     source_type: Literal["api-router", "traj-cooperate"] = "api-router"
     specific_source: Literal["free-router", "token-plan", "SXF", "deep-infra"] = (
         "free-router"

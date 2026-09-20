@@ -61,7 +61,12 @@ def _envelope() -> dict[str, object]:
 
 def _manifest_file(root: Path, suffix: str) -> Path:
     manifest = orjson.loads((root / "manifest.json").read_bytes())
-    [entry] = [item for item in manifest["files"] if item["path"].endswith(suffix)]
+    if "trajectories-" in suffix:
+        [entry] = [
+            item for item in manifest["files"] if item["path"] != "lineage.jsonl"
+        ]
+    else:
+        [entry] = [item for item in manifest["files"] if item["path"].endswith(suffix)]
     return root / entry["path"]
 
 
@@ -112,6 +117,7 @@ def test_deepinfra_pipeline_adapts_json_object_and_publishes_source_metadata(
         "model": "gpt-deepinfra",
         "user_id": "deepinfra-user",
         "session_id": "deepinfra-session",
+        "sub_session_id": 0,
         "source_type": "api-router",
         "specific_source": "deep-infra",
     }
@@ -155,9 +161,8 @@ def test_deepinfra_adapter_errors_keep_code_and_outer_request_context(
     assert stats.discovered == 1
     assert stats.parsed == 0
     assert stats.parse_failures == 1
-    records_path = _manifest_file(output_root, "/quarantine/records-00000.jsonl")
-    record = orjson.loads(records_path.read_bytes().splitlines()[0])
-    assert record["endpoint"] == "/v1/responses"
-    assert record["captured_at"] == "2026-09-14T01:02:03Z"
-    assert record["normalization_audit"]["reason_codes"] == [reason_code]
+    manifest = orjson.loads((output_root / "manifest.json").read_bytes())
+    assert manifest["counts"]["quarantined_records"] == 1
+    assert manifest["counts"]["reason_counts"] == {reason_code: 1}
+    assert [entry["path"] for entry in manifest["files"]] == ["lineage.jsonl"]
     assert validate_output(output_root).valid

@@ -91,6 +91,21 @@ def _rows(path: Path) -> list[dict[str, object]]:
 
 def _output_file(root: Path, suffix: str) -> Path:
     manifest = orjson.loads((root / "manifest.json").read_bytes())
+    if suffix == "/lineage.jsonl":
+        return root / "lineage.jsonl"
+    expected_tag = None
+    if "/accepted/" in suffix:
+        expected_tag = "pass"
+    elif "/quarantine/trajectories-" in suffix:
+        expected_tag = "quarantined"
+    if expected_tag is not None:
+        for entry in manifest["files"]:
+            if entry["path"] == "lineage.jsonl":
+                continue
+            path = root / entry["path"]
+            row = orjson.loads(path.read_bytes())
+            if row["normalization_audit"]["tag"] == expected_tag:
+                return path
     relative = next(
         entry["path"] for entry in manifest["files"] if entry["path"].endswith(suffix)
     )
@@ -851,12 +866,157 @@ def test_missing_session_prefixes_merge_by_user_across_threads(tmp_path: Path) -
     assert all(
         node.metadata.session_id == "no_session_id" for node, _ in by_user.values()
     )
+    assert all(node.metadata.sub_session_id == 0 for node, _ in by_user.values())
     assert {row["source_ref"] for row in by_user["alice"][1]} == {
         "alice-short.json",
         "alice-long.json",
     }
     assert {row["source_ref"] for row in by_user["bob"][1]} == {"bob-long.json"}
     assert {row["source_ref"] for row in by_user["no_user_id"][1]} == {"anonymous.json"}
+
+
+def test_sub_session_ids_follow_created_at_with_stable_hash_tiebreak(
+    tmp_path: Path,
+) -> None:
+    def snapshot(path: str, *, captured_at: str, content: str) -> Snapshot:
+        return Snapshot(
+            source_path=path,
+            source_sha256=(path.encode().hex() + "0" * 64)[:64],
+            session_id="real-session",
+            thread_id=path,
+            request_id=path,
+            captured_at=captured_at,
+            provider="openai",
+            operation="responses",
+            outcome="success",
+            history=[Message(role="user", content=content)],
+            response=[Message(role="assistant", content="done", reasoning_content="")],
+            termination="completed",
+            wire_complete=True,
+        )
+
+    later = snapshot(
+        "later.json",
+        captured_at="2026-09-20T00:00:01Z",
+        content="later",
+    )
+    tied_a = snapshot(
+        "tied-a.json",
+        captured_at="2026-09-20T00:00:00Z",
+        content="branch-a",
+    )
+    tied_b = snapshot(
+        "tied-b.json",
+        captured_at="2026-09-20T00:00:00Z",
+        content="branch-b",
+    )
+
+    with StateStore(tmp_path / "state.sqlite") as state:
+        for item in (later, tied_b, tied_a):
+            state.put_snapshot(item)
+        stats = PipelineStats()
+        _build_trajectories(state, stats)
+        stored = list(state.iter_trajectories())
+
+    tied = sorted(
+        (
+            identifier,
+            node.metadata.sub_session_id,
+        )
+        for identifier, node, _ in stored
+        if node.metadata.created_at == "2026-09-20T00:00:00Z"
+    )
+    assert [sub_session_id for _, sub_session_id in tied] == [0, 1]
+    assert (
+        next(
+            node.metadata.sub_session_id
+            for _, node, _ in stored
+            if node.metadata.created_at == "2026-09-20T00:00:01Z"
+        )
+        == 2
+    )
+
+
+def test_literal_no_session_id_is_numbered_as_a_real_session(tmp_path: Path) -> None:
+    snapshots = [
+        Snapshot(
+            source_path=f"literal-{index}.json",
+            source_sha256=str(index + 1) * 64,
+            session_id="no_session_id",
+            thread_id=f"thread-{index}",
+            captured_at=f"2026-09-20T00:00:0{index}Z",
+            provider="openai",
+            operation="responses",
+            outcome="success",
+            history=[Message(role="user", content=f"branch-{index}")],
+            response=[Message(role="assistant", content="done", reasoning_content="")],
+            termination="completed",
+            wire_complete=True,
+        )
+        for index in range(2)
+    ]
+
+    with StateStore(tmp_path / "state.sqlite") as state:
+        for snapshot in reversed(snapshots):
+            state.put_snapshot(snapshot)
+        stats = PipelineStats()
+        _build_trajectories(state, stats)
+        stored = list(state.iter_trajectories())
+
+    assert sorted(node.metadata.sub_session_id for _, node, _ in stored) == [0, 1]
+    assert all(
+        "metadata_session_id_synthesized"
+        not in {
+            issue.code
+            for issue in (
+                node.normalization_audit.issues if node.normalization_audit else []
+            )
+        }
+        for _, node, _ in stored
+    )
+
+
+def test_synthesized_session_branches_all_use_zero(tmp_path: Path) -> None:
+    snapshots = [
+        Snapshot(
+            source_path=f"missing-{index}.json",
+            source_sha256=str(index + 3) * 64,
+            source_name="deepinfra",
+            session_id="",
+            user_id="same-user",
+            thread_id=f"request-{index}",
+            captured_at=f"2026-09-20T00:00:0{index}Z",
+            provider="openai",
+            operation="chat_completions",
+            outcome="success",
+            history=[Message(role="user", content=f"independent-{index}")],
+            response=[Message(role="assistant", content="done", reasoning_content="")],
+            termination="stop",
+            wire_complete=True,
+        )
+        for index in range(2)
+    ]
+
+    with StateStore(tmp_path / "state.sqlite") as state:
+        for snapshot in snapshots:
+            state.put_snapshot(snapshot)
+        stats = PipelineStats()
+        _build_trajectories(state, stats)
+        stored = list(state.iter_trajectories())
+
+    assert len(stored) == 2
+    assert {node.metadata.session_id for _, node, _ in stored} == {"no_session_id"}
+    assert {node.metadata.sub_session_id for _, node, _ in stored} == {0}
+    assert all(
+        "metadata_session_id_synthesized"
+        in {
+            issue.code
+            for issue in (
+                node.normalization_audit.issues if node.normalization_audit else []
+            )
+        }
+        for _, node, _ in stored
+    )
 
 
 def test_multimodal_mapping_prefers_leaf_order_and_appends_prefix_only_parts() -> None:
@@ -927,10 +1087,14 @@ def test_failed_endpoint_never_persists_query_secrets(tmp_path: Path) -> None:
 
     normalize(PipelineConfig(input_root=input_root, output_root=output_root))
 
-    record_path = _output_file(output_root, "/quarantine/records-00000.jsonl")
-    serialized = record_path.read_bytes()
+    manifest_path = output_root / "manifest.json"
+    manifest = orjson.loads(manifest_path.read_bytes())
+    serialized = manifest_path.read_bytes() + b"".join(
+        (output_root / entry["path"]).read_bytes() for entry in manifest["files"]
+    )
     assert b"TOP-SECRET" not in serialized
-    assert b'"endpoint":"/unsupported"' in serialized
+    assert manifest["counts"]["quarantined_records"] == 1
+    assert manifest["counts"]["reason_counts"] == {"capture_parse_failed": 1}
     assert validate_output(output_root).valid
 
 
@@ -1335,11 +1499,13 @@ def test_duplicate_child_leaf_is_merged_before_mounting(tmp_path: Path) -> None:
     assert root.metadata.model == "gpt-test"
     assert root.metadata.user_id == "user-main"
     assert root.metadata.session_id == "session"
+    assert root.metadata.sub_session_id == 0
     assert root.metadata.specific_source == "free-router"
     mounted_child = root.sub_agent_trajectory["spawn-1"]
     assert mounted_child.metadata.model == "gpt-test"
     assert mounted_child.metadata.user_id == "user-child"
     assert mounted_child.metadata.session_id == "session"
+    assert mounted_child.metadata.sub_session_id == root.metadata.sub_session_id
     assert mounted_child.metadata.specific_source == "free-router"
     assert {origin["source_ref"] for origin in origins} == {
         "/input/parent-event.json",

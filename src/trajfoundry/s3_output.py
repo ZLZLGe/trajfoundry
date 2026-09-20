@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, Self
@@ -12,9 +11,9 @@ from typing import Any, Literal, Self
 import orjson
 
 from .canonical import trajectory_id
-from .export import SCHEMA_VERSION, ExportStats
+from .export import SCHEMA_VERSION, ExportStats, trajectory_filename
 from .models import QuarantineRecord, TrajectoryNode
-from .output_contract import project_quarantine_record, project_trajectory
+from .output_contract import project_trajectory
 from .quality import is_strict_sample, validate_derived_fields
 from .s3 import S3Location
 
@@ -24,7 +23,7 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class S3ObjectDescription:
-    """A completed immutable generation object."""
+    """A completed immutable object in a manifest-backed flat output run."""
 
     path: str
     bucket: str
@@ -183,79 +182,8 @@ class _S3ObjectWriter:
             self._failed = True
 
 
-class _S3JsonlShardWriter:
-    def __init__(
-        self,
-        client: Any,
-        location: S3Location,
-        directory: str,
-        prefix: str,
-        *,
-        generation_prefix: str,
-        max_bytes: int,
-    ) -> None:
-        if max_bytes <= 0:
-            raise ValueError("max shard bytes must be positive")
-        self._client = client
-        self._location = location
-        self._directory = directory
-        self._prefix = prefix
-        self._generation_prefix = generation_prefix
-        self._max_bytes = max_bytes
-        self._index = 0
-        self._size = 0
-        self._current: _S3ObjectWriter | None = None
-        self._objects: list[S3ObjectDescription] = []
-
-    @property
-    def objects(self) -> tuple[S3ObjectDescription, ...]:
-        return tuple(self._objects)
-
-    def _open(self) -> None:
-        relative_path = (
-            f"{self._generation_prefix}/{self._directory}/"
-            f"{self._prefix}-{self._index:05d}.jsonl"
-        )
-        self._index += 1
-        self._current = _S3ObjectWriter(
-            self._client,
-            self._location,
-            relative_path,
-        )
-        self._size = 0
-
-    def write(self, value: Any) -> None:
-        line = orjson.dumps(value, option=orjson.OPT_SORT_KEYS) + b"\n"
-        if self._current is None or (
-            self._size and self._size + len(line) > self._max_bytes
-        ):
-            self.close_current()
-            self._open()
-        assert self._current is not None
-        self._current.write(line)
-        self._size += len(line)
-
-    def close_current(self) -> None:
-        if self._current is None:
-            return
-        current = self._current
-        description = current.close()
-        self._objects.append(description)
-        self._current = None
-        self._size = 0
-
-    def close(self) -> None:
-        self.close_current()
-
-    def abort(self) -> None:
-        if self._current is not None:
-            self._current.abort()
-            self._current = None
-        self._size = 0
-
-
 class S3OutputSet:
-    """Write one immutable output generation without publishing its manifest."""
+    """Write flat trajectory objects without publishing the root manifest."""
 
     def __init__(
         self,
@@ -264,50 +192,21 @@ class S3OutputSet:
         *,
         max_shard_bytes: int = 512 * 1024 * 1024,
     ) -> None:
+        if max_shard_bytes <= 0:
+            raise ValueError("max shard bytes must be positive")
+        self.max_shard_bytes = max_shard_bytes
         self._client = client
         self.location = location
-        self.generation_id = uuid.uuid4().hex
-        generation_prefix = f"generations/{self.generation_id}"
-        self.accepted = _S3JsonlShardWriter(
-            client,
-            location,
-            "accepted",
-            "trajectories",
-            generation_prefix=generation_prefix,
-            max_bytes=max_shard_bytes,
-        )
-        self.quarantined = _S3JsonlShardWriter(
-            client,
-            location,
-            "quarantine",
-            "trajectories",
-            generation_prefix=generation_prefix,
-            max_bytes=max_shard_bytes,
-        )
-        self.records = _S3JsonlShardWriter(
-            client,
-            location,
-            "quarantine",
-            "records",
-            generation_prefix=generation_prefix,
-            max_bytes=max_shard_bytes,
-        )
-        self._lineage = _S3ObjectWriter(
-            client,
-            location,
-            f"{generation_prefix}/lineage.jsonl",
-        )
+        self._trajectory_objects: list[S3ObjectDescription] = []
+        self._trajectory_names: set[str] = set()
+        self._lineage = _S3ObjectWriter(client, location, "lineage.jsonl")
         self.stats = ExportStats()
         self._manifest_bytes: bytes | None = None
         self._aborted = False
 
     @property
     def written_objects(self) -> tuple[S3ObjectDescription, ...]:
-        objects = [
-            *self.accepted.objects,
-            *self.quarantined.objects,
-            *self.records.objects,
-        ]
+        objects = [*self._trajectory_objects]
         if self._lineage.description is not None:
             objects.append(self._lineage.description)
         return tuple(sorted(objects, key=lambda item: item.path))
@@ -324,15 +223,15 @@ class S3OutputSet:
         projected = project_trajectory(node)
         validate_derived_fields(node)
         identifier = trajectory_id(node)
-        strict = is_strict_sample(node)
-        destination = self.accepted if strict else self.quarantined
-        destination.write(projected)
-        if strict:
-            self.stats.accepted += 1
-        else:
-            self.stats.quarantined_trajectories += 1
-            if node.normalization_audit:
-                self.stats.add_reasons(node.normalization_audit.reason_codes)
+        filename = trajectory_filename(node, identifier)
+        if filename in self._trajectory_names:
+            raise ValueError(f"duplicate trajectory output filename: {filename}")
+        payload = orjson.dumps(projected, option=orjson.OPT_SORT_KEYS) + b"\n"
+        if len(payload) > self.max_shard_bytes:
+            raise ValueError(
+                "trajectory JSONL object exceeds max_shard_bytes: "
+                f"{len(payload)} > {self.max_shard_bytes}"
+            )
         self._lineage.write(
             orjson.dumps(
                 {
@@ -345,11 +244,26 @@ class S3OutputSet:
             )
             + b"\n"
         )
+        writer = _S3ObjectWriter(self._client, self.location, filename)
+        try:
+            writer.write(payload)
+            description = writer.close()
+        except Exception:
+            writer.abort()
+            raise
+        self._trajectory_names.add(filename)
+        self._trajectory_objects.append(description)
+        strict = is_strict_sample(node)
+        if strict:
+            self.stats.accepted += 1
+        else:
+            self.stats.quarantined_trajectories += 1
+            if node.normalization_audit:
+                self.stats.add_reasons(node.normalization_audit.reason_codes)
         self.stats.duplicate_trajectories += max(0, len(origins) - 1)
         return identifier
 
     def write_record(self, record: QuarantineRecord) -> None:
-        self.records.write(project_quarantine_record(record))
         self.stats.quarantined_records += 1
         if record.normalization_audit.tag.value == "excluded":
             self.stats.excluded_records += 1
@@ -372,9 +286,6 @@ class S3OutputSet:
         if self._aborted:
             raise ValueError("cannot close an aborted S3 output set")
         try:
-            self.accepted.close()
-            self.quarantined.close()
-            self.records.close()
             self._lineage.close()
         except Exception:
             self.abort()
@@ -402,9 +313,6 @@ class S3OutputSet:
         return self._manifest_bytes
 
     def abort(self) -> None:
-        self.accepted.abort()
-        self.quarantined.abort()
-        self.records.abort()
         self._lineage.abort()
         if self._manifest_bytes is None:
             self._aborted = True

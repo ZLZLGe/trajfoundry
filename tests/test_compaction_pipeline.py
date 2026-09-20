@@ -115,12 +115,12 @@ def test_complete_compaction_capture_is_a_full_quarantined_trajectory(
     trajectory_file = next(
         output_root / entry["path"]
         for entry in manifest["files"]
-        if entry["path"].endswith("/quarantine/trajectories-00000.jsonl")
+        if entry["path"] != "lineage.jsonl"
     )
     trajectory = orjson.loads(trajectory_file.read_bytes().splitlines()[0])
 
     assert stats.parsed == 1
-    assert manifest["schema_version"] == "trajfoundry-v3"
+    assert manifest["schema_version"] == "trajfoundry-v4"
     assert manifest["counts"]["accepted"] == 0
     assert manifest["counts"]["quarantined_trajectories"] == 1
     assert manifest["counts"]["quarantined_records"] == 0

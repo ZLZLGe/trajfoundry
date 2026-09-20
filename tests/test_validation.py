@@ -78,6 +78,16 @@ def _refresh_manifest_entry(root: Path, relative: str) -> None:
 
 def _manifest_path(root: Path, fragment: str) -> Path:
     manifest = orjson.loads((root / "manifest.json").read_bytes())
+    if fragment == "/lineage.jsonl":
+        fragment = "lineage.jsonl"
+    if "accepted/trajectories-" in fragment:
+        for entry in manifest["files"]:
+            if entry["path"] == "lineage.jsonl":
+                continue
+            path = root / entry["path"]
+            value = orjson.loads(path.read_bytes())
+            if value["normalization_audit"]["tag"] == "pass":
+                return path
     relative = next(
         entry["path"] for entry in manifest["files"] if fragment in entry["path"]
     )
@@ -137,7 +147,7 @@ def test_validate_output_reports_integrity_and_json_without_content(
     assert "TOP-SECRET" not in "\n".join(report.errors)
 
 
-def test_validate_output_rejects_non_strict_accepted_sample(tmp_path: Path) -> None:
+def test_validate_output_detects_disposition_count_change(tmp_path: Path) -> None:
     _write_output(tmp_path)
     shard = _manifest_path(tmp_path, "/accepted/trajectories-")
     payload = orjson.loads(shard.read_bytes())
@@ -148,7 +158,7 @@ def test_validate_output_rejects_non_strict_accepted_sample(tmp_path: Path) -> N
     report = validate_output(tmp_path)
 
     assert not report.valid
-    assert any("not a strict accepted sample" in error for error in report.errors)
+    assert any("count accepted" in error for error in report.errors)
 
 
 def test_validate_output_rejects_type_correct_stale_derived_fields(
@@ -188,6 +198,26 @@ def test_validate_output_checks_manifest_counts(tmp_path: Path) -> None:
 
     assert not report.valid
     assert any("count accepted" in error for error in report.errors)
+
+
+def test_validate_output_requires_v4_reason_total_to_cover_records(
+    tmp_path: Path,
+) -> None:
+    _write_output(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest = orjson.loads(manifest_path.read_bytes())
+    # The quarantined trajectory reason remains covered, but the omitted
+    # quarantined-record reason makes the aggregate accounting incomplete.
+    manifest["counts"]["reason_counts"] = {"no_final_assistant_turn": 1}
+    manifest_path.write_bytes(orjson.dumps(manifest))
+
+    report = validate_output(tmp_path)
+
+    assert not report.valid
+    assert any(
+        "reason_counts does not account for quarantined records" in error
+        for error in report.errors
+    )
 
 
 def test_validate_output_does_not_follow_manifest_path_outside_root(
@@ -264,8 +294,46 @@ def test_validate_output_accepts_v2_manifest_with_skip_defaults(tmp_path: Path) 
     _write_output(tmp_path)
     manifest_path = tmp_path / "manifest.json"
     manifest = orjson.loads(manifest_path.read_bytes())
+    generation = tmp_path / "generations" / ("a" * 32)
+    accepted_dir = generation / "accepted"
+    quarantine_dir = generation / "quarantine"
+    accepted_dir.mkdir(parents=True)
+    quarantine_dir.mkdir()
+    legacy_files = []
+    trajectory_index = 0
+    for entry in manifest["files"]:
+        source = tmp_path / entry["path"]
+        if entry["path"] == "lineage.jsonl":
+            target = generation / "lineage.jsonl"
+        else:
+            row = orjson.loads(source.read_bytes())
+            row["metadata"].pop("sub_session_id")
+            target_dir = (
+                accepted_dir
+                if row["normalization_audit"]["tag"] == "pass"
+                else quarantine_dir
+            )
+            target = target_dir / f"trajectories-{trajectory_index:05d}.jsonl"
+            target.write_bytes(orjson.dumps(row) + b"\n")
+            source.unlink()
+            trajectory_index += 1
+        if source.exists():
+            source.replace(target)
+        relative = target.relative_to(tmp_path).as_posix()
+        legacy_files.append(
+            {
+                "path": relative,
+                "bytes": target.stat().st_size,
+                "sha256": file_sha256(target),
+            }
+        )
     manifest["schema_version"] = "trajfoundry-v2"
     manifest.pop("input_format")
+    manifest["files"] = legacy_files
+    manifest["counts"]["input_files"] = 3
+    manifest["counts"]["quarantined_records"] = 0
+    manifest["counts"]["excluded_records"] = 0
+    manifest["counts"]["reason_counts"] = {"no_final_assistant_turn": 1}
     manifest["counts"].pop("skipped_inputs")
     manifest["counts"].pop("skip_reason_counts")
     manifest_path.write_bytes(orjson.dumps(manifest))

@@ -302,7 +302,7 @@ def test_compaction_projection_is_lossless_and_round_trips() -> None:
 
 
 def test_compaction_items_is_a_required_array_on_every_node() -> None:
-    assert SCHEMA_VERSION == "trajfoundry-v3"
+    assert SCHEMA_VERSION == "trajfoundry-v4"
 
     plain = project_trajectory(_trajectory())
     assert plain["compaction_items"] == []
@@ -331,6 +331,7 @@ def test_metadata_extensions_are_required_and_source_mapping_is_strict() -> None
         "model": "",
         "user_id": "",
         "session_id": "",
+        "sub_session_id": 0,
         "source_type": "api-router",
         "specific_source": "free-router",
     }

@@ -132,9 +132,10 @@ an all-quarantine batch are logged as warnings for inspection.
 
 S3 mode streams each SXF `.jsonl.zst` object through a bounded decompressor and
 handles one JSONL row at a time; other formats read one capture object at a
-time. Normalized JSONL shards are streamed back to S3. The complete input or
-output is never staged under `/share`, and AWS CLI is not required. `/share` is
-still used for the shared Python environment and editable source checkout.
+time. One flat JSONL object is written for each final trajectory. The complete
+input or output is never staged under `/share`, and AWS CLI is not required.
+`/share` is still used for the shared Python environment and editable source
+checkout.
 
 S3 credentials are loaded from this fixed path by default:
 
@@ -210,10 +211,10 @@ an initial one-day run, configure the task parameters as follows:
 
 | Workflow | `input_format` | `input_uri` | `output_uri` |
 | --- | --- | --- | --- |
-| `trajfoundry_tokenplan_v002` | `tokenplan` | `s3://agent-trajectory/lakehouse/token-plan/masked-raw/v001/dt=2026-09-09/` | `s3://agent-trajectory/lakehouse/token-plan/normalized/v002/dt=2026-09-09/` |
-| `trajfoundry_freerouter_v002` | `freerouter` | `s3://agent-trajectory/lakehouse/free-router/masked-raw/v001/dt=2026-09-09/` | `s3://agent-trajectory/lakehouse/free-router/normalized/v002/dt=2026-09-09/` |
-| `trajfoundry_sxf_v001` | `sxf` | `s3://agent-trajectory/lakehouse/SXF/mul-agent-sxf/guixu-data/260821/gpt-5.6-sol/` | `s3://agent-trajectory/lakehouse/SXF/mul-agent-sxf/normalized/v001/dt=2026-08-21/` |
-| `trajfoundry_deepinfra_v001` | `deepinfra` | `s3://agent-trajectory/lakehouse/deep-infra/masked-raw/v001/dt=2026-09-14/` | `s3://agent-trajectory/lakehouse/deep-infra/normalized/v001/dt=2026-09-14/` |
+| `trajfoundry_tokenplan_v005` | `tokenplan` | `s3://agent-trajectory/lakehouse/token-plan/masked-raw/v001/dt=2026-09-09/` | `s3://agent-trajectory/lakehouse/token-plan/normalized/v005/dt=2026-09-09/` |
+| `trajfoundry_freerouter_v005` | `freerouter` | `s3://agent-trajectory/lakehouse/free-router/masked-raw/v001/dt=2026-09-09/` | `s3://agent-trajectory/lakehouse/free-router/normalized/v005/dt=2026-09-09/` |
+| `trajfoundry_sxf_v005` | `sxf` | `s3://agent-trajectory/lakehouse/SXF/mul-agent-sxf/guixu-data/260821/gpt-5.6-sol/` | `s3://agent-trajectory/lakehouse/SXF/mul-agent-sxf/normalized/v005/dt=2026-08-21/` |
+| `trajfoundry_deepinfra_v005` | `deepinfra` | `s3://agent-trajectory/lakehouse/deep-infra/masked-raw/v001/dt=2026-09-14/` | `s3://agent-trajectory/lakehouse/deep-infra/normalized/v005/dt=2026-09-14/` |
 
 Set the shared `endpoint_url` parameter to:
 
@@ -249,23 +250,89 @@ directory, which can be reviewed and removed after confirming no task uses it.
 
 Publication follows this order:
 
-1. Write immutable JSONL objects under `generations/<run-id>/`.
-2. Stream those remote objects through the full output validator.
-3. Upload top-level `manifest.json` as the final publication pointer.
-4. Read back and verify the uploaded manifest.
+1. List top-level JSONL objects and remove any object not referenced by the
+   currently published manifest.
+2. Write one top-level JSONL object per trajectory plus `lineage.jsonl`.
+3. Stream those remote objects through the full output validator, ignoring only
+   files referenced exclusively by the previous manifest.
+4. Upload top-level `manifest.json` as the final publication pointer.
+5. Read back and verify the uploaded manifest.
+6. Delete files referenced only by the previous manifest.
 
-If upload or validation fails before step 3, an existing manifest remains
-unchanged. Completed generation objects from a failed attempt can remain as
-unreferenced orphans and are not automatically deleted. An empty source prefix,
-S3 permission failure, or network failure fails the task without publishing a
-new manifest; malformed individual captures continue to be represented in
-quarantine.
+If upload or validation fails before step 4, an existing manifest remains
+unchanged. Because flat keys can reuse names, a same-named object may already
+have been overwritten even while the old manifest is still visible. This is an
+inherent limitation of the required flat layout. Do not run concurrent writers
+for one output partition, and make downstream readers verify manifest hashes.
+An empty source prefix, S3 permission failure, or network failure fails the task
+without publishing a new manifest.
+
+Deletion failures are not ignored. A failure before publication leaves the old
+manifest authoritative; a failure after publication reports the task as failed
+even though the new manifest is already authoritative. In either case, the next
+retry removes the unlisted residue during step 1 before writing new objects.
+Top-level JSONL objects under an output prefix are therefore managed entirely by
+TrajFoundry; do not place unrelated JSONL files there.
+
+`max_shard_bytes` is a compatibility parameter name. In the flat v4 contract it
+sets the maximum serialized size of one complete trajectory JSONL object; a
+trajectory above the limit fails the task and is never split across files.
 
 Once the final manifest PUT begins, a lost network response can make the task
 result indeterminate even though S3 accepted the already validated manifest.
 If publication or read-back fails at that stage, inspect the current
 `manifest.json` before retrying; do not start another same-date instance in
 parallel.
+
+### Independent classification workflow
+
+Classification is a separate task and must use a normalized root as its input;
+it never calls normalization. Use
+[`dolphinscheduler_label_s3_node.py`](../examples/dolphinscheduler_label_s3_node.py)
+with parameters such as:
+
+| Parameter | Example |
+| --- | --- |
+| `input_uri` | `s3://agent-trajectory/lakehouse/token-plan/normalized/v004/dt=2026-09-14/` |
+| `output_uri` | `s3://agent-trajectory/lakehouse/token-plan/classified/v001/dt=2026-09-14/` |
+| `endpoint_url` | `http://d-ceph-ssd-inside.pjlab.org.cn` |
+| `workspace_parent` | `/tmp` |
+
+The input must be the directory containing `manifest.json`; do not pass an
+`accepted`, `quarantine`, or `generations` child. Both strict and quarantined
+complete trajectories are classified. v004 generation shards and the current
+flat v4 contract are supported. Output is flat and contains each complete
+normalized row plus its top-level `classification` object.
+
+The worker process must provide these settings without embedding values in the
+Python task:
+
+```text
+CLASSIFIER_API_URL=https://<approved-host>/v1/chat/completions
+CLASSIFIER_MODEL=<available-model-id>
+CLASSIFIER_API_KEY=<secret>
+```
+
+Inject `CLASSIFIER_API_KEY` through the platform's protected secret mechanism
+or the worker service environment. Never put it in workflow parameters,
+`rawScript`, source control, or task logs. A key pasted into chat or another
+uncontrolled channel must be rotated before use.
+
+The default cache is a deterministic SQLite file below
+`workspace_parent/.trajfoundry-label-cache/`. For recovery across worker
+restarts, point `state_path` at a worker-local persistent volume and pin retries
+to that worker or volume. Do not place a live SQLite cache on NFS and do not run
+two tasks against the same cache/output prefix concurrently. Set the scheduler
+maximum concurrency to `1` per source and date.
+
+The classifier uses bounded concurrency (four requests in the example). HTTP
+429 and 5xx responses are retried; HTTP 404 and 422 indicate a bad endpoint or
+missing model configuration and fail the job. Per-trajectory exhausted retries
+or invalid model output still produce the original trajectory with
+`classification.status="failed"`, allowing a later rerun to inspect and retry
+the failed population. Classification also removes unlisted top-level JSONL
+before output publication and fails on any cleanup error, so a retry can recover
+an interrupted post-manifest cleanup.
 
 ## Updating the project
 

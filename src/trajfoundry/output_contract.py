@@ -531,7 +531,13 @@ def _has_primary_mount_failure(audit: dict[str, Any]) -> bool:
     )
 
 
-def _validate_node(value: object, path: str, *, top_level: bool) -> tuple[bool, int]:
+def _validate_node(
+    value: object,
+    path: str,
+    *,
+    top_level: bool,
+    expected_sub_session_id: int | None = None,
+) -> tuple[bool, int]:
     node = _object(value, path)
     required = _NODE_REQUIRED | (
         {"completeness_tag", "completeness"} if top_level else set()
@@ -601,6 +607,7 @@ def _validate_node(value: object, path: str, *, top_level: bool) -> tuple[bool, 
             "model",
             "user_id",
             "session_id",
+            "sub_session_id",
             "source_type",
             "specific_source",
         },
@@ -628,6 +635,17 @@ def _validate_node(value: object, path: str, *, top_level: bool) -> tuple[bool, 
     _integer(metadata["line_no"], f"{path}/metadata/line_no")
     for field in ("created_at", "model", "user_id", "session_id"):
         _string(metadata[field], f"{path}/metadata/{field}")
+    sub_session_id = _integer(
+        metadata["sub_session_id"], f"{path}/metadata/sub_session_id"
+    )
+    if (
+        expected_sub_session_id is not None
+        and sub_session_id != expected_sub_session_id
+    ):
+        _fail(
+            f"{path}/metadata/sub_session_id",
+            "must inherit the root trajectory sub_session_id",
+        )
     if metadata["model"] != node["model"]:
         _fail(f"{path}/metadata/model", "must equal the trajectory model")
     expected_sources = {
@@ -656,6 +674,7 @@ def _validate_node(value: object, path: str, *, top_level: bool) -> tuple[bool, 
                     child,
                     f"{path}/sub_agent_trajectory/{call_id}",
                     top_level=False,
+                    expected_sub_session_id=sub_session_id,
                 )
             )
 
@@ -981,6 +1000,7 @@ def _project_trajectory(
             "model": node.metadata.model or node.model,
             "user_id": node.metadata.user_id,
             "session_id": node.metadata.session_id,
+            "sub_session_id": node.metadata.sub_session_id,
             "source_type": node.metadata.source_type,
             "specific_source": node.metadata.specific_source,
         },
@@ -1019,15 +1039,48 @@ def project_trajectory(
     return result
 
 
-def parse_trajectory_record(value: object) -> TrajectoryNode:
-    """Validate raw required keys/types before Pydantic defaults can apply."""
+def _with_legacy_sub_session_ids(value: object) -> object:
+    """Return a detached v4-compatible value for legacy normalized records."""
 
-    _validate_node(value, "$", top_level=True)
     try:
-        node = TrajectoryNode.model_validate_json(orjson.dumps(value), strict=True)
+        upgraded = orjson.loads(orjson.dumps(value))
+    except (TypeError, orjson.JSONEncodeError, orjson.JSONDecodeError) as error:
+        raise OutputContractError("trajectory is not JSON serializable") from error
+
+    def add_default(node: object, inherited: int = 0) -> None:
+        if not isinstance(node, dict):
+            return
+        metadata = node.get("metadata")
+        if isinstance(metadata, dict):
+            candidate = metadata.setdefault("sub_session_id", inherited)
+            if type(candidate) is int and candidate >= 0:
+                inherited = candidate
+        children = node.get("sub_agent_trajectory")
+        if isinstance(children, dict):
+            for child in children.values():
+                add_default(child, inherited)
+
+    add_default(upgraded)
+    return upgraded
+
+
+def parse_trajectory_record(
+    value: object, *, allow_legacy_metadata: bool = False
+) -> TrajectoryNode:
+    """Validate required keys/types before Pydantic defaults can apply.
+
+    ``allow_legacy_metadata`` is limited to reading v2/v3 manifests whose
+    trajectory metadata predates ``sub_session_id``. New records must publish
+    the field explicitly.
+    """
+
+    candidate = _with_legacy_sub_session_ids(value) if allow_legacy_metadata else value
+    _validate_node(candidate, "$", top_level=True)
+    try:
+        node = TrajectoryNode.model_validate_json(orjson.dumps(candidate), strict=True)
     except (TypeError, orjson.JSONEncodeError, ValidationError) as error:
         raise OutputContractError("trajectory violates the typed model") from error
-    if project_trajectory(node) != value:
+    if project_trajectory(node) != candidate:
         raise OutputContractError("trajectory is not in canonical output projection")
     return node
 

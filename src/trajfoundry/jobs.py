@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from typing import Any, Literal
+
+import orjson
 
 from .credentials import DEFAULT_S3_CREDENTIALS_PATH, load_s3_credentials
 from .pipeline import PipelineConfig, PipelineStats, normalize, normalize_source
 from .s3 import S3CaptureSource, S3Location, create_s3_client, parse_s3_uri
 from .s3_output import S3OutputSet
 from .s3_validation import S3ValidationBackend
+from .s3_validation import _is_not_found as _is_missing_s3_object
 from .validation import ValidationReport, validate_output, validate_output_backend
 
 LOGGER = logging.getLogger(__name__)
@@ -23,7 +26,7 @@ DEFAULT_MAX_SHARD_BYTES = 512 * 1024 * 1024
 
 @dataclass(frozen=True, slots=True)
 class JobResult:
-    """The run statistics and validation report for the selected generation."""
+    """The run statistics and validation report for one published output."""
 
     stats: PipelineStats
     validation: ValidationReport
@@ -48,7 +51,7 @@ class JobResult:
 
 
 class JobValidationError(RuntimeError):
-    """Raised when an output generation does not satisfy its contract."""
+    """Raised when a published output does not satisfy its contract."""
 
     def __init__(self, output_root: str | Path, report: ValidationReport) -> None:
         self.output_root = output_root
@@ -106,6 +109,84 @@ def _close_s3_client(client: Any) -> None:
         LOGGER.warning("TrajFoundry could not close the S3 client cleanly")
 
 
+def _flat_manifest_jsonl_paths(manifest_bytes: bytes | None) -> set[str]:
+    if manifest_bytes is None:
+        return set()
+    try:
+        manifest = orjson.loads(manifest_bytes)
+    except orjson.JSONDecodeError:
+        return set()
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema_version") != "trajfoundry-v4"
+    ):
+        return set()
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        return set()
+    paths: set[str] = set()
+    for entry in files:
+        relative = entry.get("path") if isinstance(entry, dict) else None
+        if not isinstance(relative, str):
+            continue
+        pure = PurePosixPath(relative)
+        if (
+            len(pure.parts) == 1
+            and pure.as_posix() == relative
+            and relative.endswith(".jsonl")
+        ):
+            paths.add(relative)
+    return paths
+
+
+def _read_previous_manifest(client: Any, location: S3Location) -> bytes | None:
+    key = location.key("manifest.json")
+    try:
+        response = client.get_object(Bucket=location.bucket, Key=key)
+    except KeyError:
+        # In-memory clients commonly represent a missing object as a KeyError.
+        return None
+    except Exception as error:
+        if _is_missing_s3_object(error, client):
+            return None
+        raise
+    return _read_s3_response_bytes(response)
+
+
+def _list_flat_jsonl_paths(client: Any, location: S3Location) -> set[str]:
+    """List every managed top-level JSONL object under an output prefix."""
+
+    try:
+        return set(
+            S3ValidationBackend(client, location).iter_generated_jsonl_paths(
+                frozenset()
+            )
+        )
+    except Exception as error:
+        raise OSError("could not enumerate managed S3 output JSONL files") from error
+
+
+def _delete_flat_jsonl_paths(
+    client: Any,
+    location: S3Location,
+    *,
+    paths: set[str],
+    phase: str,
+) -> None:
+    """Delete stale output objects and fail if any deletion is rejected."""
+
+    for relative in sorted(paths):
+        try:
+            client.delete_object(
+                Bucket=location.bucket,
+                Key=location.key(relative),
+            )
+        except Exception as error:
+            raise OSError(
+                f"could not remove stale S3 output JSONL during {phase} cleanup"
+            ) from error
+
+
 def _run_s3_job_with_client(
     client: Any,
     *,
@@ -115,6 +196,17 @@ def _run_s3_job_with_client(
     workspace: Path,
     max_shard_bytes: int,
 ) -> JobResult:
+    previous_manifest = _read_previous_manifest(client, output_location)
+    previous_flat_paths = _flat_manifest_jsonl_paths(previous_manifest)
+    # Clean objects left by an interrupted or failed prior publication before
+    # writing any new flat object.  The published manifest is the keep-set.
+    listed_flat_paths = _list_flat_jsonl_paths(client, output_location)
+    _delete_flat_jsonl_paths(
+        client,
+        output_location,
+        paths=listed_flat_paths - previous_flat_paths,
+        phase="preflight",
+    )
     source = S3CaptureSource(client, input_location)
     with TemporaryDirectory(prefix="trajfoundry-state-", dir=workspace) as directory:
         stats, manifest_bytes = normalize_source(
@@ -129,9 +221,14 @@ def _run_s3_job_with_client(
             max_shard_bytes=max_shard_bytes,
         )
 
+    current_flat_paths = _flat_manifest_jsonl_paths(manifest_bytes)
     report = validate_output_backend(
         manifest_bytes,
-        S3ValidationBackend(client, output_location),
+        S3ValidationBackend(
+            client,
+            output_location,
+            ignored_flat_paths=frozenset(previous_flat_paths - current_flat_paths),
+        ),
     )
     if not report.valid:
         raise JobValidationError(output_location.uri, report)
@@ -148,6 +245,15 @@ def _run_s3_job_with_client(
     )
     if published != manifest_bytes:
         raise OSError("published S3 manifest verification failed")
+    # Flat keys cannot provide generation-level atomic replacement: existing
+    # names may be overwritten before this manifest commit. Cleanup therefore
+    # happens after publication and is restricted to the old manifest's files.
+    _delete_flat_jsonl_paths(
+        client,
+        output_location,
+        paths=_list_flat_jsonl_paths(client, output_location) - current_flat_paths,
+        phase="post-publication",
+    )
 
     if stats.parse_failures:
         LOGGER.warning(
@@ -256,12 +362,12 @@ def run_s3_job(
     max_shard_bytes: int = DEFAULT_MAX_SHARD_BYTES,
     credentials_path: str | Path | None = DEFAULT_S3_CREDENTIALS_PATH,
 ) -> JobResult:
-    """Normalize an S3 prefix directly into an unpublished S3 generation.
+    """Normalize an S3 prefix directly into a flat S3 output prefix.
 
     Raw captures and JSONL output never pass through local staging files.  The
     aggregation database is created in a unique workspace-local directory and is
     deleted when this call returns or raises.  The root manifest is published
-    only after the complete candidate generation passes remote validation. S3
+    only after the complete candidate output passes remote validation. S3
     credentials come from the fixed credential file by default; explicitly pass
     ``credentials_path=None`` only when the standard AWS SDK chain is intended.
     """

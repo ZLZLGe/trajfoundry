@@ -84,7 +84,7 @@ def _accepted_row(output_root: Path) -> dict:
     path = next(
         output_root / item["path"]
         for item in manifest["files"]
-        if item["path"].endswith("/accepted/trajectories-00000.jsonl")
+        if item["path"] != "lineage.jsonl"
     )
     return orjson.loads(path.read_bytes().splitlines()[0])
 

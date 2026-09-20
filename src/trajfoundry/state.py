@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import zlib
+from collections import defaultdict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -24,6 +25,7 @@ _PAGE_SIZE = 32 * 1024
 _CACHE_SIZE_KIB = 128 * 1024
 _MMAP_SIZE = 256 * 1024 * 1024
 _PATH_QUERY_BATCH_SIZE = 512
+_TRAJECTORY_UPDATE_BATCH_SIZE = 512
 _PAYLOAD_HEADER = b"TFZ1"
 _ZSTD_COMPRESSOR = zstandard.ZstdCompressor(level=1)
 _ZSTD_DECOMPRESSOR = zstandard.ZstdDecompressor()
@@ -54,6 +56,26 @@ def _sorted_path_batches(paths: Iterable[str]) -> Iterator[list[str]]:
     ordered_paths = sorted(set(paths))
     for offset in range(0, len(ordered_paths), _PATH_QUERY_BATCH_SIZE):
         yield ordered_paths[offset : offset + _PATH_QUERY_BATCH_SIZE]
+
+
+def _has_synthesized_session(node: TrajectoryNode) -> bool:
+    if not node.metadata.session_id:
+        return True
+    audit = node.normalization_audit
+    return bool(
+        audit
+        and any(
+            issue.code == "metadata_session_id_synthesized" for issue in audit.issues
+        )
+    )
+
+
+def _set_sub_session_id(node: TrajectoryNode, value: int) -> None:
+    """Assign one output-branch number to a root and all mounted children."""
+
+    node.metadata.sub_session_id = value
+    for child in (node.sub_agent_trajectory or {}).values():
+        _set_sub_session_id(child, value)
 
 
 class StateStore:
@@ -630,6 +652,83 @@ class StateStore:
         with self._write_scope():
             self.connection.execute("DELETE FROM trajectory_origins")
             self.connection.execute("DELETE FROM trajectories")
+
+    def assign_sub_session_ids(self) -> None:
+        """Number final, deduplicated branches within each real session.
+
+        Missing provider sessions are recognizable by their normalization
+        audit marker even though their published value is ``no_session_id``.
+        Those user-scoped fallback groups are not real session branches and
+        therefore always receive zero.  A literal provider session whose value
+        is ``no_session_id`` has no marker and is numbered normally.
+        """
+
+        assignments: dict[str, int] = {}
+        real_sessions: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
+        rows = self.connection.execute(
+            "SELECT trajectory_id,payload FROM trajectories ORDER BY trajectory_id"
+        )
+        for identifier, payload in rows:
+            node = parse_trajectory_record(orjson.loads(_decompress_payload(payload)))
+            if identifier != compute_trajectory_id(node):
+                raise ValueError(
+                    "stored trajectory_id does not match trajectory content"
+                )
+            if _has_synthesized_session(node):
+                assignments[str(identifier)] = 0
+                continue
+            real_sessions[node.metadata.session_id].append(
+                (
+                    node.metadata.created_at,
+                    str(identifier),
+                    node.metadata.source_file,
+                )
+            )
+
+        for session_rows in real_sessions.values():
+            session_rows.sort()
+            for sub_session_id, (_, identifier, _) in enumerate(session_rows):
+                assignments[identifier] = sub_session_id
+
+        ordered_ids = sorted(assignments)
+        with self._write_scope():
+            for offset in range(
+                0,
+                len(ordered_ids),
+                _TRAJECTORY_UPDATE_BATCH_SIZE,
+            ):
+                identifiers = ordered_ids[
+                    offset : offset + _TRAJECTORY_UPDATE_BATCH_SIZE
+                ]
+                placeholders = ",".join("?" for _ in identifiers)
+                payloads = {
+                    str(identifier): payload
+                    for identifier, payload in self.connection.execute(
+                        "SELECT trajectory_id,payload FROM trajectories "
+                        f"WHERE trajectory_id IN ({placeholders})",
+                        identifiers,
+                    )
+                }
+                updates: list[tuple[bytes, str]] = []
+                for identifier in identifiers:
+                    node = parse_trajectory_record(
+                        orjson.loads(_decompress_payload(payloads[identifier]))
+                    )
+                    _set_sub_session_id(node, assignments[identifier])
+                    validate_derived_fields(node)
+                    if identifier != compute_trajectory_id(node):
+                        raise ValueError(
+                            "sub_session_id changed canonical trajectory identity"
+                        )
+                    node_json = orjson.dumps(
+                        project_trajectory(node),
+                        option=orjson.OPT_SORT_KEYS,
+                    )
+                    updates.append((_compress_payload(node_json), identifier))
+                self.connection.executemany(
+                    "UPDATE trajectories SET payload=? WHERE trajectory_id=?",
+                    updates,
+                )
 
     def put_trajectory(
         self,

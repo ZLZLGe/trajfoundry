@@ -46,9 +46,16 @@ def _close_rejected_body(response: object) -> None:
 class S3ValidationBackend:
     """Expose one S3 output root through the validation backend protocol."""
 
-    def __init__(self, client: Any, location: S3Location) -> None:
+    def __init__(
+        self,
+        client: Any,
+        location: S3Location,
+        *,
+        ignored_flat_paths: frozenset[str] = frozenset(),
+    ) -> None:
         self.client = client
         self.location = location
+        self._ignored_flat_paths = ignored_flat_paths
 
     def open_file(self, relative_path: str) -> ValidationFile | None:
         """Open one output object without consuming or closing its body."""
@@ -87,12 +94,42 @@ class S3ValidationBackend:
                 raise ValueError(
                     "generation id must be 32 lowercase hexadecimal digits"
                 )
-        if not generation_ids:
-            return ()
-
         paths: list[str] = []
         observed_keys: set[str] = set()
         paginator = self.client.get_paginator("list_objects_v2")
+        if not generation_ids:
+            pages = paginator.paginate(
+                Bucket=self.location.bucket,
+                Prefix=self.location.prefix,
+            )
+            for page in pages:
+                contents = page.get("Contents", [])
+                if contents is None:
+                    contents = []
+                if not isinstance(contents, list):
+                    raise TypeError("S3 listing Contents must be a list")
+                for item in contents:
+                    if not isinstance(item, Mapping):
+                        raise TypeError("S3 listing entry must be an object")
+                    key = item.get("Key")
+                    if not isinstance(key, str) or not key.startswith(
+                        self.location.prefix
+                    ):
+                        raise OSError(
+                            "S3 listing returned a key outside the output root"
+                        )
+                    if key in observed_keys:
+                        raise OSError("S3 listing returned a duplicate key")
+                    observed_keys.add(key)
+                    relative_path = key[len(self.location.prefix) :]
+                    if (
+                        "/" not in relative_path
+                        and relative_path.endswith(".jsonl")
+                        and relative_path not in self._ignored_flat_paths
+                    ):
+                        paths.append(relative_path)
+            return tuple(sorted(paths))
+
         for generation_id in sorted(generation_ids):
             generation_prefix = f"{self.location.prefix}generations/{generation_id}/"
             pages = paginator.paginate(

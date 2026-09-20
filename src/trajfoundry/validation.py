@@ -14,6 +14,7 @@ import orjson
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .canonical import trajectory_id
+from .export import trajectory_filename
 from .models import AuditTag
 from .output_contract import (
     OutputContractError,
@@ -58,7 +59,7 @@ class _ManifestCounts(_StrictContract):
 
 
 class _Manifest(_StrictContract):
-    schema_version: Literal["trajfoundry-v2", "trajfoundry-v3"]
+    schema_version: Literal["trajfoundry-v2", "trajfoundry-v3", "trajfoundry-v4"]
     created_at: str
     input_root: str
     input_format: Literal["freerouter", "tokenplan", "sxf", "deepinfra"] = "freerouter"
@@ -68,16 +69,18 @@ class _Manifest(_StrictContract):
     files: list[_ManifestFile]
 
     @model_validator(mode="after")
-    def require_v3_skip_fields(self) -> _Manifest:
-        """Keep v2 readable while requiring the new accounting in v3."""
+    def require_current_accounting_fields(self) -> _Manifest:
+        """Keep v2 readable while requiring accounting fields in v3 and v4."""
 
-        if self.schema_version == "trajfoundry-v3":
+        if self.schema_version in {"trajfoundry-v3", "trajfoundry-v4"}:
             if "input_format" not in self.model_fields_set:
                 raise ValueError("v3 manifest requires input_format")
             if "skipped_inputs" not in self.counts.model_fields_set:
                 raise ValueError("v3 manifest requires counts.skipped_inputs")
             if "skip_reason_counts" not in self.counts.model_fields_set:
                 raise ValueError("v3 manifest requires counts.skip_reason_counts")
+        if self.counts.excluded_records > self.counts.quarantined_records:
+            raise ValueError("excluded_records cannot exceed quarantined_records")
         return self
 
 
@@ -184,7 +187,7 @@ class _Observed:
     lineage_contract_valid: bool = True
 
     def mark_invalid(self, kind: str | None) -> None:
-        if kind in {"accepted", "quarantined_trajectories"}:
+        if kind in {"trajectory", "accepted", "quarantined_trajectories"}:
             self.trajectory_contract_valid = False
         if kind == "quarantined_trajectories":
             self.quarantine_contract_valid = False
@@ -218,8 +221,16 @@ def _safe_manifest_path(root: Path, relative: str) -> Path | None:
     return candidate
 
 
-def _file_kind(relative: str) -> str | None:
+def _file_kind(relative: str, schema_version: str) -> str | None:
     pure = PurePosixPath(relative)
+    if schema_version == "trajfoundry-v4":
+        if len(pure.parts) != 1:
+            return None
+        if pure.name == "lineage.jsonl":
+            return "lineage"
+        if pure.name.endswith(".jsonl"):
+            return "trajectory"
+        return None
     parts = pure.parts
     if len(parts) >= 3 and parts[0] == "generations":
         if not re.fullmatch(r"[0-9a-f]{32}", parts[1]):
@@ -251,6 +262,8 @@ def _validate_row(
     kind: str | None,
     file_index: int,
     line_no: int,
+    relative_path: str,
+    allow_legacy_metadata: bool,
     observed: _Observed,
     errors: _ErrorCollector,
 ) -> None:
@@ -260,23 +273,37 @@ def _validate_row(
         errors.add(f"{context} must contain a JSON object")
         return
 
-    if kind in {"accepted", "quarantined_trajectories"}:
+    if kind in {"trajectory", "accepted", "quarantined_trajectories"}:
         try:
-            node = parse_trajectory_record(value)
+            node = parse_trajectory_record(
+                value, allow_legacy_metadata=allow_legacy_metadata
+            )
         except (OutputContractError, ValidationError):
             observed.mark_invalid(kind)
             errors.add(f"{context} violates the TrajectoryNode contract")
             return
         observed.trajectory_ids[trajectory_id(node)] += 1
+        strict = is_strict_sample(node)
+        if kind == "trajectory":
+            try:
+                expected_filename = trajectory_filename(node)
+            except ValueError:
+                errors.add(f"{context} cannot produce a safe trajectory filename")
+            else:
+                if relative_path != expected_filename:
+                    errors.add(f"{context} filename does not match trajectory metadata")
+            observed.counts["accepted" if strict else "quarantined_trajectories"] += 1
+            if not strict and node.normalization_audit is not None:
+                observed.reason_counts.update(node.normalization_audit.reason_codes)
         try:
             validate_derived_fields(node)
         except StaleDerivedFieldsError:
             errors.add(f"{context} has stale or inconsistent derived quality fields")
         if kind == "accepted":
-            if not is_strict_sample(node):
+            if not strict:
                 errors.add(f"{context} is not a strict accepted sample")
-        else:
-            if is_strict_sample(node):
+        elif kind == "quarantined_trajectories":
+            if strict:
                 errors.add(f"{context} is strict and must not be quarantined")
             if node.normalization_audit is not None:
                 observed.reason_counts.update(node.normalization_audit.reason_codes)
@@ -321,6 +348,8 @@ def _validate_jsonl_stream(
     *,
     kind: str | None,
     file_index: int,
+    relative_path: str,
+    allow_legacy_metadata: bool,
     observed: _Observed,
     errors: _ErrorCollector,
 ) -> _StreamResult:
@@ -358,6 +387,8 @@ def _validate_jsonl_stream(
                     kind=kind,
                     file_index=file_index,
                     line_no=line_no,
+                    relative_path=relative_path,
+                    allow_legacy_metadata=allow_legacy_metadata,
                     observed=observed,
                     errors=errors,
                 )
@@ -374,6 +405,8 @@ def _validate_jsonl_stream(
                 kind=kind,
                 file_index=file_index,
                 line_no=line_no,
+                relative_path=relative_path,
+                allow_legacy_metadata=allow_legacy_metadata,
                 observed=observed,
                 errors=errors,
             )
@@ -384,6 +417,10 @@ def _validate_jsonl_stream(
         except Exception:  # noqa: BLE001
             observed.mark_invalid(kind)
             errors.add(f"manifest files[{file_index}] could not be read completely")
+
+    if complete and kind == "trajectory" and line_no != 1:
+        observed.mark_invalid(kind)
+        errors.add(f"manifest files[{file_index}] must contain exactly one trajectory")
 
     return _StreamResult(
         bytes_read=bytes_read,
@@ -398,6 +435,8 @@ def _validate_jsonl_row(
     kind: str | None,
     file_index: int,
     line_no: int,
+    relative_path: str,
+    allow_legacy_metadata: bool,
     observed: _Observed,
     errors: _ErrorCollector,
 ) -> None:
@@ -422,6 +461,8 @@ def _validate_jsonl_row(
         kind=kind,
         file_index=file_index,
         line_no=line_no,
+        relative_path=relative_path,
+        allow_legacy_metadata=allow_legacy_metadata,
         observed=observed,
         errors=errors,
     )
@@ -462,6 +503,11 @@ class _LocalValidationBackend:
                 )
         if (self._root / "lineage.jsonl").is_file():
             files.add("lineage.jsonl")
+        files.update(
+            path.name
+            for path in self._root.glob("*.jsonl")
+            if path.is_file() and not path.is_symlink()
+        )
         for generation_id in generation_ids:
             generation = self._root / "generations" / generation_id
             if generation.is_dir() and not generation.is_symlink():
@@ -479,16 +525,19 @@ def _compare_manifest_counts(
     errors: _ErrorCollector,
 ) -> None:
     expected = manifest.counts
-    directly_observed = {
+    directly_observed: dict[str, int] = {
         "accepted": observed.counts["accepted"],
         "quarantined_trajectories": observed.counts["quarantined_trajectories"],
-        "quarantined_records": observed.counts["quarantined_records"],
     }
+    if manifest.schema_version != "trajfoundry-v4":
+        directly_observed["quarantined_records"] = observed.counts[
+            "quarantined_records"
+        ]
     for name, actual in directly_observed.items():
         if getattr(expected, name) != actual:
             errors.add(f"manifest count {name} does not match the JSONL rows")
 
-    if (
+    if manifest.schema_version != "trajfoundry-v4" and (
         observed.records_contract_valid
         and expected.excluded_records != observed.counts["excluded_records"]
     ):
@@ -498,10 +547,28 @@ def _compare_manifest_counts(
         and expected.duplicate_trajectories != observed.counts["duplicate_trajectories"]
     ):
         errors.add("manifest count duplicate_trajectories does not match lineage")
-    if observed.quarantine_contract_valid and observed.records_contract_valid:
+    if (
+        manifest.schema_version != "trajfoundry-v4"
+        and observed.quarantine_contract_valid
+        and observed.records_contract_valid
+    ):
         actual_reasons = dict(sorted(observed.reason_counts.items()))
         if expected.reason_counts != actual_reasons:
             errors.add("manifest reason_counts does not match quarantined output")
+    elif manifest.schema_version == "trajfoundry-v4":
+        declared_reason_total = sum(expected.reason_counts.values())
+        observed_reason_total = sum(observed.reason_counts.values())
+        required_reason_total = observed_reason_total + expected.quarantined_records
+        if declared_reason_total < required_reason_total:
+            errors.add(
+                "manifest reason_counts does not account for quarantined records"
+            )
+        for reason, count in observed.reason_counts.items():
+            if expected.reason_counts.get(reason, 0) < count:
+                errors.add(
+                    "manifest reason_counts does not cover quarantined trajectories"
+                )
+                break
 
 
 def validate_output_backend(
@@ -536,6 +603,10 @@ def validate_output_backend(
     observed.counts["manifest_files"] = len(manifest.files)
     observed.counts["input_files_declared"] = manifest.counts.input_files
     observed.counts["skipped_inputs"] = manifest.counts.skipped_inputs
+    if manifest.schema_version == "trajfoundry-v4":
+        # v4 deliberately retains failed-record accounting only in the manifest.
+        observed.counts["quarantined_records"] = manifest.counts.quarantined_records
+        observed.counts["excluded_records"] = manifest.counts.excluded_records
     seen_paths: set[str] = set()
     lineage_entries = 0
 
@@ -548,7 +619,7 @@ def validate_output_backend(
             continue
         seen_paths.add(entry.path)
 
-        kind = _file_kind(entry.path)
+        kind = _file_kind(entry.path, manifest.schema_version)
         if kind is None:
             errors.add(f"manifest files[{file_index}] is not a supported output file")
         elif kind == "lineage":
@@ -575,6 +646,12 @@ def validate_output_backend(
             source.stream,
             kind=kind,
             file_index=file_index,
+            relative_path=entry.path,
+            allow_legacy_metadata=manifest.schema_version
+            in {
+                "trajfoundry-v2",
+                "trajfoundry-v3",
+            },
             observed=observed,
             errors=file_errors,
         )
@@ -625,10 +702,10 @@ def validate_output_backend(
         errors.add("trajectory IDs must be globally unique")
     if any(count != 1 for count in observed.lineage_ids.values()):
         errors.add("lineage trajectory IDs must be globally unique")
-    if (
-        len(observed.covered_sources) + manifest.counts.skipped_inputs
-        != manifest.counts.input_files
-    ):
+    accounted_sources = len(observed.covered_sources) + manifest.counts.skipped_inputs
+    if manifest.schema_version == "trajfoundry-v4":
+        accounted_sources += manifest.counts.quarantined_records
+    if accounted_sources != manifest.counts.input_files:
         errors.add(
             "input_files does not match unique lineage, quarantine, and skipped sources"
         )

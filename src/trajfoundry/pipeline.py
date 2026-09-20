@@ -53,7 +53,7 @@ from .subagents import (
 )
 from .tool_names import is_spawn_tool_name
 
-NORMALIZER_REVISION = "2026-09-17.1"
+NORMALIZER_REVISION = "2026-09-21.1"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 _INGEST_BATCH_ITEMS = 512
@@ -1050,6 +1050,7 @@ def _build_trajectories(state: StateStore, stats: PipelineStats) -> None:
                 _origin_rows(state, leaves_by_index[orphan_index].contributor_paths),
             )
             del node, snapshot, enriched
+    state.assign_sub_session_ids()
     stats.stored_trajectories = state.trajectory_count()
 
 

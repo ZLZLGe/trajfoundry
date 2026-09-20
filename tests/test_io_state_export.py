@@ -3,8 +3,10 @@ import zlib
 from pathlib import Path
 
 import orjson
+import pytest
 import zstandard
 
+from trajfoundry import export as export_module
 from trajfoundry.canonical import trajectory_id
 from trajfoundry.export import OutputSet
 from trajfoundry.io import JsonlShardWriter, load_capture
@@ -20,6 +22,7 @@ from trajfoundry.models import (
 )
 from trajfoundry.quality import enrich_trajectory
 from trajfoundry.state import StateStore
+from trajfoundry.validation import validate_output
 
 
 def test_capture_loader_drops_sensitive_headers(tmp_path: Path) -> None:
@@ -530,6 +533,47 @@ def test_state_round_trip_preserves_trajectory_media_mapping(tmp_path: Path) -> 
     ]
 
 
+def test_empty_published_session_is_synthesized_for_sub_session_assignment(
+    tmp_path: Path,
+) -> None:
+    def node(source: str, content: str) -> TrajectoryNode:
+        return enrich_trajectory(
+            TrajectoryNode(
+                messages=[
+                    Message(role="user", content=content),
+                    Message(role="assistant", content="done", reasoning_content=""),
+                ],
+                tools=[],
+                source=source,
+                metadata=Metadata(source_file=source, session_id=""),
+                normalization_audit=NormalizationAudit(tag=AuditTag.PASS),
+            )
+        )
+
+    first = node("first.json", "first")
+    second = node("second.json", "second")
+
+    with StateStore(tmp_path / "state.sqlite") as state:
+        for item in (first, second):
+            identifier = trajectory_id(item)
+            state.put_trajectory(
+                identifier,
+                item,
+                representative_key=item.metadata.source_file,
+                source_ref=item.metadata.source_file,
+                sha256="a" * 64,
+                captured_at=item.metadata.created_at,
+                disposition="pass",
+                reason_codes=[],
+            )
+        state.assign_sub_session_ids()
+        restored = list(state.iter_trajectories())
+
+    assert len(restored) == 2
+    assert all(item.metadata.session_id == "" for _, item, _ in restored)
+    assert all(item.metadata.sub_session_id == 0 for _, item, _ in restored)
+
+
 def test_failed_reparse_removes_stale_snapshot(tmp_path: Path) -> None:
     snapshot = Snapshot(
         source_path="v1/p/s/a.json",
@@ -679,9 +723,7 @@ def test_export_writes_manifest_and_lineage(tmp_path: Path) -> None:
     manifest = orjson.loads((tmp_path / "manifest.json").read_bytes())
     assert manifest["counts"]["accepted"] == 1
     lineage = next(
-        entry["path"]
-        for entry in manifest["files"]
-        if entry["path"].endswith("/lineage.jsonl")
+        entry["path"] for entry in manifest["files"] if entry["path"] == "lineage.jsonl"
     )
     assert (tmp_path / lineage).is_file()
 
@@ -694,7 +736,7 @@ def test_export_counts_skipped_inputs_without_emitting_rows(tmp_path: Path) -> N
     output.close(input_root="/input", config_hash="config", input_format="tokenplan")
 
     manifest = orjson.loads((tmp_path / "manifest.json").read_bytes())
-    assert manifest["schema_version"] == "trajfoundry-v3"
+    assert manifest["schema_version"] == "trajfoundry-v4"
     assert manifest["input_format"] == "tokenplan"
     assert manifest["counts"]["skipped_inputs"] == 2
     assert manifest["counts"]["skip_reason_counts"] == {
@@ -714,7 +756,7 @@ def test_aborted_export_publishes_no_partial_run(tmp_path: Path) -> None:
             metadata=Metadata(source_file="a.json"),
         )
     )
-    output = OutputSet(tmp_path, max_shard_bytes=1)
+    output = OutputSet(tmp_path)
     output.write_trajectory(node, [{"source_ref": "a.json", "sha256": "a" * 64}])
     output.abort()
 
@@ -723,7 +765,26 @@ def test_aborted_export_publishes_no_partial_run(tmp_path: Path) -> None:
     assert not list(tmp_path.glob(".staging-*"))
 
 
-def test_publish_keeps_previous_immutable_generation(tmp_path: Path) -> None:
+def test_export_rejects_trajectory_over_max_shard_bytes(tmp_path: Path) -> None:
+    node = enrich_trajectory(
+        TrajectoryNode(
+            messages=[Message(role="assistant", content="done", reasoning_content="")],
+            tools=[],
+            source="oversized.json",
+            metadata=Metadata(source_file="oversized.json"),
+        )
+    )
+    output = OutputSet(tmp_path, max_shard_bytes=1)
+    with pytest.raises(ValueError, match="exceeds max_shard_bytes"):
+        output.write_trajectory(
+            node, [{"source_ref": "oversized.json", "sha256": "a" * 64}]
+        )
+    output.abort()
+
+    assert not list(tmp_path.rglob("*.jsonl"))
+
+
+def test_flat_publish_replaces_the_same_stable_files(tmp_path: Path) -> None:
     node = enrich_trajectory(
         TrajectoryNode(
             messages=[Message(role="assistant", content="done", reasoning_content="")],
@@ -745,8 +806,108 @@ def test_publish_keeps_previous_immutable_generation(tmp_path: Path) -> None:
     second.close(input_root="/input", config_hash="config")
     second_manifest = orjson.loads((tmp_path / "manifest.json").read_bytes())
 
-    assert first_manifest["files"] != second_manifest["files"]
+    assert first_manifest["files"] == second_manifest["files"]
     assert all(path.is_file() for path in first_paths)
-    assert all(
-        entry["path"].startswith("generations/") for entry in second_manifest["files"]
+    assert all("/" not in entry["path"] for entry in second_manifest["files"])
+
+
+def test_flat_publish_removes_only_stale_manifest_files(tmp_path: Path) -> None:
+    def node(session_id: str, source: str) -> TrajectoryNode:
+        return enrich_trajectory(
+            TrajectoryNode(
+                messages=[
+                    Message(role="assistant", content="done", reasoning_content="")
+                ],
+                tools=[],
+                source=source,
+                metadata=Metadata(source_file=source, session_id=session_id),
+            )
+        )
+
+    first = OutputSet(tmp_path)
+    first.stats.input_files = 2
+    first.write_trajectory(
+        node("session-a", "a.json"),
+        [{"source_ref": "a.json", "sha256": "a" * 64}],
     )
+    first.write_trajectory(
+        node("session-b", "b.json"),
+        [{"source_ref": "b.json", "sha256": "b" * 64}],
+    )
+    first.close(input_root="/input", config_hash="config")
+    unrelated = tmp_path / "keep.json"
+    unrelated.write_text("keep")
+
+    second = OutputSet(tmp_path)
+    second.stats.input_files = 1
+    second.write_trajectory(
+        node("session-a", "a.json"),
+        [{"source_ref": "a.json", "sha256": "a" * 64}],
+    )
+    second.close(input_root="/input", config_hash="config")
+
+    assert (tmp_path / "session-a_sub_0.jsonl").is_file()
+    assert not (tmp_path / "session-b_sub_0.jsonl").exists()
+    assert unrelated.read_text() == "keep"
+
+
+def test_flat_publish_recovers_after_post_cleanup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def node(session_id: str, source: str) -> TrajectoryNode:
+        return enrich_trajectory(
+            TrajectoryNode(
+                messages=[
+                    Message(role="assistant", content="done", reasoning_content="")
+                ],
+                tools=[],
+                source=source,
+                metadata=Metadata(source_file=source, session_id=session_id),
+                normalization_audit=NormalizationAudit(tag=AuditTag.PASS),
+            )
+        )
+
+    first = OutputSet(tmp_path)
+    first.stats.input_files = 2
+    first.write_trajectory(
+        node("session-a", "a.json"),
+        [{"source_ref": "a.json", "sha256": "a" * 64}],
+    )
+    first.write_trajectory(
+        node("session-b", "b.json"),
+        [{"source_ref": "b.json", "sha256": "b" * 64}],
+    )
+    first.close(input_root="/input", config_hash="config")
+
+    original_unlink = export_module._unlink_local_output_path
+    state = {"failed": False}
+
+    def fail_once(path: Path) -> None:
+        if path.name == "session-b_sub_0.jsonl" and not state["failed"]:
+            state["failed"] = True
+            raise OSError("injected delete failure")
+        original_unlink(path)
+
+    monkeypatch.setattr(export_module, "_unlink_local_output_path", fail_once)
+    second = OutputSet(tmp_path)
+    second.stats.input_files = 1
+    second.write_trajectory(
+        node("session-a", "a.json"),
+        [{"source_ref": "a.json", "sha256": "a" * 64}],
+    )
+    with pytest.raises(OSError, match="post-publication cleanup"):
+        second.close(input_root="/input", config_hash="config")
+
+    # The new manifest is already published, but the failed deletion leaves the
+    # old object for the next run's preflight pass.
+    assert (tmp_path / "session-b_sub_0.jsonl").is_file()
+    third = OutputSet(tmp_path)
+    third.stats.input_files = 1
+    third.write_trajectory(
+        node("session-a", "a.json"),
+        [{"source_ref": "a.json", "sha256": "a" * 64}],
+    )
+    third.close(input_root="/input", config_hash="config")
+
+    assert not (tmp_path / "session-b_sub_0.jsonl").exists()
+    assert validate_output(tmp_path).valid

@@ -127,22 +127,25 @@ def test_tokenplan_pipeline_includes_test_and_publishes_media_mapping(
     assert stats.skipped_inputs == 0
 
     manifest = orjson.loads((output_root / "manifest.json").read_bytes())
-    assert manifest["schema_version"] == "trajfoundry-v3"
+    assert manifest["schema_version"] == "trajfoundry-v4"
     assert manifest["input_format"] == "tokenplan"
     assert manifest["counts"]["input_files"] == 3
     assert manifest["counts"]["accepted"] == 2
     assert manifest["counts"]["skipped_inputs"] == 0
     assert manifest["counts"]["skip_reason_counts"] == {}
 
-    accepted_path = _manifest_file(output_root, "/accepted/trajectories-00000.jsonl")
     accepted_rows = [
-        orjson.loads(line) for line in accepted_path.read_bytes().splitlines()
+        orjson.loads((output_root / entry["path"]).read_bytes())
+        for entry in manifest["files"]
+        if entry["path"] != "lineage.jsonl"
     ]
     good_row = next(
         row
         for row in accepted_rows
         if row["metadata"]["source_file"] == "req_good.json"
     )
+    good_sub_session_id = good_row["metadata"].pop("sub_session_id")
+    assert good_sub_session_id in {0, 1}
     assert good_row["metadata"] == {
         "source_file": "req_good.json",
         "source_name": "tokenplan",
@@ -160,14 +163,14 @@ def test_tokenplan_pipeline_includes_test_and_publishes_media_mapping(
         for row in accepted_rows
         if row["metadata"]["source_file"] == "req_media.json"
     )
+    assert media_row["metadata"]["sub_session_id"] in {0, 1}
+    assert media_row["metadata"]["sub_session_id"] != good_sub_session_id
     assert media_row["multimodal_file_mapping"] == [
         {"part_id": "media_0", "object_name": "media_0-test.png"}
     ]
 
-    records_path = _manifest_file(output_root, "/quarantine/records-00000.jsonl")
-    record = orjson.loads(records_path.read_bytes().splitlines()[0])
-    assert record["source_ref"].endswith("req_empty.json")
-    assert record["normalization_audit"]["reason_codes"] == ["tokenplan_empty_envelope"]
+    assert manifest["counts"]["quarantined_records"] == 1
+    assert manifest["counts"]["reason_counts"]["tokenplan_empty_envelope"] == 1
     report = validate_output(output_root)
     assert report.valid
     assert report.counts["skipped_inputs"] == 0

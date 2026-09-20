@@ -42,7 +42,7 @@ def normalize_command(
     ] = "freerouter",
     output_root: Annotated[
         Path,
-        typer.Option("--output", help="Destination for normalized shards."),
+        typer.Option("--output", help="Destination for normalized JSONL objects."),
     ] = DEFAULT_OUTPUT,
     resume: Annotated[
         bool,
@@ -54,10 +54,13 @@ def normalize_command(
     ] = None,
     max_shard_mib: Annotated[
         int,
-        typer.Option(min=1, help="Maximum uncompressed size of each JSONL shard."),
+        typer.Option(
+            min=1,
+            help=("Maximum serialized size of one trajectory JSONL object, in MiB."),
+        ),
     ] = 512,
 ) -> None:
-    """Normalize captures, aggregate trajectories, and publish output shards."""
+    """Normalize captures, aggregate trajectories, and publish JSONL output."""
 
     try:
         stats = run_normalize(
@@ -130,7 +133,9 @@ def inspect_command(
         for entry in manifest.get("files", [])
         if isinstance(entry, dict)
         and isinstance(entry.get("path"), str)
-        and entry["path"].endswith("/lineage.jsonl")
+        and (
+            entry["path"] == "lineage.jsonl" or entry["path"].endswith("/lineage.jsonl")
+        )
     ]
     if len(lineage_entries) != 1:
         typer.echo("inspect failed: manifest has no unique lineage file", err=True)
