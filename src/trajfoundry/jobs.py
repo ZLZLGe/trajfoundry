@@ -15,7 +15,6 @@ from .pipeline import PipelineConfig, PipelineStats, normalize, normalize_source
 from .s3 import S3CaptureSource, S3Location, create_s3_client, parse_s3_uri
 from .s3_output import S3OutputSet
 from .s3_validation import S3ValidationBackend
-from .s3_validation import _is_not_found as _is_missing_s3_object
 from .validation import ValidationReport, validate_output, validate_output_backend
 
 LOGGER = logging.getLogger(__name__)
@@ -68,37 +67,6 @@ def _locations_overlap(left: S3Location, right: S3Location) -> bool:
     )
 
 
-def _read_s3_response_bytes(response: dict[str, Any]) -> bytes:
-    """Read and close a small S3 response without exposing its contents."""
-
-    body = response.get("Body")
-    if body is None or not callable(getattr(body, "read", None)):
-        raise OSError("S3 response has no readable body")
-    payload = bytearray()
-    try:
-        while True:
-            chunk = body.read(1024 * 1024)
-            if not chunk:
-                break
-            if not isinstance(chunk, bytes):
-                raise TypeError("S3 response body must yield bytes")
-            payload.extend(chunk)
-    finally:
-        close = getattr(body, "close", None)
-        if callable(close):
-            close()
-
-    content_length = response.get("ContentLength")
-    if (
-        not isinstance(content_length, int)
-        or isinstance(content_length, bool)
-        or content_length < 0
-        or content_length != len(payload)
-    ):
-        raise OSError("S3 response byte count does not match")
-    return bytes(payload)
-
-
 def _close_s3_client(client: Any) -> None:
     close = getattr(client, "close", None)
     if not callable(close):
@@ -137,20 +105,6 @@ def _flat_manifest_jsonl_paths(manifest_bytes: bytes | None) -> set[str]:
         ):
             paths.add(relative)
     return paths
-
-
-def _read_previous_manifest(client: Any, location: S3Location) -> bytes | None:
-    key = location.key("manifest.json")
-    try:
-        response = client.get_object(Bucket=location.bucket, Key=key)
-    except KeyError:
-        # In-memory clients commonly represent a missing object as a KeyError.
-        return None
-    except Exception as error:
-        if _is_missing_s3_object(error, client):
-            return None
-        raise
-    return _read_s3_response_bytes(response)
 
 
 def _list_flat_jsonl_paths(client: Any, location: S3Location) -> set[str]:
@@ -196,17 +150,12 @@ def _run_s3_job_with_client(
     workspace: Path,
     max_shard_bytes: int,
 ) -> JobResult:
-    previous_manifest = _read_previous_manifest(client, output_location)
-    previous_flat_paths = _flat_manifest_jsonl_paths(previous_manifest)
-    # Clean objects left by an interrupted or failed prior publication before
-    # writing any new flat object.  The published manifest is the keep-set.
+    # Existing flat objects are retained while the candidate is being built so
+    # validation can ignore files from the previous publication.  They are
+    # removed after the new manifest is published.  In particular, do not read
+    # manifest.json here: some S3-compatible stores return AccessDenied for a
+    # missing object, which must not prevent a first run.
     listed_flat_paths = _list_flat_jsonl_paths(client, output_location)
-    _delete_flat_jsonl_paths(
-        client,
-        output_location,
-        paths=listed_flat_paths - previous_flat_paths,
-        phase="preflight",
-    )
     source = S3CaptureSource(client, input_location)
     with TemporaryDirectory(prefix="trajfoundry-state-", dir=workspace) as directory:
         stats, manifest_bytes = normalize_source(
@@ -227,7 +176,7 @@ def _run_s3_job_with_client(
         S3ValidationBackend(
             client,
             output_location,
-            ignored_flat_paths=frozenset(previous_flat_paths - current_flat_paths),
+            ignored_flat_paths=frozenset(listed_flat_paths - current_flat_paths),
         ),
     )
     if not report.valid:
@@ -240,14 +189,13 @@ def _run_s3_job_with_client(
         Body=manifest_bytes,
         ContentType="application/json",
     )
-    published = _read_s3_response_bytes(
-        client.get_object(Bucket=output_location.bucket, Key=manifest_key)
-    )
-    if published != manifest_bytes:
-        raise OSError("published S3 manifest verification failed")
+    # Treat the manifest as write-only here.  Some S3-compatible deployments
+    # grant PutObject but deny GetObject, and publication already succeeded if
+    # the put call returned without error.
     # Flat keys cannot provide generation-level atomic replacement: existing
     # names may be overwritten before this manifest commit. Cleanup therefore
-    # happens after publication and is restricted to the old manifest's files.
+    # happens after publication and is restricted to listed flat objects that
+    # are not part of the newly published manifest.
     _delete_flat_jsonl_paths(
         client,
         output_location,

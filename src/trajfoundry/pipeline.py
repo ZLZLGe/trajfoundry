@@ -53,7 +53,7 @@ from .subagents import (
 )
 from .tool_names import is_spawn_tool_name
 
-NORMALIZER_REVISION = "2026-09-21.1"
+NORMALIZER_REVISION = "2026-09-21.2"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 _INGEST_BATCH_ITEMS = 512

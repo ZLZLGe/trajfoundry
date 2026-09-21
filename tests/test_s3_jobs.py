@@ -272,14 +272,53 @@ def test_run_s3_job_streams_valid_generation_then_publishes_manifest_last(
         for index, call in enumerate(client.calls)
         if call == ("get_object", manifest_key)
     ]
-    assert manifest_get_indices
-    manifest_put_index = max(
-        index
-        for index, call in enumerate(client.calls)
-        if call == ("put_object", manifest_key)
-    )
-    assert manifest_get_indices[-1] == manifest_put_index + 1
+    assert not manifest_get_indices
     assert client.calls[-1] == ("close", "")
+    assert client.closed
+
+
+def test_run_s3_job_does_not_read_existing_output_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = _MemoryS3Client()
+    input_key = "lakehouse/free-router/masked-raw/v001/dt=2026-09-09/capture.json"
+    manifest_key = "lakehouse/free-router/normalized/v002/dt=2026-09-09/manifest.json"
+    client.objects[("agent-trajectory", input_key)] = _capture()
+    client.objects[("agent-trajectory", manifest_key)] = b"previous manifest"
+
+    original_get_object = client.get_object
+
+    def deny_manifest_read(*, Bucket: str, Key: str, **kwargs: str) -> dict[str, Any]:
+        if Key == manifest_key:
+            raise PermissionError("manifest reads are forbidden")
+        return original_get_object(Bucket=Bucket, Key=Key, **kwargs)
+
+    monkeypatch.setattr(client, "get_object", deny_manifest_read)
+
+    result = _run(monkeypatch, tmp_path, client)
+
+    assert result.validation.valid
+    assert client.objects[("agent-trajectory", manifest_key)] != b"previous manifest"
+
+
+def test_run_s3_job_preserves_output_listing_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = _MemoryS3Client()
+    input_key = "lakehouse/free-router/masked-raw/v001/dt=2026-09-09/capture.json"
+    client.objects[("agent-trajectory", input_key)] = _capture()
+
+    def deny_listing(operation: str) -> _Paginator:
+        raise PermissionError(f"listing denied for {operation}")
+
+    monkeypatch.setattr(client, "get_paginator", deny_listing)
+
+    with pytest.raises(OSError, match="enumerate managed S3 output JSONL files"):
+        _run(monkeypatch, tmp_path, client)
+
+    assert not any(call[0] == "put_object" for call in client.calls)
     assert client.closed
 
 
