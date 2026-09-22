@@ -4,11 +4,13 @@ import json
 
 from trajfoundry.models import (
     AgentMessageEvidence,
+    AuditTag,
     FunctionCall,
     Message,
     Metadata,
     Snapshot,
     ToolCall,
+    ToolDefinition,
     TrajectoryNode,
 )
 from trajfoundry.output_contract import project_trajectory
@@ -710,6 +712,136 @@ def test_responses_mount_uses_canonical_agent_name_and_unique_ordered_relay() ->
     )
     assert result.roots[0].sub_agent_relay_mounts == {"spawn-1": "relay-1"}
     assert result.roots[0].agent_messages[0].item == parent.agent_messages[0].item
+
+
+def test_materialization_quarantines_relay_missing_from_local_parent() -> None:
+    event, parent, child = _responses_relay_snapshots(parent_agent_messages=[])
+    evidence_parent = parent.model_copy(
+        update={
+            "source_path": "/parent-evidence.json",
+            "source_sha256": "parent-evidence",
+            "request_id": "parent-evidence",
+            "agent_messages": [
+                agent_message(
+                    "relay-1",
+                    author="/root/child",
+                    recipient="/root",
+                    preceding=["spawn-1"],
+                )
+            ],
+        },
+        deep=True,
+    )
+    parent_node = node(parent).model_copy(
+        update={"tools": [ToolDefinition(name="spawn_agent")]},
+        deep=True,
+    )
+
+    result = mount_subagents(
+        [
+            SnapshotTrajectory(parent, parent_node),
+            SnapshotTrajectory(child, node(child)),
+        ],
+        all_snapshots=[event, evidence_parent, parent, child],
+    )
+
+    root = result.roots[0]
+    assert root.sub_agent_trajectory is not None
+    assert set(root.sub_agent_trajectory) == {"spawn-1"}
+    assert root.sub_agent_relay_mounts is None
+    assert root.agent_messages == []
+    assert root.normalization_audit is not None
+    assert root.normalization_audit.tag == AuditTag.QUARANTINED
+    assert "ambiguous_agent_relay" in root.normalization_audit.reason_codes
+    issue = next(
+        issue
+        for issue in root.normalization_audit.issues
+        if issue.code == "ambiguous_agent_relay"
+    )
+    assert issue.path == "/sub_agent_relay_mounts/spawn-1"
+    assert "matched 0" in issue.detail
+    assert root.completeness is not None
+    assert root.completeness.relay_mounts == 0
+    assert root.completeness.subtree_complete
+    project_trajectory(root)
+
+
+def test_materialization_keeps_valid_relay_when_another_is_unresolved() -> None:
+    event, parent, child_a, child_b = _responses_multi_spawn_snapshots(
+        parent_agent_messages=[
+            agent_message(
+                "relay-b",
+                author="/root/child-b",
+                recipient="/root",
+                preceding=["spawn-a", "spawn-b"],
+            )
+        ]
+    )
+    evidence_parent = parent.model_copy(
+        update={
+            "source_path": "/parent-evidence.json",
+            "source_sha256": "parent-evidence",
+            "request_id": "parent-evidence",
+            "agent_messages": [
+                agent_message(
+                    "relay-a",
+                    author="/root/child-a",
+                    recipient="/root",
+                    preceding=["spawn-a"],
+                ),
+                agent_message(
+                    "relay-b",
+                    author="/root/child-b",
+                    recipient="/root",
+                    preceding=["spawn-a", "spawn-b"],
+                    item_index=1,
+                ),
+            ],
+        },
+        deep=True,
+    )
+    spawn_definition = ToolDefinition(
+        name="spawn_agent",
+        parameters={
+            "type": "object",
+            "properties": {
+                "task_name": {"type": "string"},
+                "message": {"type": "string"},
+            },
+        },
+    )
+    parent_node = node(parent).model_copy(
+        update={"tools": [spawn_definition]},
+        deep=True,
+    )
+
+    result = mount_subagents(
+        [
+            SnapshotTrajectory(parent, parent_node),
+            SnapshotTrajectory(child_a, node(child_a)),
+            SnapshotTrajectory(child_b, node(child_b)),
+        ],
+        all_snapshots=[event, evidence_parent, parent, child_a, child_b],
+    )
+
+    root = result.roots[0]
+    assert root.sub_agent_trajectory is not None
+    assert set(root.sub_agent_trajectory) == {"spawn-a", "spawn-b"}
+    assert root.sub_agent_relay_mounts == {"spawn-b": "relay-b"}
+    assert [record.item["id"] for record in root.agent_messages] == ["relay-b"]
+    assert root.normalization_audit is not None
+    assert root.normalization_audit.tag == AuditTag.QUARANTINED
+    issue = next(
+        issue
+        for issue in root.normalization_audit.issues
+        if issue.code == "ambiguous_agent_relay"
+    )
+    assert issue.path == "/sub_agent_relay_mounts/spawn-a"
+    assert "matched 0" in issue.detail
+    assert root.completeness is not None
+    assert root.completeness.relay_mounts == 1
+    assert root.completeness.subtree_complete
+    project_trajectory(root)
 
 
 def test_multiple_ordered_agent_messages_do_not_guess_a_relay() -> None:

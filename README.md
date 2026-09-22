@@ -192,7 +192,11 @@ timestamp changes.
   by `spawn_agent`, a matching child recipient, and one unique parent-side
   `agent_message` after the corresponding call/result pair has completed.
   Missing or conflicting relay evidence never removes an otherwise proven
-  parent/child mount. Raw relay content is retained but never parsed for routing.
+  parent/child mount. If final contributor materialization leaves zero or
+  multiple local records for a selected relay id, only that optional mapping
+  is omitted and the parent is quarantined; raw relay content is retained but
+  never parsed for routing. In the flat v4 layout, this disposition is carried
+  by `normalization_audit` and manifest counts rather than output directories.
 - Semantic hashes deduplicate completed trajectory trees within their normalized
   identity boundary (`user_id` and `session_id`); source file, timestamp, and
   other provenance remain outside the hash. `lineage.jsonl` retains every

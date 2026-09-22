@@ -48,12 +48,13 @@ from .state import StateStore
 from .streaming import streaming_prefix_leaves
 from .subagents import (
     SubagentMountPlan,
+    _accept_local_relay_mount,
     diagnostic_applies_to_snapshot,
     plan_subagent_mounts,
 )
 from .tool_names import is_spawn_tool_name
 
-NORMALIZER_REVISION = "2026-09-21.2"
+NORMALIZER_REVISION = "2026-09-22.1"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 _INGEST_BATCH_ITEMS = 512
@@ -932,7 +933,11 @@ def _materialize_tree(
             child_index,
         )
         children[call_id] = child
-        if relay_id:
+        if relay_id and _accept_local_relay_mount(
+            node,
+            call_id=call_id,
+            relay_id=relay_id,
+        ):
             relay_mounts[call_id] = relay_id
     node.sub_agent_trajectory = children or None
     node.sub_agent_relay_mounts = relay_mounts or None

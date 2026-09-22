@@ -22,6 +22,7 @@ from .models import (
     AuditTag,
     Message,
     NormalizationAudit,
+    Severity,
     Snapshot,
     ToolCall,
     TrajectoryNode,
@@ -108,6 +109,49 @@ class SnapshotTrajectory:
 
     snapshot: Snapshot
     trajectory: TrajectoryNode
+
+
+def _accept_local_relay_mount(
+    node: TrajectoryNode,
+    *,
+    call_id: str,
+    relay_id: str,
+) -> bool:
+    """Keep a relay only when the materialized parent has one local record.
+
+    Mount planning intentionally uses a wider, routing-only evidence set than
+    the contributor records materialized on a particular parent leaf. A relay
+    selected from that wider set can therefore be absent locally, and replayed
+    opaque records can leave more than one local record with the same provider
+    id. Relay metadata is optional; the primary parent/child mount remains
+    valid when this check fails.
+    """
+
+    matches = [
+        record for record in node.agent_messages if record.item.get("id") == relay_id
+    ]
+    if len(matches) == 1:
+        return True
+
+    issue = AuditIssue(
+        code="ambiguous_agent_relay",
+        stage="subagents",
+        path=f"/sub_agent_relay_mounts/{call_id}",
+        detail=(
+            "relay evidence matched "
+            f"{len(matches)} local agent_message records; relay mount omitted"
+        ),
+    )
+    previous = node.normalization_audit
+    issues = [*(previous.issues if previous else ()), issue]
+    node.normalization_audit = NormalizationAudit(
+        tag=AuditTag.QUARANTINED,
+        reason_codes=sorted(
+            {item.code for item in issues if item.severity == Severity.ERROR}
+        ),
+        issues=issues,
+    )
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1641,7 +1685,11 @@ def mount_subagents(
         relay_mounts: dict[str, str] = {}
         for edge in child_edges:
             mounted[edge.spawn_call_id] = build(edge.child_index)
-            if edge.relay_id:
+            if edge.relay_id and _accept_local_relay_mount(
+                node,
+                call_id=edge.spawn_call_id,
+                relay_id=edge.relay_id,
+            ):
                 relay_mounts[edge.spawn_call_id] = edge.relay_id
 
         # Inputs to this stage are flat nodes.  Any pre-existing mounts were

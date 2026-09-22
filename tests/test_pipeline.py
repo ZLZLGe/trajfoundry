@@ -1335,7 +1335,14 @@ def test_missing_spawn_turn_id_only_quarantines_affected_branch(
     assert unaffected.normalization_audit.reason_codes == []
 
 
-def test_duplicate_child_leaf_is_merged_before_mounting(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "replayed_relay",
+    [False, True],
+    ids=["unique_relay", "replayed_relay"],
+)
+def test_duplicate_child_leaf_mounting_handles_replayed_relay(
+    tmp_path: Path, replayed_relay: bool
+) -> None:
     spawn = ToolCall(
         id="spawn-1",
         function=FunctionCall(
@@ -1409,6 +1416,23 @@ def test_duplicate_child_leaf_is_merged_before_mounting(tmp_path: Path) -> None:
             wire_complete=True,
         )
 
+    replayed_relay_record = AgentMessageEvidence(
+        origin="response",
+        item_index=1,
+        item={
+            "type": "agent_message",
+            "id": "relay-1",
+            "author": "/root/child",
+            "recipient": "/root",
+            "content": [
+                {
+                    "type": "encrypted_content",
+                    "encrypted_content": "opaque-replay",
+                }
+            ],
+        },
+        preceding_completed_spawn_call_ids=["spawn-1"],
+    )
     parent_event = snapshot(
         "parent-event",
         thread_id="main",
@@ -1417,6 +1441,7 @@ def test_duplicate_child_leaf_is_merged_before_mounting(tmp_path: Path) -> None:
         response=[spawn_message],
         captured_at="2026-08-27T00:00:00Z",
         tools=[spawn_definition],
+        agent_messages=[replayed_relay_record] if replayed_relay else [],
     )
     parent_leaf = snapshot(
         "parent-leaf",
@@ -1491,11 +1516,31 @@ def test_duplicate_child_leaf_is_merged_before_mounting(tmp_path: Path) -> None:
     assert len(stored) == 1
     _, root, origins = stored[0]
     assert root.normalization_audit is not None
-    assert root.normalization_audit.tag == AuditTag.PASS
+    if replayed_relay:
+        assert root.normalization_audit.tag == AuditTag.QUARANTINED
+        assert root.normalization_audit.reason_codes == ["ambiguous_agent_relay"]
+        issue = next(
+            issue
+            for issue in root.normalization_audit.issues
+            if issue.code == "ambiguous_agent_relay"
+        )
+        assert issue.path == "/sub_agent_relay_mounts/spawn-1"
+        assert "matched 2" in issue.detail
+    else:
+        assert root.normalization_audit.tag == AuditTag.PASS
+        assert root.normalization_audit.reason_codes == []
     assert root.sub_agent_trajectory is not None
     assert set(root.sub_agent_trajectory) == {"spawn-1"}
-    assert root.sub_agent_relay_mounts == {"spawn-1": "relay-1"}
-    assert root.agent_messages[0].item["unknown"] == "preserved"
+    assert root.sub_agent_relay_mounts == (
+        None if replayed_relay else {"spawn-1": "relay-1"}
+    )
+    assert len(root.agent_messages) == (2 if replayed_relay else 1)
+    assert {
+        record.item["content"][0]["encrypted_content"] for record in root.agent_messages
+    } == ({"opaque-replay", "opaque-relay"} if replayed_relay else {"opaque-relay"})
+    assert any(
+        record.item.get("unknown") == "preserved" for record in root.agent_messages
+    )
     assert root.metadata.model == "gpt-test"
     assert root.metadata.user_id == "user-main"
     assert root.metadata.session_id == "session"
@@ -1513,6 +1558,9 @@ def test_duplicate_child_leaf_is_merged_before_mounting(tmp_path: Path) -> None:
         "/input/child-a.json",
         "/input/child-b.json",
     }
+    assert root.completeness is not None
+    assert root.completeness.relay_mounts == (0 if replayed_relay else 1)
+    assert root.completeness.subtree_complete
 
     child = duplicate_children[0]
     variant = child.model_copy(update={"termination": "length"})
