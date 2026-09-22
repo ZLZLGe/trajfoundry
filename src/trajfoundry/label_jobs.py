@@ -123,50 +123,6 @@ def _get_object_bytes(client: Any, location: S3Location, relative: str) -> bytes
     return _read_response_bytes(response)
 
 
-def _missing_s3_object(error: Exception) -> bool:
-    if isinstance(error, KeyError):
-        return True
-    response = getattr(error, "response", None)
-    if not isinstance(response, dict):
-        return False
-    details = response.get("Error")
-    metadata = response.get("ResponseMetadata")
-    code = details.get("Code") if isinstance(details, dict) else None
-    status = metadata.get("HTTPStatusCode") if isinstance(metadata, dict) else None
-    return code in {"NoSuchKey", "404"} or status == 404
-
-
-def _previous_output_paths(client: Any, location: S3Location) -> set[str]:
-    try:
-        payload = _get_object_bytes(client, location, "manifest.json")
-    except Exception as error:
-        if _missing_s3_object(error):
-            return set()
-        raise
-    try:
-        manifest = orjson.loads(payload)
-    except orjson.JSONDecodeError:
-        return set()
-    if type(manifest) is not dict or manifest.get("schema_version") != (
-        "trajfoundry-classification-v1"
-    ):
-        return set()
-    files = manifest.get("files")
-    if type(files) is not list:
-        return set()
-    paths: set[str] = set()
-    for entry in files:
-        path = entry.get("path") if type(entry) is dict else None
-        if type(path) is not str or not path.endswith(".jsonl"):
-            return set()
-        try:
-            location.key(path)
-        except (TypeError, ValueError):
-            return set()
-        paths.add(path)
-    return paths
-
-
 def _list_flat_jsonl_paths(client: Any, location: S3Location) -> set[str]:
     """List top-level JSONL objects, including objects absent from a manifest."""
 
@@ -497,6 +453,7 @@ def _put_and_verify(
     payload: bytes,
     *,
     content_type: str,
+    verify_readback: bool = True,
 ) -> dict[str, str | int]:
     client.put_object(
         Bucket=location.bucket,
@@ -504,9 +461,12 @@ def _put_and_verify(
         Body=payload,
         ContentType=content_type,
     )
-    published = _get_object_bytes(client, location, relative_path)
-    if published != payload:
-        raise LabelJobError(f"published object verification failed: {relative_path}")
+    if verify_readback:
+        published = _get_object_bytes(client, location, relative_path)
+        if published != payload:
+            raise LabelJobError(
+                f"published object verification failed: {relative_path}"
+            )
     return {
         "path": relative_path,
         "sha256": hashlib.sha256(payload).hexdigest(),
@@ -685,6 +645,11 @@ def _run_s3_label_job_with_client(
     if not input_report.valid:
         detail = input_report.errors[0] if input_report.errors else "unknown error"
         raise LabelJobError(f"normalized input failed validation: {detail}")
+    # Verify output listing access before any model calls. Existing flat objects
+    # remain in place until the replacement manifest has been published. Do not
+    # read the old output manifest: some S3-compatible stores return AccessDenied
+    # for a missing object, which must not block a first classification run.
+    initial_output_paths = _list_flat_jsonl_paths(client, output_location)
     entries = _manifest_entries(manifest_bytes)
     trajectory_entries = [entry for entry in entries if _is_trajectory_entry(entry)]
     lineage_entries = [entry for entry in entries if _is_lineage_entry(entry)]
@@ -816,21 +781,6 @@ def _run_s3_label_job_with_client(
             output_manifest, option=orjson.OPT_SORT_KEYS | orjson.OPT_INDENT_2
         )
 
-        # All model calls and local contract checks have completed.  Only now
-        # remove unowned objects, immediately before the first publication.
-        # A failure here leaves the previously published manifest untouched and
-        # can be recovered by rerunning the job.
-        previous_paths = _previous_output_paths(client, output_location)
-        current_paths = {item.output_path for item in assigned}
-        current_paths.add("lineage.jsonl")
-        listed_paths = _list_flat_jsonl_paths(client, output_location)
-        _delete_flat_jsonl_paths(
-            client,
-            output_location,
-            listed_paths - (previous_paths | current_paths),
-            phase="preflight",
-        )
-
         files_by_path = {str(entry["path"]): entry for entry in files}
         for item, candidate, _ in candidates:
             uploaded = _put_and_verify(
@@ -856,12 +806,19 @@ def _run_s3_label_job_with_client(
             "manifest.json",
             output_manifest_bytes,
             content_type="application/json",
+            verify_readback=False,
         )
+        # Treat the output manifest as write-only. Trajectory JSONL and lineage
+        # objects are still read back above, while a successful PutObject is the
+        # publication boundary for the manifest itself.
         published_paths = {str(entry["path"]) for entry in files}
+        listed_output_paths = initial_output_paths | _list_flat_jsonl_paths(
+            client, output_location
+        )
         _delete_flat_jsonl_paths(
             client,
             output_location,
-            previous_paths - published_paths,
+            listed_output_paths - published_paths,
             phase="post-publication",
         )
 

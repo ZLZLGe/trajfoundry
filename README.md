@@ -76,11 +76,11 @@ uses one temporary local SQLite database in the task workspace. The state is
 deleted when the task finishes and is rebuilt from the source inventory on a
 retry, so S3 jobs do not resume across workers.
 
-S3 publication first removes any top-level JSONL left unlisted by the currently
-published manifest, writes and validates the new flat JSONL objects, then
-uploads the top-level `manifest.json` last. Files referenced only by the
-previous manifest are removed after that commit. A cleanup failure fails the
-job; the next retry repeats the preflight cleanup before writing. See
+S3 publication lists existing top-level JSONL objects, writes and validates the
+new flat JSONL objects, then uploads the top-level `manifest.json` last. The
+manifest is a write-only publication pointer; stale JSONL is removed only after
+that commit. A cleanup failure fails the job, and the next retry lists the
+residue again and removes it after the replacement manifest is published. See
 [`docs/dolphinscheduler.md`](docs/dolphinscheduler.md) for normalization and
 classification workflow configuration.
 
@@ -243,8 +243,8 @@ overwritten file. Do not run two writers for the same output partition, and
 make readers verify the manifest checksums. `validate` checks checksums,
 contracts, input coverage, derived quality fields, strict admission, lineage
 IDs, and manifest counts. Top-level JSONL files not listed by the current
-manifest are treated as interrupted-run residue and removed before the next
-publication; inability to remove them fails the run.
+manifest are treated as interrupted-run residue and removed after the next
+replacement manifest is published; inability to remove them fails the run.
 
 ## Trajectory classification
 
@@ -273,8 +273,11 @@ Classification uses bounded concurrency and a persistent SQLite cache under
 place that cache on a worker-local persistent volume. HTTP 429 and 5xx responses
 are retried with bounded exponential backoff; HTTP 404 and 422 fail the job as
 configuration errors. Candidate rows are completed locally before any output
-object is changed, and `manifest.json` is published last. Classification uses
-the same recoverable stale-JSONL cleanup rule as normalization.
+object is changed, and `manifest.json` is published last. Classification reads
+and validates the normalized input manifest, but treats its own output manifest
+as write-only. It lists existing top-level JSONL before model calls and removes
+unlisted JSONL only after the replacement manifest is published; a cleanup
+failure is recoverable on retry.
 
 ## Development
 

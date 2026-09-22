@@ -376,64 +376,68 @@ def test_v004_job_classifies_accepted_and_quarantined_into_flat_files(
     assert completion.calls == 3
 
 
-def test_preflight_delete_failure_is_recoverable_on_rerun(tmp_path: Path) -> None:
-    client = _MemoryS3(delete_failures=1)
+def test_output_manifest_is_write_only_on_first_classification_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = _MemoryS3()
     input_location = S3Location("bucket", "normalized/v004/dt=2026-09-14/")
     output_location = S3Location("bucket", "classified/v001/dt=2026-09-14/")
     manifest_bytes = _install_v004_input(client, input_location)
-    orphan_path = "orphan.jsonl"
-    client.objects[(output_location.bucket, output_location.key(orphan_path))] = (
+    stale_path = "orphan.jsonl"
+    client.objects[(output_location.bucket, output_location.key(stale_path))] = (
         b"orphan\n"
     )
+    previous_manifest = b'{"previous":true}'
+    output_manifest_key = output_location.key("manifest.json")
+    client.objects[(output_location.bucket, output_manifest_key)] = previous_manifest
+
+    original_get_object = client.get_object
+    manifest_reads: list[str] = []
+
+    def deny_output_manifest_read(*, Bucket: str, Key: str) -> dict[str, Any]:
+        if Key == output_manifest_key:
+            manifest_reads.append(Key)
+            raise PermissionError("output manifest reads are forbidden")
+        return original_get_object(Bucket=Bucket, Key=Key)
+
+    monkeypatch.setattr(client, "get_object", deny_output_manifest_read)
+
     completion = _Completion()
     classifier = TrajectoryClassifier(
         client=completion,
         taxonomy=_taxonomy(tmp_path),
         input_manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
     )
-    state_path = tmp_path / "preflight-state.sqlite"
 
-    with pytest.raises(LabelJobError, match="preflight"):
-        _run_s3_label_job_with_client(
-            client,
-            input_location=input_location,
-            output_location=output_location,
-            classifier=classifier,
-            workspace=tmp_path,
-            state_path=state_path,
-            max_workers=1,
-        )
-
-    # Classification and local checks may populate the local cache, but no S3
-    # publication is allowed when preflight cleanup cannot complete.
-    assert completion.calls == 3
-    assert (output_location.bucket, output_location.key(orphan_path)) in client.objects
-    assert (
-        output_location.bucket,
-        output_location.key("manifest.json"),
-    ) not in client.objects
-    assert not any(
-        operation == "put_object" and key.startswith(output_location.prefix)
-        for operation, key in client.calls
-    )
-
-    client.delete_failures = 0
     result = _run_s3_label_job_with_client(
         client,
         input_location=input_location,
         output_location=output_location,
         classifier=classifier,
         workspace=tmp_path,
-        state_path=state_path,
+        state_path=tmp_path / "manifest-write-only-state.sqlite",
         max_workers=1,
     )
 
-    assert result.cache_hits == 3
+    assert result.input_trajectories == 3
+    assert result.classified == 3
+    assert result.cache_hits == 0
     assert completion.calls == 3
     assert (
         output_location.bucket,
-        output_location.key(orphan_path),
+        output_location.key(stale_path),
     ) not in client.objects
+    assert manifest_reads == []
+    assert ("get_object", output_manifest_key) not in client.calls
+    assert (
+        client.objects[(output_location.bucket, output_manifest_key)]
+        != previous_manifest
+    )
+    published_manifest = orjson.loads(
+        client.objects[(output_location.bucket, output_manifest_key)]
+    )
+    assert published_manifest["schema_version"] == "trajfoundry-classification-v1"
 
 
 def test_post_publication_delete_failure_is_recoverable_on_rerun(

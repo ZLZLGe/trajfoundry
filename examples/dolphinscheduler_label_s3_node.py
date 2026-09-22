@@ -13,7 +13,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    expected_revision = "2026-09-21.1"
+    expected_revision = "2026-09-22.1"
     if CLASSIFIER_REVISION != expected_revision:
         raise RuntimeError(
             "TrajFoundry classifier revision mismatch: "

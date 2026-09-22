@@ -250,14 +250,15 @@ directory, which can be reviewed and removed after confirming no task uses it.
 
 Publication follows this order:
 
-1. List top-level JSONL objects and remove any object not referenced by the
-   currently published manifest.
+1. List existing top-level JSONL objects. The old output `manifest.json` is not
+   read; some S3-compatible stores report `AccessDenied` for a missing object.
 2. Write one top-level JSONL object per trajectory plus `lineage.jsonl`.
 3. Stream those remote objects through the full output validator, ignoring only
-   files referenced exclusively by the previous manifest.
-4. Upload top-level `manifest.json` as the final publication pointer.
-5. Read back and verify the uploaded manifest.
-6. Delete files referenced only by the previous manifest.
+   JSONL already listed before this run.
+4. Upload top-level `manifest.json` as the final, write-only publication
+   pointer.
+5. Delete listed top-level JSONL objects that are not referenced by the new
+   manifest.
 
 If upload or validation fails before step 4, an existing manifest remains
 unchanged. Because flat keys can reuse names, a same-named object may already
@@ -270,7 +271,8 @@ without publishing a new manifest.
 Deletion failures are not ignored. A failure before publication leaves the old
 manifest authoritative; a failure after publication reports the task as failed
 even though the new manifest is already authoritative. In either case, the next
-retry removes the unlisted residue during step 1 before writing new objects.
+retry lists the unlisted residue and removes it after publishing the replacement
+manifest.
 Top-level JSONL objects under an output prefix are therefore managed entirely by
 TrajFoundry; do not place unrelated JSONL files there.
 
@@ -280,9 +282,8 @@ trajectory above the limit fails the task and is never split across files.
 
 Once the final manifest PUT begins, a lost network response can make the task
 result indeterminate even though S3 accepted the already validated manifest.
-If publication or read-back fails at that stage, inspect the current
-`manifest.json` before retrying; do not start another same-date instance in
-parallel.
+If publication fails at that stage, inspect the current `manifest.json` before
+retrying; do not start another same-date instance in parallel.
 
 ### Independent classification workflow
 
@@ -330,9 +331,11 @@ The classifier uses bounded concurrency (four requests in the example). HTTP
 missing model configuration and fail the job. Per-trajectory exhausted retries
 or invalid model output still produce the original trajectory with
 `classification.status="failed"`, allowing a later rerun to inspect and retry
-the failed population. Classification also removes unlisted top-level JSONL
-before output publication and fails on any cleanup error, so a retry can recover
-an interrupted post-manifest cleanup.
+the failed population. Classification reads and validates the normalized input
+manifest, but does not read its own output manifest. It lists existing
+top-level JSONL before model calls, publishes the replacement manifest last,
+and removes unlisted JSONL only after publication. A cleanup error fails the
+task, so a retry can recover an interrupted post-manifest cleanup.
 
 ## Updating the project
 

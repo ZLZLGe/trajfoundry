@@ -27,7 +27,9 @@ CAPABILITY_LABELS = (
     "Interactive Collaboration",
     "Reliability & Safety",
 )
-CLASSIFIER_REVISION = "2026-09-21.1"
+# Bump when the classification contract or publication behavior changes so
+# scheduler assertions and the persistent cache cannot silently mix runs.
+CLASSIFIER_REVISION = "2026-09-22.1"
 PROMPT_VERSION = "v001"
 DEFAULT_MAX_CONTEXT_CHARS = 500_000
 
