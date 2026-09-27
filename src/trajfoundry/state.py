@@ -11,10 +11,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal, Self, TypeAlias
 
-import orjson
 import zstandard
 
 from .canonical import trajectory_id as compute_trajectory_id
+from .json_codec import dumps, loads
 from .models import Snapshot, TrajectoryNode
 from .output_contract import parse_trajectory_record, project_trajectory
 from .quality import validate_derived_fields
@@ -669,7 +669,7 @@ class StateStore:
             "SELECT trajectory_id,payload FROM trajectories ORDER BY trajectory_id"
         )
         for identifier, payload in rows:
-            node = parse_trajectory_record(orjson.loads(_decompress_payload(payload)))
+            node = parse_trajectory_record(loads(_decompress_payload(payload)))
             if identifier != compute_trajectory_id(node):
                 raise ValueError(
                     "stored trajectory_id does not match trajectory content"
@@ -712,7 +712,7 @@ class StateStore:
                 updates: list[tuple[bytes, str]] = []
                 for identifier in identifiers:
                     node = parse_trajectory_record(
-                        orjson.loads(_decompress_payload(payloads[identifier]))
+                        loads(_decompress_payload(payloads[identifier]))
                     )
                     _set_sub_session_id(node, assignments[identifier])
                     validate_derived_fields(node)
@@ -720,10 +720,7 @@ class StateStore:
                         raise ValueError(
                             "sub_session_id changed canonical trajectory identity"
                         )
-                    node_json = orjson.dumps(
-                        project_trajectory(node),
-                        option=orjson.OPT_SORT_KEYS,
-                    )
+                    node_json = dumps(project_trajectory(node), sort_keys=True)
                     updates.append((_compress_payload(node_json), identifier))
                 self.connection.executemany(
                     "UPDATE trajectories SET payload=? WHERE trajectory_id=?",
@@ -787,7 +784,7 @@ class StateStore:
         if trajectory_id != expected_id:
             raise ValueError("trajectory_id does not match trajectory content")
         rank = {"pass": 0, "quarantined": 1, "excluded": 2}
-        node_json = orjson.dumps(projected, option=orjson.OPT_SORT_KEYS)
+        node_json = dumps(projected, sort_keys=True)
         existing = self.connection.execute(
             "SELECT disposition,representative_key FROM trajectories "
             "WHERE trajectory_id=?",
@@ -848,7 +845,7 @@ class StateStore:
             "SELECT trajectory_id,payload FROM trajectories ORDER BY trajectory_id"
         )
         for identifier, payload in rows:
-            node = parse_trajectory_record(orjson.loads(_decompress_payload(payload)))
+            node = parse_trajectory_record(loads(_decompress_payload(payload)))
             validate_derived_fields(node)
             if identifier != compute_trajectory_id(node):
                 raise ValueError(

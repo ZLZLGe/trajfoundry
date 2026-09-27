@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
 import orjson
 import pytest
 
+import trajfoundry.pipeline as pipeline_module
 from trajfoundry.models import (
     AgentMessageEvidence,
     AuditIssue,
@@ -18,6 +20,7 @@ from trajfoundry.models import (
     Snapshot,
     ToolCall,
     ToolDefinition,
+    TrajectoryNode,
 )
 from trajfoundry.pipeline import (
     PipelineConfig,
@@ -110,6 +113,102 @@ def _output_file(root: Path, suffix: str) -> Path:
         entry["path"] for entry in manifest["files"] if entry["path"].endswith(suffix)
     )
     return root / relative
+
+
+def test_trajectory_preserves_integer_larger_than_orjson_range(
+    tmp_path: Path,
+) -> None:
+    input_root = tmp_path / "input"
+    output_root = tmp_path / "output"
+    huge = 2**80
+    call_id = "call-large-integer"
+    call = {
+        "type": "function_call",
+        "call_id": call_id,
+        "name": "lookup",
+        "arguments": json.dumps({"value": huge}),
+    }
+    result = {
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": "ok",
+    }
+    tool = {
+        "type": "function",
+        "name": "lookup",
+        "description": "Look up a value",
+        "parameters": {
+            "type": "object",
+            "properties": {"value": {"type": "integer"}},
+            "required": ["value"],
+        },
+    }
+    _write(
+        input_root / "large.json",
+        _capture(
+            captured_at="2026-08-27T00:00:00Z",
+            turn_id="large-turn",
+            request_input=[_message("user", "look up"), call, result],
+            response_output=[_message("assistant", "done")],
+            tools=[tool],
+        ),
+    )
+
+    stats = normalize(PipelineConfig(input_root=input_root, output_root=output_root))
+
+    assert stats.stored_trajectories == 1
+    manifest = orjson.loads((output_root / "manifest.json").read_bytes())
+    trajectory_path = output_root / next(
+        entry["path"] for entry in manifest["files"] if entry["path"] != "lineage.jsonl"
+    )
+    trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+    arguments = trajectory["messages"][1]["tool_calls"][0]["function"]["arguments"]
+    assert arguments["value"] == huge
+    assert str(huge).encode() in trajectory_path.read_bytes()
+    assert validate_output(output_root).valid
+
+
+def test_bad_trajectory_is_skipped_without_discarding_other_trajectories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_root = tmp_path / "input"
+    output_root = tmp_path / "output"
+    for source_name, turn_id in (("bad.json", "bad-turn"), ("good.json", "good-turn")):
+        _write(
+            input_root / source_name,
+            _capture(
+                captured_at=f"2026-08-27T00:0{0 if source_name == 'bad.json' else 1}:00Z",
+                turn_id=turn_id,
+                request_input=[_message("user", source_name)],
+                response_output=[_message("assistant", "done")],
+                tools=[],
+            ),
+        )
+
+    original = pipeline_module._flat_semantic_key
+
+    def fail_one(snapshot: Snapshot, node: TrajectoryNode) -> str:
+        if snapshot.source_path == "bad.json":
+            raise RuntimeError("synthetic trajectory defect")
+        return original(snapshot, node)
+
+    monkeypatch.setattr(pipeline_module, "_flat_semantic_key", fail_one)
+    stats = normalize(PipelineConfig(input_root=input_root, output_root=output_root))
+
+    manifest = orjson.loads((output_root / "manifest.json").read_bytes())
+    assert stats.stored_trajectories == 1
+    assert stats.skipped_inputs == 1
+    assert manifest["counts"]["skipped_inputs"] == 1
+    assert manifest["counts"]["skip_reason_counts"] == {
+        "trajectory_materialization_failed": 1
+    }
+    trajectory_path = output_root / next(
+        entry["path"] for entry in manifest["files"] if entry["path"] != "lineage.jsonl"
+    )
+    trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+    assert trajectory["metadata"]["source_file"] == "good.json"
+    assert validate_output(output_root).valid
 
 
 def test_end_to_end_prefix_tool_union_resume_and_deleted_input(tmp_path: Path) -> None:

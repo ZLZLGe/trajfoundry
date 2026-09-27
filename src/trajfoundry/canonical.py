@@ -6,15 +6,14 @@ import hashlib
 from collections.abc import Iterable
 from typing import Any
 
-import orjson
-
 from .audit_codes import RESPONSES_UNSUPPORTED_CALL_EVIDENCE
+from .json_codec import dumps
 from .models import CompactionRecord, Message, Severity, TrajectoryNode
 from .output_contract import project_message, project_trajectory
 
 
 def canonical_json(value: Any) -> bytes:
-    return orjson.dumps(value, option=orjson.OPT_SORT_KEYS)
+    return dumps(value, sort_keys=True)
 
 
 def message_fingerprint(message: Message) -> str:

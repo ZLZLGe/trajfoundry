@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from .canonical import trajectory_id
 from .export import trajectory_filename
+from .json_codec import loads
 from .models import AuditTag
 from .output_contract import (
     OutputContractError,
@@ -450,7 +451,7 @@ def _validate_jsonl_row(
     elif kind == "lineage":
         observed.counts["lineage_records"] += 1
     try:
-        value = orjson.loads(raw_line)
+        value = loads(raw_line)
     except orjson.JSONDecodeError:
         observed.mark_invalid(kind)
         context = _row_context(file_index, line_no, kind)
@@ -585,7 +586,7 @@ def validate_output_backend(
     errors = _ErrorCollector()
     observed = _Observed()
     try:
-        raw_manifest = orjson.loads(manifest_bytes)
+        raw_manifest = loads(manifest_bytes)
     except (TypeError, orjson.JSONDecodeError):
         errors.add("manifest.json could not be read as valid JSON")
         return ValidationReport(

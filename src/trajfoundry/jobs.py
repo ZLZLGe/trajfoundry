@@ -11,6 +11,7 @@ from typing import Any, Literal
 import orjson
 
 from .credentials import DEFAULT_S3_CREDENTIALS_PATH, load_s3_credentials
+from .json_codec import loads
 from .pipeline import PipelineConfig, PipelineStats, normalize, normalize_source
 from .s3 import S3CaptureSource, S3Location, create_s3_client, parse_s3_uri
 from .s3_output import S3OutputSet
@@ -81,7 +82,7 @@ def _flat_manifest_jsonl_paths(manifest_bytes: bytes | None) -> set[str]:
     if manifest_bytes is None:
         return set()
     try:
-        manifest = orjson.loads(manifest_bytes)
+        manifest = loads(manifest_bytes)
     except orjson.JSONDecodeError:
         return set()
     if (
@@ -208,6 +209,11 @@ def _run_s3_job_with_client(
             "TrajFoundry quarantined %d capture(s) during parsing",
             stats.parse_failures,
         )
+    if stats.skipped_inputs:
+        LOGGER.warning(
+            "TrajFoundry skipped %d input(s) after trajectory processing errors",
+            stats.skipped_inputs,
+        )
     if report.counts.get("accepted", 0) == 0:
         LOGGER.warning(
             "TrajFoundry produced no accepted trajectories; inspect quarantine output"
@@ -215,13 +221,14 @@ def _run_s3_job_with_client(
     LOGGER.info(
         "TrajFoundry S3 job complete: discovered=%d parsed=%d "
         "trajectories=%d accepted=%d quarantined_trajectories=%d "
-        "quarantined_records=%d validation=passed",
+        "quarantined_records=%d skipped_inputs=%d validation=passed",
         stats.discovered,
         stats.parsed,
         stats.stored_trajectories,
         report.counts.get("accepted", 0),
         report.counts.get("quarantined_trajectories", 0),
         report.counts.get("quarantined_records", 0),
+        report.counts.get("skipped_inputs", 0),
     )
     return JobResult(stats=stats, validation=report)
 
@@ -276,6 +283,11 @@ def run_job(
             "TrajFoundry quarantined %d capture(s) during parsing",
             stats.parse_failures,
         )
+    if stats.skipped_inputs:
+        LOGGER.warning(
+            "TrajFoundry skipped %d input(s) after trajectory processing errors",
+            stats.skipped_inputs,
+        )
     if stats.discovered and report.counts.get("accepted", 0) == 0:
         LOGGER.warning(
             "TrajFoundry produced no accepted trajectories; inspect quarantine output"
@@ -287,7 +299,7 @@ def run_job(
     LOGGER.info(
         "TrajFoundry job complete: discovered=%d parsed=%d reused=%d "
         "trajectories=%d accepted=%d quarantined_trajectories=%d "
-        "quarantined_records=%d validation=passed",
+        "quarantined_records=%d skipped_inputs=%d validation=passed",
         stats.discovered,
         stats.parsed,
         stats.reused,
@@ -295,6 +307,7 @@ def run_job(
         report.counts.get("accepted", 0),
         report.counts.get("quarantined_trajectories", 0),
         report.counts.get("quarantined_records", 0),
+        report.counts.get("skipped_inputs", 0),
     )
     return JobResult(stats=stats, validation=report)
 

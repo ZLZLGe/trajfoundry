@@ -10,6 +10,7 @@ import orjson
 from pydantic import BaseModel, ValidationError
 
 from .audit_codes import PRIMARY_MOUNT_DIAGNOSTIC_CODES
+from .json_codec import dumps, loads
 from .models import (
     AuditIssue,
     CompactionRecord,
@@ -1043,7 +1044,7 @@ def _with_legacy_sub_session_ids(value: object) -> object:
     """Return a detached v4-compatible value for legacy normalized records."""
 
     try:
-        upgraded = orjson.loads(orjson.dumps(value))
+        upgraded = loads(dumps(value))
     except (TypeError, orjson.JSONEncodeError, orjson.JSONDecodeError) as error:
         raise OutputContractError("trajectory is not JSON serializable") from error
 
@@ -1077,7 +1078,7 @@ def parse_trajectory_record(
     candidate = _with_legacy_sub_session_ids(value) if allow_legacy_metadata else value
     _validate_node(candidate, "$", top_level=True)
     try:
-        node = TrajectoryNode.model_validate_json(orjson.dumps(candidate), strict=True)
+        node = TrajectoryNode.model_validate_json(dumps(candidate), strict=True)
     except (TypeError, orjson.JSONEncodeError, ValidationError) as error:
         raise OutputContractError("trajectory violates the typed model") from error
     if project_trajectory(node) != candidate:
@@ -1123,7 +1124,7 @@ def _validate_quarantine_value(value: object) -> dict[str, Any]:
 def parse_quarantine_record(value: object) -> QuarantineRecord:
     item = _validate_quarantine_value(value)
     try:
-        record = QuarantineRecord.model_validate_json(orjson.dumps(item), strict=True)
+        record = QuarantineRecord.model_validate_json(dumps(item), strict=True)
     except (TypeError, orjson.JSONEncodeError, ValidationError) as error:
         raise OutputContractError(
             "quarantine record violates the typed model"

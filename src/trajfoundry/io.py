@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol, Self
 
-import orjson
+from .json_codec import dumps, loads
 
 SAFE_REQUEST_HEADERS = {
     "x-claude-code-session-id",
@@ -143,7 +143,7 @@ def decode_capture(
     Memory is bounded by an individual capture, never by a complete session.
     """
 
-    capture = orjson.loads(payload)
+    capture = loads(payload)
     if not isinstance(capture, dict):
         raise TypeError("capture root must be a JSON object")
     if input_format == "freerouter":
@@ -218,7 +218,7 @@ class JsonlShardWriter:
         self._size = 0
 
     def write(self, value: Any) -> None:
-        line = orjson.dumps(value, option=orjson.OPT_SORT_KEYS) + b"\n"
+        line = dumps(value, sort_keys=True) + b"\n"
         if self._handle is None or (
             self._size and self._size + len(line) > self.max_bytes
         ):

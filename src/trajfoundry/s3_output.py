@@ -8,10 +8,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, Self
 
-import orjson
-
 from .canonical import trajectory_id
 from .export import SCHEMA_VERSION, ExportStats, trajectory_filename
+from .json_codec import dumps
 from .models import QuarantineRecord, TrajectoryNode
 from .output_contract import project_trajectory
 from .quality import is_strict_sample, validate_derived_fields
@@ -226,21 +225,21 @@ class S3OutputSet:
         filename = trajectory_filename(node, identifier)
         if filename in self._trajectory_names:
             raise ValueError(f"duplicate trajectory output filename: {filename}")
-        payload = orjson.dumps(projected, option=orjson.OPT_SORT_KEYS) + b"\n"
+        payload = dumps(projected, sort_keys=True) + b"\n"
         if len(payload) > self.max_shard_bytes:
             raise ValueError(
                 "trajectory JSONL object exceeds max_shard_bytes: "
                 f"{len(payload)} > {self.max_shard_bytes}"
             )
         self._lineage.write(
-            orjson.dumps(
+            dumps(
                 {
                     "trajectory_id": identifier,
                     "representative": node.metadata.source_file,
                     "origin_count": len(origins),
                     "origins": origins,
                 },
-                option=orjson.OPT_SORT_KEYS,
+                sort_keys=True,
             )
             + b"\n"
         )
@@ -307,9 +306,7 @@ class S3OutputSet:
             },
             "files": [item.manifest_entry() for item in self.written_objects],
         }
-        self._manifest_bytes = orjson.dumps(
-            manifest, option=orjson.OPT_SORT_KEYS | orjson.OPT_INDENT_2
-        )
+        self._manifest_bytes = dumps(manifest, sort_keys=True, indent=2)
         return self._manifest_bytes
 
     def abort(self) -> None:

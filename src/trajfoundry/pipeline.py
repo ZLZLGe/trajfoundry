@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -54,11 +55,14 @@ from .subagents import (
 )
 from .tool_names import is_spawn_tool_name
 
-NORMALIZER_REVISION = "2026-09-22.1"
+LOGGER = logging.getLogger(__name__)
+
+NORMALIZER_REVISION = "2026-09-27.1"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 _INGEST_BATCH_ITEMS = 512
 _INGEST_BATCH_BYTES = 64 * 1024 * 1024
+_TRAJECTORY_BUILD_SKIP_REASON = "trajectory_materialization_failed"
 
 # These defects are fully representable in the canonical trajectory.  They
 # remain error-level audit evidence (and therefore quarantine the trajectory),
@@ -944,8 +948,48 @@ def _materialize_tree(
     return node, representative
 
 
+def _log_trajectory_build_failure(
+    error: Exception,
+    source_paths: Iterable[str],
+) -> None:
+    paths = sorted(set(source_paths))
+    LOGGER.warning(
+        "skipping trajectory after %s: source_count=%d source_refs=%s",
+        type(error).__name__,
+        len(paths),
+        paths[:3],
+    )
+
+
+def _skip_failed_trajectory_sources(
+    state: StateStore,
+    failed_paths: Iterable[str],
+    represented_paths: Iterable[str],
+) -> int:
+    """Mark failed leaves skipped after all successful origins are known."""
+
+    paths = sorted(set(failed_paths) - set(represented_paths))
+    skipped = 0
+    with state.write_batch():
+        for source_path in paths:
+            metadata = state.source_metadata(source_path)
+            if metadata is None:
+                continue
+            sha256, captured_at = metadata
+            state.put_skipped(
+                source_path,
+                sha256,
+                _TRAJECTORY_BUILD_SKIP_REASON,
+                captured_at=captured_at,
+            )
+            skipped += 1
+    return skipped
+
+
 def _build_trajectories(state: StateStore, stats: PipelineStats) -> None:
     state.clear_trajectories()
+    failed_paths: set[str] = set()
+    represented_paths: set[str] = set()
     # A real session is one mount-planning universe; the prefix index itself
     # keeps its threads separate.  Captures without a session are partitioned
     # by user (or the explicit no-user bucket) so they can merge across noisy
@@ -970,10 +1014,15 @@ def _build_trajectories(state: StateStore, stats: PipelineStats) -> None:
             contributor_paths = result.contributor_paths.get(
                 leaf.source_path, (leaf.source_path,)
             )
-            candidate = _trajectory_from_leaf(
-                leaf, _snapshots_for_paths(state, contributor_paths)
-            )
-            semantic_key = _flat_semantic_key(leaf, candidate)
+            try:
+                candidate = _trajectory_from_leaf(
+                    leaf, _snapshots_for_paths(state, contributor_paths)
+                )
+                semantic_key = _flat_semantic_key(leaf, candidate)
+            except Exception as error:  # noqa: BLE001 - skip one bad trajectory
+                failed_paths.update(contributor_paths)
+                _log_trajectory_build_failure(error, contributor_paths)
+                continue
             candidate_issues = (
                 candidate.normalization_audit.issues
                 if candidate.normalization_audit
@@ -1001,60 +1050,95 @@ def _build_trajectories(state: StateStore, stats: PipelineStats) -> None:
             flat_leaves[key].routing_snapshot for key in sorted(flat_leaves)
         ]
         evidence = tuple(evidence_by_path.values())
-        plan = plan_subagent_mounts(routing_leaves, all_snapshots=evidence)
-        leaves_by_identity = {
-            _snapshot_identity(leaf.routing_snapshot): leaf
-            for leaf in flat_leaves.values()
+        all_flat_paths = {
+            path
+            for flat_leaf in flat_leaves.values()
+            for path in flat_leaf.contributor_paths
         }
-        leaves_by_index = {
-            index: leaves_by_identity[_snapshot_identity(snapshot)]
-            for index, snapshot in enumerate(plan.leaves)
-        }
-        graph_issues = _mount_issues_by_index(plan)
-        edges_by_parent: dict[int, list[tuple[str, int, str]]] = defaultdict(list)
-        for edge in plan.edges:
-            edges_by_parent[edge.parent_index].append(
-                (edge.spawn_call_id, edge.child_index, edge.relay_id)
-            )
+        try:
+            plan = plan_subagent_mounts(routing_leaves, all_snapshots=evidence)
+            leaves_by_identity = {
+                _snapshot_identity(leaf.routing_snapshot): leaf
+                for leaf in flat_leaves.values()
+            }
+            leaves_by_index = {
+                index: leaves_by_identity[_snapshot_identity(snapshot)]
+                for index, snapshot in enumerate(plan.leaves)
+            }
+            graph_issues = _mount_issues_by_index(plan)
+            edges_by_parent: dict[int, list[tuple[str, int, str]]] = defaultdict(list)
+            for edge in plan.edges:
+                edges_by_parent[edge.parent_index].append(
+                    (edge.spawn_call_id, edge.child_index, edge.relay_id)
+                )
+        except Exception as error:  # noqa: BLE001 - skip one broken scope
+            failed_paths.update(all_flat_paths)
+            _log_trajectory_build_failure(error, all_flat_paths)
+            continue
 
         for root_index in plan.main_root_indices:
-            node, snapshot = _materialize_tree(
-                state,
-                leaves_by_index,
-                graph_issues,
-                edges_by_parent,
-                root_index,
-            )
             origin_paths = {
                 path
                 for index in _descendants(plan, root_index)
                 for path in leaves_by_index[index].contributor_paths
             }
-            enriched = enrich_trajectory(node, top_level=True, is_subagent=False)
-            _store_trajectory(
-                state,
-                enriched,
-                snapshot,
-                _origin_rows(state, origin_paths),
-            )
-            del node, snapshot, enriched, origin_paths
+            try:
+                node, snapshot = _materialize_tree(
+                    state,
+                    leaves_by_index,
+                    graph_issues,
+                    edges_by_parent,
+                    root_index,
+                )
+                enriched = enrich_trajectory(node, top_level=True, is_subagent=False)
+                _store_trajectory(
+                    state,
+                    enriched,
+                    snapshot,
+                    _origin_rows(state, origin_paths),
+                )
+            except Exception as error:  # noqa: BLE001 - skip one bad trajectory
+                failed_paths.update(origin_paths)
+                _log_trajectory_build_failure(error, origin_paths)
+            else:
+                represented_paths.update(origin_paths)
+            finally:
+                node = None
+                snapshot = None
+                enriched = None
+            del origin_paths
 
         for orphan_index in plan.orphan_indices:
-            node, snapshot = _load_flat_node(
-                state,
-                leaves_by_index[orphan_index],
-                graph_issues.get(orphan_index, ()),
-            )
-            node.sub_agent_trajectory = None
-            node.sub_agent_relay_mounts = None
-            enriched = enrich_trajectory(node, top_level=True, is_subagent=True)
-            _store_trajectory(
-                state,
-                enriched,
-                snapshot,
-                _origin_rows(state, leaves_by_index[orphan_index].contributor_paths),
-            )
-            del node, snapshot, enriched
+            origin_paths = set(leaves_by_index[orphan_index].contributor_paths)
+            try:
+                node, snapshot = _load_flat_node(
+                    state,
+                    leaves_by_index[orphan_index],
+                    graph_issues.get(orphan_index, ()),
+                )
+                node.sub_agent_trajectory = None
+                node.sub_agent_relay_mounts = None
+                enriched = enrich_trajectory(node, top_level=True, is_subagent=True)
+                _store_trajectory(
+                    state,
+                    enriched,
+                    snapshot,
+                    _origin_rows(state, origin_paths),
+                )
+            except Exception as error:  # noqa: BLE001 - skip one bad trajectory
+                failed_paths.update(origin_paths)
+                _log_trajectory_build_failure(error, origin_paths)
+            else:
+                represented_paths.update(origin_paths)
+            finally:
+                node = None
+                snapshot = None
+                enriched = None
+            del origin_paths
+    _skip_failed_trajectory_sources(state, failed_paths, represented_paths)
+    stats.skipped_inputs = sum(
+        status == "skipped" for _, _, status, _, _, _ in state.capture_records()
+    )
     state.assign_sub_session_ids()
     stats.stored_trajectories = state.trajectory_count()
 

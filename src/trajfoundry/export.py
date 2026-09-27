@@ -15,6 +15,7 @@ import orjson
 
 from .canonical import trajectory_id
 from .io import file_sha256
+from .json_codec import dumps, loads
 from .models import QuarantineRecord, TrajectoryNode
 from .output_contract import project_trajectory
 from .quality import is_strict_sample, validate_derived_fields
@@ -82,7 +83,7 @@ def trajectory_filename(node: TrajectoryNode, identifier: str | None = None) -> 
 
 def _manifest_paths(root: Path) -> set[str]:
     try:
-        manifest = orjson.loads((root / "manifest.json").read_bytes())
+        manifest = loads((root / "manifest.json").read_bytes())
     except (OSError, orjson.JSONDecodeError):
         return set()
     files = manifest.get("files") if isinstance(manifest, dict) else None
@@ -222,7 +223,7 @@ class OutputSet:
 
         path = self._stage / filename
         pending = path.with_suffix(path.suffix + ".tmp")
-        payload = orjson.dumps(projected, option=orjson.OPT_SORT_KEYS) + b"\n"
+        payload = dumps(projected, sort_keys=True) + b"\n"
         if len(payload) > self.max_shard_bytes:
             raise ValueError(
                 "trajectory JSONL object exceeds max_shard_bytes: "
@@ -244,14 +245,14 @@ class OutputSet:
             if node.normalization_audit:
                 self.stats.add_reasons(node.normalization_audit.reason_codes)
         self._lineage.write(
-            orjson.dumps(
+            dumps(
                 {
                     "trajectory_id": identifier,
                     "representative": node.metadata.source_file,
                     "origin_count": len(origins),
                     "origins": origins,
                 },
-                option=orjson.OPT_SORT_KEYS,
+                sort_keys=True,
             )
             + b"\n"
         )
@@ -312,9 +313,7 @@ class OutputSet:
                 for path in files
             ],
         }
-        manifest_bytes = orjson.dumps(
-            manifest, option=orjson.OPT_SORT_KEYS | orjson.OPT_INDENT_2
-        )
+        manifest_bytes = dumps(manifest, sort_keys=True, indent=2)
         with self._manifest_tmp.open("wb") as handle:
             handle.write(manifest_bytes)
             handle.flush()
