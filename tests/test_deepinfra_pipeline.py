@@ -124,6 +124,51 @@ def test_deepinfra_pipeline_adapts_json_object_and_publishes_source_metadata(
     assert validate_output(output_root).valid
 
 
+def test_deepinfra_pipeline_ignores_masked_nested_session_identity(
+    tmp_path: Path,
+) -> None:
+    input_root = tmp_path / "input"
+    output_root = tmp_path / "output"
+    source = input_root / "capture.json"
+    input_root.mkdir()
+    envelope = _envelope()
+    request_body = orjson.loads(envelope["request"]["body"])
+    request_body["client_metadata"] = {
+        "user_id": orjson.dumps(
+            {"session_id": "<SENSITIVE>", "user_id": "<SENSITIVE>"}
+        ).decode()
+    }
+    envelope["request"]["body"] = orjson.dumps(request_body).decode()
+    source.write_bytes(orjson.dumps(envelope))
+
+    stats = normalize(
+        PipelineConfig(
+            input_root=input_root,
+            input_format="deepinfra",
+            output_root=output_root,
+        )
+    )
+
+    assert stats.discovered == 1
+    assert stats.parsed == 1
+    assert stats.stored_trajectories == 1
+    assert validate_output(output_root).valid
+    manifest = orjson.loads((output_root / "manifest.json").read_bytes())
+    trajectory_paths = [
+        item["path"]
+        for item in manifest["files"]
+        if item["path"].endswith(".jsonl") and "lineage" not in item["path"]
+    ]
+    assert len(trajectory_paths) == 1
+    assert trajectory_paths[0].startswith("no_session_id_")
+    record = orjson.loads((output_root / trajectory_paths[0]).read_bytes().splitlines()[0])
+    assert "<SENSITIVE>" not in orjson.dumps(record).decode()
+    assert any(
+        issue["code"] == "metadata_session_id_masked"
+        for issue in record["normalization_audit"]["issues"]
+    )
+
+
 @pytest.mark.parametrize(
     "reason_code",
     ["invalid_deepinfra_envelope", "deepinfra_incomplete_envelope"],

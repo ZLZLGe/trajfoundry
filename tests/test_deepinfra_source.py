@@ -256,6 +256,41 @@ def test_identity_headers_are_capture_fallbacks() -> None:
     }
 
 
+def test_redacted_identity_values_are_removed_before_provider_parsing() -> None:
+    capture = adapt_deepinfra_envelope(
+        _envelope(
+            request_body={
+                "model": "test-model",
+                "messages": [],
+                "metadata": {
+                    "user_id": json.dumps(
+                        {
+                            "device_id": "device",
+                            "account_uuid": "",
+                            "session_id": "<SENSITIVE>",
+                            "user_id": "<SENSITIVE>",
+                        }
+                    )
+                },
+            },
+            headers={
+                "X-Session-Id": " <SENSITIVE> ",
+                "X-User-Id": "<SENSITIVE>",
+            },
+        )
+    )
+
+    assert "session_id" not in capture
+    assert "user_id" not in capture
+    assert capture["_masked_identity_fields"] == ["session_id", "user_id"]
+    body_metadata = capture["request_body"]["metadata"]
+    assert json.loads(body_metadata["user_id"]) == {
+        "device_id": "device",
+        "account_uuid": "",
+    }
+    assert "<SENSITIVE>" not in repr(capture)
+
+
 def test_claude_agent_and_parent_headers_define_thread_boundaries() -> None:
     capture = adapt_deepinfra_envelope(
         _envelope(

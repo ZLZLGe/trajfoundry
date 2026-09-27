@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -102,13 +103,151 @@ _IDENTITY_ALIASES = {
     "thread_id": ("thread_id", "threadId"),
 }
 
+# The archive redaction layer replaces sensitive identity values with this
+# marker.  It is not a usable conversation identity: treating the marker as a
+# real session would merge unrelated captures and it cannot be used in the
+# flat output filename.  Keep the value out of the projected capture instead.
+_REDACTED_IDENTITY_VALUES = frozenset(
+    {"<SENSITIVE>", "<REDACTED>", "[REDACTED]", "***"}
+)
+_SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
+
+
+def _identity_text(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        return ""
+    value = value.strip()
+    if not value or value.upper() in _REDACTED_IDENTITY_VALUES:
+        return ""
+    return value
+
+
+def _session_identity_text(value: object) -> str:
+    candidate = _identity_text(value)
+    return candidate if candidate and _SAFE_SESSION_ID.fullmatch(candidate) else ""
+
 
 def _identity_value(source: Mapping[str, Any], field: str) -> str:
     for alias in _IDENTITY_ALIASES[field]:
-        value = source.get(alias)
-        if isinstance(value, str) and value:
+        value = (
+            _session_identity_text(source.get(alias))
+            if field == "session_id"
+            else _identity_text(source.get(alias))
+        )
+        if value:
             return value
     return ""
+
+
+def _clean_identity_container(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove redacted identity values from one provider metadata object."""
+
+    result = dict(value)
+    for field in (
+        "session_id",
+        "sessionId",
+        "thread_id",
+        "threadId",
+        "turn_id",
+        "turnId",
+        "parent_thread_id",
+        "parentThreadId",
+        "parent_turn_id",
+        "parentTurnId",
+        "forked_from_thread_id",
+        "forkedFromThreadId",
+        "user_id",
+        "userId",
+    ):
+        raw = result.get(field)
+        identity_text = (
+            _session_identity_text(raw)
+            if field in {"session_id", "sessionId"}
+            else _identity_text(raw)
+        )
+        if isinstance(raw, str) and raw and not identity_text:
+            result.pop(field, None)
+
+    for field in ("user_id", "x-codex-turn-metadata"):
+        raw = result.get(field)
+        decoded = _decoded_mapping(raw)
+        if decoded is None:
+            continue
+        cleaned = _clean_identity_container(decoded)
+        if cleaned != dict(decoded):
+            result[field] = json.dumps(
+                cleaned, ensure_ascii=False, separators=(",", ":")
+            )
+    return result
+
+
+def _clean_request_identity(request_body: Mapping[str, Any]) -> dict[str, Any]:
+    """Project request metadata without archive redaction placeholders.
+
+    Provider adapters inspect the request body again after this source adapter
+    returns. Cleaning only the projected capture identity would let a nested
+    ``metadata.user_id`` value reintroduce the placeholder later.
+    """
+
+    result = dict(request_body)
+    for field in ("client_metadata", "metadata"):
+        container = result.get(field)
+        if isinstance(container, Mapping):
+            result[field] = _clean_identity_container(container)
+    return result
+
+
+def _redacted_identity_fields(value: object) -> set[str]:
+    """Return semantic identity fields replaced by the archive redactor."""
+
+    if not isinstance(value, Mapping):
+        return set()
+    fields: set[str] = set()
+    aliases = {
+        "session_id": "session_id",
+        "sessionid": "session_id",
+        "session-id": "session_id",
+        "x-session-id": "session_id",
+        "thread_id": "thread_id",
+        "threadid": "thread_id",
+        "thread-id": "thread_id",
+        "x-thread-id": "thread_id",
+        "turn_id": "turn_id",
+        "turnid": "turn_id",
+        "turn-id": "turn_id",
+        "user_id": "user_id",
+        "userid": "user_id",
+        "user-id": "user_id",
+        "x-user-id": "user_id",
+        "parent_thread_id": "parent_thread_id",
+        "parentthreadid": "parent_thread_id",
+        "parent-thread-id": "parent_thread_id",
+        "x-parent-session-id": "parent_thread_id",
+        "parent_turn_id": "parent_turn_id",
+        "parentturnid": "parent_turn_id",
+        "parent-turn-id": "parent_turn_id",
+    }
+    for raw_key, raw_value in value.items():
+        key = str(raw_key).strip().lower()
+        field = aliases.get(key)
+        if field and isinstance(raw_value, str) and raw_value:
+            identity_text = (
+                _session_identity_text(raw_value)
+                if field == "session_id"
+                else _identity_text(raw_value)
+            )
+            if not identity_text:
+                fields.add(field)
+        if key in {
+            "client_metadata",
+            "metadata",
+            "user_id",
+            "x-codex-turn-metadata",
+        }:
+            decoded = _decoded_mapping(raw_value)
+            if decoded is not None:
+                fields.update(_redacted_identity_fields(decoded))
+    return fields
 
 
 def _body_identity(request_body: Mapping[str, Any], field: str) -> str:
@@ -149,6 +288,24 @@ def _identity_headers(value: object) -> tuple[dict[str, Any], str]:
     """Sanitize headers and project Deep Infra's additional identity aliases."""
 
     result = sanitize_identity_headers(value)
+    for key in list(result):
+        if key == "x-codex-turn-metadata":
+            continue
+        raw = result[key]
+        identity_text = (
+            _session_identity_text(raw)
+            if key in {"session_id", "x-claude-code-session-id"}
+            else _identity_text(raw)
+        )
+        if isinstance(raw, str) and raw and not identity_text:
+            result.pop(key, None)
+    encoded_headers = _decoded_mapping(result.get("x-codex-turn-metadata"))
+    if encoded_headers is not None:
+        cleaned_headers = _clean_identity_container(encoded_headers)
+        if cleaned_headers != dict(encoded_headers):
+            result["x-codex-turn-metadata"] = json.dumps(
+                cleaned_headers, ensure_ascii=False, separators=(",", ":")
+            )
     user_id = ""
     if not isinstance(value, Mapping):
         return result, user_id
@@ -157,9 +314,11 @@ def _identity_headers(value: object) -> tuple[dict[str, Any], str]:
         key = str(raw_key).strip().lower()
         scalar = _header_scalar(raw_value)
         if key == "x-session-id":
-            result.setdefault("session_id", scalar)
+            if identity := _session_identity_text(scalar):
+                result.setdefault("session_id", identity)
         elif key == "x-thread-id":
-            result.setdefault("thread_id", scalar)
+            if identity := _identity_text(scalar):
+                result.setdefault("thread_id", identity)
         elif key in {
             "x-claude-code-agent-id",
             "x-claude-code-session-id",
@@ -167,38 +326,50 @@ def _identity_headers(value: object) -> tuple[dict[str, Any], str]:
             # These are semantic routing identities, not credentials.  Keep
             # them only after the generic identity allowlist has removed all
             # unrelated transport headers.
-            result[key] = scalar
+            identity = (
+                _session_identity_text(scalar)
+                if key == "x-claude-code-session-id"
+                else _identity_text(scalar)
+            )
+            if not identity:
+                continue
+            result[key] = identity
             if key == "x-claude-code-session-id":
-                result.setdefault("session_id", scalar)
+                result.setdefault("session_id", identity)
             else:
-                result.setdefault("thread_id", scalar)
+                result.setdefault("thread_id", identity)
         elif key == "x-parent-session-id":
-            result.setdefault("parent_thread_id", scalar)
+            if identity := _identity_text(scalar):
+                result.setdefault("parent_thread_id", identity)
         elif key == "x-deepseek-harness-session-id":
-            result.setdefault("session_id", scalar)
-        elif key == "x-deepseek-harness-user-id" and isinstance(scalar, str) and scalar:
-            user_id = scalar
-        elif key == "x-user-id" and isinstance(scalar, str) and scalar:
-            user_id = user_id or scalar
+            if identity := _session_identity_text(scalar):
+                result.setdefault("session_id", identity)
+        elif key == "x-deepseek-harness-user-id":
+            user_id = _identity_text(scalar)
+        elif key == "x-user-id":
+            user_id = user_id or _identity_text(scalar)
     return result, user_id
 
 
 def _header_identity(headers: Mapping[str, Any], field: str) -> str:
-    value = headers.get(field)
-    if isinstance(value, str) and value:
+    value = (
+        _session_identity_text(headers.get(field))
+        if field == "session_id"
+        else _identity_text(headers.get(field))
+    )
+    if value:
         return value
     if field == "session_id":
         for key in (
             "x-claude-code-session-id",
             "x-deepseek-harness-session-id",
         ):
-            semantic_session = headers.get(key)
-            if isinstance(semantic_session, str) and semantic_session:
+            if semantic_session := _session_identity_text(headers.get(key)):
                 return semantic_session
-    if field == "thread_id":
-        claude_agent = headers.get("x-claude-code-agent-id")
-        if isinstance(claude_agent, str) and claude_agent:
-            return claude_agent
+    if field == "thread_id" and (
+        claude_agent := _identity_text(headers.get("x-claude-code-agent-id"))
+    ):
+        return claude_agent
     turn_metadata = _decoded_mapping(headers.get("x-codex-turn-metadata"))
     return _identity_value(turn_metadata, field) if turn_metadata is not None else ""
 
@@ -234,7 +405,8 @@ def adapt_deepinfra_envelope(value: object) -> dict[str, Any]:
         raise _error(_INVALID, "$.request.body is not valid JSON") from error
     if not isinstance(request_body, Mapping):
         raise _error(_INVALID, "$.request.body must decode to an object")
-    request_body = dict(request_body)
+    masked_identity_fields = _redacted_identity_fields(request_body)
+    request_body = _clean_request_identity(request_body)
 
     status_code = response.get("status_code")
     if (
@@ -256,6 +428,7 @@ def adapt_deepinfra_envelope(value: object) -> dict[str, Any]:
         raw_headers = {}
     if not isinstance(raw_headers, Mapping):
         raise _error(_INVALID, "$.request.headers must be an object")
+    masked_identity_fields.update(_redacted_identity_fields(raw_headers))
     request_headers, header_user_id = _identity_headers(raw_headers)
 
     try:
@@ -285,6 +458,8 @@ def adapt_deepinfra_envelope(value: object) -> dict[str, Any]:
         "request_headers": request_headers,
         "is_stream": request_body.get("stream") is True,
     }
+    if masked_identity_fields:
+        capture["_masked_identity_fields"] = sorted(masked_identity_fields)
 
     body_session = _body_identity(request_body, "session_id")
     header_session = _header_identity(request_headers, "session_id")

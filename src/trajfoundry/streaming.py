@@ -60,12 +60,21 @@ def _compatibility(snapshot: Snapshot) -> tuple[Hashable, bytes]:
     internally, only the empty string means missing.
     """
 
+    masked_session = any(
+        issue.code == "metadata_session_id_masked"
+        for issue in snapshot.issues
+    )
     if snapshot.session_id:
         scope: Hashable = (
             "session",
             snapshot.session_id,
             snapshot.thread_id,
         )
+    elif masked_session:
+        # A redacted session token is shared by many unrelated captures in an
+        # archive. Keep each source isolated instead of merging them all into
+        # the user's missing-session bucket.
+        scope = ("masked-session-source", snapshot.source_path)
     else:
         scope = ("user", snapshot.user_id)
     return scope, compaction_signature(snapshot.compaction_items)

@@ -57,7 +57,7 @@ from .tool_names import is_spawn_tool_name
 
 LOGGER = logging.getLogger(__name__)
 
-NORMALIZER_REVISION = "2026-09-27.1"
+NORMALIZER_REVISION = "2026-09-28.1"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 _INGEST_BATCH_ITEMS = 512
@@ -248,6 +248,23 @@ def parse_capture(
     else:
         raise UnsupportedCaptureError(f"unsupported capture endpoint: {endpoint!r}")
     updates: dict[str, Any] = {}
+    masked_fields = capture.get("_masked_identity_fields")
+    if isinstance(masked_fields, (list, tuple, set, frozenset)):
+        issues = list(snapshot.issues)
+        for field in sorted(
+            item for item in masked_fields if isinstance(item, str) and item
+        ):
+            issues.append(
+                AuditIssue(
+                    code=f"metadata_{field}_masked",
+                    stage="parsing",
+                    severity=Severity.WARNING,
+                    path=f"/metadata/{field}",
+                    detail="redacted identity value was ignored",
+                )
+            )
+        if issues != snapshot.issues:
+            updates["issues"] = issues
     if snapshot.source_name != source_name:
         updates["source_name"] = source_name
     if multimodal_file_mapping is not None:
