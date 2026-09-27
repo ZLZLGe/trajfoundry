@@ -106,6 +106,11 @@ def semantic_payload(node: TrajectoryNode) -> dict[str, Any]:
             ),
         },
     }
+    if "metadata_session_id_masked" in issue_codes:
+        # A redacted session token is shared by unrelated captures. Preserve
+        # source identity in the semantic hash so those captures cannot be
+        # collapsed after their aggregation scopes have been separated.
+        aggregation_identity["masked_source"] = node.metadata.source_file
     for key in (
         "source",
         "metadata",

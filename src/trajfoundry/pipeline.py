@@ -826,6 +826,10 @@ def _flat_semantic_key(snapshot: Snapshot, node: TrajectoryNode) -> str:
         "response_spawn_bindings": response_spawns,
         "trajectory": semantic_payload(node),
     }
+    if any(
+        issue.code == "metadata_session_id_masked" for issue in snapshot.issues
+    ):
+        payload["masked_identity_source"] = snapshot.source_path
     return hashlib.sha256(canonical_json(payload)).hexdigest()
 
 

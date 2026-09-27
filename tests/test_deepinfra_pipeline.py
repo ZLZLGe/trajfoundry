@@ -169,6 +169,39 @@ def test_deepinfra_pipeline_ignores_masked_nested_session_identity(
     )
 
 
+def test_masked_sessions_with_identical_transcripts_are_not_deduplicated(
+    tmp_path: Path,
+) -> None:
+    input_root = tmp_path / "input"
+    output_root = tmp_path / "output"
+    input_root.mkdir()
+    for name in ("a.json", "b.json"):
+        envelope = _envelope()
+        body = orjson.loads(envelope["request"]["body"])
+        body["client_metadata"] = {
+            "user_id": orjson.dumps(
+                {"session_id": "<SENSITIVE>", "user_id": "<SENSITIVE>"}
+            ).decode()
+        }
+        envelope["request"]["body"] = orjson.dumps(body).decode()
+        input_root.joinpath(name).write_bytes(orjson.dumps(envelope))
+
+    normalize(
+        PipelineConfig(
+            input_root=input_root,
+            input_format="deepinfra",
+            output_root=output_root,
+        )
+    )
+
+    report = validate_output(output_root)
+    assert report.valid
+    manifest = orjson.loads((output_root / "manifest.json").read_bytes())
+    assert manifest["counts"]["input_files"] == 2
+    assert manifest["counts"]["duplicate_trajectories"] == 0
+    assert manifest["counts"]["accepted"] == 2
+
+
 @pytest.mark.parametrize(
     "reason_code",
     ["invalid_deepinfra_envelope", "deepinfra_incomplete_envelope"],
