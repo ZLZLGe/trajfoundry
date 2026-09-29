@@ -1157,10 +1157,13 @@ def _build_trajectories(state: StateStore, stats: PipelineStats) -> None:
                 enriched = None
             del origin_paths
     _skip_failed_trajectory_sources(state, failed_paths, represented_paths)
+    state.assign_sub_session_ids()
+    # Sub-session assignment validates the materialized rows a second time.
+    # A malformed cached row can therefore be skipped after the initial
+    # materialization pass; count those inputs before exporting the manifest.
     stats.skipped_inputs = sum(
         status == "skipped" for _, _, status, _, _, _ in state.capture_records()
     )
-    state.assign_sub_session_ids()
     stats.stored_trajectories = state.trajectory_count()
 
 

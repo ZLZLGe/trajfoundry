@@ -574,6 +574,168 @@ def test_empty_published_session_is_synthesized_for_sub_session_assignment(
     assert all(item.metadata.sub_session_id == 0 for _, item, _ in restored)
 
 
+def test_sub_session_assignment_skips_noncanonical_row_and_renumbers_survivors(
+    tmp_path: Path,
+) -> None:
+    snapshots = [
+        Snapshot(
+            source_path=source,
+            source_sha256=sha * 64,
+            session_id="session",
+            thread_id="thread",
+            captured_at=f"2026-09-03T00:0{index}:00Z",
+            provider="openai",
+            operation="responses",
+            outcome="success",
+        )
+        for index, (source, sha) in enumerate(
+            (("first.json", "a"), ("bad.json", "b"), ("last.json", "c"))
+        )
+    ]
+
+    def make_node(snapshot: Snapshot) -> TrajectoryNode:
+        return enrich_trajectory(
+            TrajectoryNode(
+                messages=[
+                    Message(role="user", content=snapshot.source_path),
+                    Message(role="assistant", content="done", reasoning_content=""),
+                ],
+                tools=[],
+                source=snapshot.source_path,
+                metadata=Metadata(
+                    source_file=snapshot.source_path,
+                    session_id=snapshot.session_id,
+                    created_at=snapshot.captured_at,
+                ),
+                normalization_audit=NormalizationAudit(tag=AuditTag.PASS),
+            )
+        )
+
+    with StateStore(tmp_path / "state.sqlite") as state:
+        for snapshot in snapshots:
+            state.put_snapshot(snapshot)
+        survivors = [make_node(snapshots[0]), make_node(snapshots[2])]
+        for node, snapshot in zip(survivors, (snapshots[0], snapshots[2])):
+            state.put_trajectory(
+                trajectory_id(node),
+                node,
+                representative_key=snapshot.source_path,
+                source_ref=snapshot.source_path,
+                sha256=snapshot.source_sha256,
+                captured_at=snapshot.captured_at,
+                disposition="pass",
+                reason_codes=[],
+            )
+        # Simulate a row written by an earlier materialization step whose
+        # payload cannot be parsed back into the canonical output projection.
+        state.connection.execute(
+            "INSERT INTO trajectories VALUES(?,?,?,?)",
+            ("bad-trajectory", "pass", "bad.json", b"not-a-trajectory"),
+        )
+        state.connection.execute(
+            "INSERT INTO trajectory_origins VALUES(?,?,?,?,?,?)",
+            (
+                "bad-trajectory",
+                "bad.json",
+                snapshots[1].source_sha256,
+                snapshots[1].captured_at,
+                "pass",
+                "[]",
+            ),
+        )
+
+        assert state.assign_sub_session_ids() == 1
+        restored = list(state.iter_trajectories())
+        records = list(state.capture_records())
+
+    assert {
+        item[1].metadata.source_file: item[1].metadata.sub_session_id
+        for item in restored
+    } == {"first.json": 0, "last.json": 1}
+    assert (
+        "bad.json",
+        snapshots[1].source_sha256,
+        "skipped",
+        "trajectory_materialization_failed",
+        "",
+        snapshots[1].captured_at,
+    ) in records
+
+
+def test_sub_session_assignment_keeps_shared_origin_for_surviving_trajectory(
+    tmp_path: Path,
+) -> None:
+    snapshot = Snapshot(
+        source_path="shared.json",
+        source_sha256="a" * 64,
+        session_id="session",
+        thread_id="thread",
+        captured_at="2026-09-03T00:00:00Z",
+        provider="openai",
+        operation="responses",
+        outcome="success",
+    )
+    node = enrich_trajectory(
+        TrajectoryNode(
+            messages=[
+                Message(role="user", content="shared"),
+                Message(role="assistant", content="done", reasoning_content=""),
+            ],
+            tools=[],
+            source="shared.json",
+            metadata=Metadata(
+                source_file="shared.json",
+                session_id="session",
+                created_at=snapshot.captured_at,
+            ),
+            normalization_audit=NormalizationAudit(tag=AuditTag.PASS),
+        )
+    )
+    identifier = trajectory_id(node)
+
+    with StateStore(tmp_path / "state.sqlite") as state:
+        state.put_snapshot(snapshot)
+        state.put_trajectory(
+            identifier,
+            node,
+            representative_key="shared.json",
+            source_ref="shared.json",
+            sha256=snapshot.source_sha256,
+            captured_at=snapshot.captured_at,
+            disposition="pass",
+            reason_codes=[],
+        )
+        state.connection.execute(
+            "INSERT INTO trajectories VALUES(?,?,?,?)",
+            ("bad-trajectory", "pass", "shared.json", b"not-a-trajectory"),
+        )
+        state.connection.execute(
+            "INSERT INTO trajectory_origins VALUES(?,?,?,?,?,?)",
+            (
+                "bad-trajectory",
+                "shared.json",
+                snapshot.source_sha256,
+                snapshot.captured_at,
+                "pass",
+                "[]",
+            ),
+        )
+
+        assert state.assign_sub_session_ids() == 0
+        records = list(state.capture_records())
+
+    assert records == [
+        (
+            "shared.json",
+            snapshot.source_sha256,
+            "parsed",
+            "",
+            "",
+            snapshot.captured_at,
+        )
+    ]
+
+
 def test_failed_reparse_removes_stale_snapshot(tmp_path: Path) -> None:
     snapshot = Snapshot(
         source_path="v1/p/s/a.json",

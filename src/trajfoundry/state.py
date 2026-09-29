@@ -29,6 +29,7 @@ _TRAJECTORY_UPDATE_BATCH_SIZE = 512
 _PAYLOAD_HEADER = b"TFZ1"
 _ZSTD_COMPRESSOR = zstandard.ZstdCompressor(level=1)
 _ZSTD_DECOMPRESSOR = zstandard.ZstdDecompressor()
+_TRAJECTORY_ASSIGN_SKIP_REASON = "trajectory_materialization_failed"
 _SNAPSHOT_COLUMNS = (
     "source_path",
     "session_id",
@@ -653,7 +654,72 @@ class StateStore:
             self.connection.execute("DELETE FROM trajectory_origins")
             self.connection.execute("DELETE FROM trajectories")
 
-    def assign_sub_session_ids(self) -> None:
+    def _discard_trajectories(
+        self,
+        identifiers: Iterable[str],
+        *,
+        reason: str = _TRAJECTORY_ASSIGN_SKIP_REASON,
+    ) -> int:
+        """Remove malformed final rows and skip their unrepresented inputs.
+
+        A trajectory row is normally accompanied by one or more origin rows.
+        Removing only the trajectory would leave those captures marked as
+        parsed without a lineage row, which makes the published manifest
+        unverifiable.  Delete the bad rows first, then mark an origin skipped
+        only when no surviving trajectory still represents that source.
+        """
+
+        unique_ids = sorted({str(identifier) for identifier in identifiers})
+        if not unique_ids:
+            return 0
+        placeholders = ",".join("?" for _ in unique_ids)
+        skipped_sources = 0
+        with self.write_batch():
+            origin_rows = list(
+                self.connection.execute(
+                    "SELECT source_ref FROM trajectory_origins "
+                    f"WHERE trajectory_id IN ({placeholders})",
+                    unique_ids,
+                )
+            )
+            failed_sources = {str(row[0]) for row in origin_rows}
+            self.connection.execute(
+                "DELETE FROM trajectory_origins "
+                f"WHERE trajectory_id IN ({placeholders})",
+                unique_ids,
+            )
+            self.connection.execute(
+                "DELETE FROM trajectories "
+                f"WHERE trajectory_id IN ({placeholders})",
+                unique_ids,
+            )
+            if not failed_sources:
+                return skipped_sources
+
+            source_placeholders = ",".join("?" for _ in failed_sources)
+            represented_sources = {
+                str(row[0])
+                for row in self.connection.execute(
+                    "SELECT DISTINCT source_ref FROM trajectory_origins "
+                    f"WHERE source_ref IN ({source_placeholders})",
+                    sorted(failed_sources),
+                )
+            }
+            for source_path in sorted(failed_sources - represented_sources):
+                metadata = self.source_metadata(source_path)
+                if metadata is None:
+                    continue
+                sha256, captured_at = metadata
+                self.put_skipped(
+                    source_path,
+                    sha256,
+                    reason,
+                    captured_at=captured_at,
+                )
+                skipped_sources += 1
+        return skipped_sources
+
+    def assign_sub_session_ids(self) -> int:
         """Number final, deduplicated branches within each real session.
 
         Missing provider sessions are recognizable by their normalization
@@ -663,69 +729,104 @@ class StateStore:
         is ``no_session_id`` has no marker and is numbered normally.
         """
 
-        assignments: dict[str, int] = {}
-        real_sessions: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
-        rows = self.connection.execute(
-            "SELECT trajectory_id,payload FROM trajectories ORDER BY trajectory_id"
-        )
-        for identifier, payload in rows:
-            node = parse_trajectory_record(loads(_decompress_payload(payload)))
-            if identifier != compute_trajectory_id(node):
-                raise ValueError(
-                    "stored trajectory_id does not match trajectory content"
-                )
-            if _has_synthesized_session(node):
-                assignments[str(identifier)] = 0
-                continue
-            real_sessions[node.metadata.session_id].append(
-                (
-                    node.metadata.created_at,
-                    str(identifier),
-                    node.metadata.source_file,
-                )
+        skipped = 0
+        while True:
+            assignments: dict[str, int] = {}
+            real_sessions: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
+            bad_ids: list[str] = []
+            rows = self.connection.execute(
+                "SELECT trajectory_id,payload FROM trajectories ORDER BY trajectory_id"
             )
-
-        for session_rows in real_sessions.values():
-            session_rows.sort()
-            for sub_session_id, (_, identifier, _) in enumerate(session_rows):
-                assignments[identifier] = sub_session_id
-
-        ordered_ids = sorted(assignments)
-        with self._write_scope():
-            for offset in range(
-                0,
-                len(ordered_ids),
-                _TRAJECTORY_UPDATE_BATCH_SIZE,
-            ):
-                identifiers = ordered_ids[
-                    offset : offset + _TRAJECTORY_UPDATE_BATCH_SIZE
-                ]
-                placeholders = ",".join("?" for _ in identifiers)
-                payloads = {
-                    str(identifier): payload
-                    for identifier, payload in self.connection.execute(
-                        "SELECT trajectory_id,payload FROM trajectories "
-                        f"WHERE trajectory_id IN ({placeholders})",
-                        identifiers,
-                    )
-                }
-                updates: list[tuple[bytes, str]] = []
-                for identifier in identifiers:
-                    node = parse_trajectory_record(
-                        loads(_decompress_payload(payloads[identifier]))
-                    )
-                    _set_sub_session_id(node, assignments[identifier])
-                    validate_derived_fields(node)
+            for identifier, payload in rows:
+                identifier = str(identifier)
+                try:
+                    node = parse_trajectory_record(loads(_decompress_payload(payload)))
                     if identifier != compute_trajectory_id(node):
                         raise ValueError(
-                            "sub_session_id changed canonical trajectory identity"
+                            "stored trajectory_id does not match trajectory content"
                         )
-                    node_json = dumps(project_trajectory(node), sort_keys=True)
-                    updates.append((_compress_payload(node_json), identifier))
-                self.connection.executemany(
-                    "UPDATE trajectories SET payload=? WHERE trajectory_id=?",
-                    updates,
-                )
+                    if _has_synthesized_session(node):
+                        assignments[identifier] = 0
+                        continue
+                    real_sessions[node.metadata.session_id].append(
+                        (
+                            node.metadata.created_at,
+                            identifier,
+                            node.metadata.source_file,
+                        )
+                    )
+                except (
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    zlib.error,
+                    zstandard.ZstdError,
+                ):
+                    bad_ids.append(identifier)
+
+            if bad_ids:
+                skipped += self._discard_trajectories(bad_ids)
+                continue
+
+            for session_rows in real_sessions.values():
+                session_rows.sort()
+                for sub_session_id, (_, identifier, _) in enumerate(session_rows):
+                    assignments[identifier] = sub_session_id
+
+            ordered_ids = sorted(assignments)
+            update_bad_ids: list[str] = []
+            with self._write_scope():
+                for offset in range(
+                    0,
+                    len(ordered_ids),
+                    _TRAJECTORY_UPDATE_BATCH_SIZE,
+                ):
+                    identifiers = ordered_ids[
+                        offset : offset + _TRAJECTORY_UPDATE_BATCH_SIZE
+                    ]
+                    placeholders = ",".join("?" for _ in identifiers)
+                    payloads = {
+                        str(identifier): payload
+                        for identifier, payload in self.connection.execute(
+                            "SELECT trajectory_id,payload FROM trajectories "
+                            f"WHERE trajectory_id IN ({placeholders})",
+                            identifiers,
+                        )
+                    }
+                    updates: list[tuple[bytes, str]] = []
+                    for identifier in identifiers:
+                        try:
+                            node = parse_trajectory_record(
+                                loads(_decompress_payload(payloads[identifier]))
+                            )
+                            _set_sub_session_id(node, assignments[identifier])
+                            validate_derived_fields(node)
+                            if identifier != compute_trajectory_id(node):
+                                raise ValueError(
+                                    "sub_session_id changed canonical trajectory identity"
+                                )
+                            node_json = dumps(project_trajectory(node), sort_keys=True)
+                            updates.append(
+                                (_compress_payload(node_json), identifier)
+                            )
+                        except (
+                            ValueError,
+                            TypeError,
+                            KeyError,
+                            zlib.error,
+                            zstandard.ZstdError,
+                        ):
+                            update_bad_ids.append(identifier)
+                    if updates:
+                        self.connection.executemany(
+                            "UPDATE trajectories SET payload=? WHERE trajectory_id=?",
+                            updates,
+                        )
+
+            if update_bad_ids:
+                skipped += self._discard_trajectories(update_bad_ids)
+                continue
+            return skipped
 
     def put_trajectory(
         self,
