@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -19,6 +20,8 @@ from .s3 import S3Location
 
 _BUFFER_BYTES = 8 * 1024 * 1024
 LOGGER = logging.getLogger(__name__)
+_PROGRESS_INTERVAL_SECONDS = 60.0
+_PROGRESS_ITEM_INTERVAL = 10_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +223,29 @@ class S3OutputSet:
             else None
         )
         self._trajectory_futures: list[Future[S3ObjectDescription]] = []
+        self._started_at = time.monotonic()
+        self._last_progress_at = self._started_at
+
+    def _log_progress(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        completed = len(self._trajectory_objects)
+        submitted = len(self._trajectory_names)
+        if not force and (
+            completed % _PROGRESS_ITEM_INTERVAL != 0
+            and now - self._last_progress_at < _PROGRESS_INTERVAL_SECONDS
+        ):
+            return
+        LOGGER.info(
+            "【上传阶段】已完成上传=%d，已提交上传=%d，待完成=%d，"
+            "接受轨迹=%d，隔离轨迹=%d，耗时=%.1f秒",
+            completed,
+            submitted,
+            len(self._trajectory_futures),
+            self.stats.accepted,
+            self.stats.quarantined_trajectories,
+            now - self._started_at,
+        )
+        self._last_progress_at = now
 
     def _upload_trajectory(
         self,
@@ -246,6 +272,7 @@ class S3OutputSet:
             return
         future = self._trajectory_futures.pop(0)
         self._trajectory_objects.append(future.result())
+        self._log_progress()
 
     def _resolve_all_futures(self) -> None:
         while self._trajectory_futures:
@@ -310,6 +337,7 @@ class S3OutputSet:
             if self._executor is None:
                 description = self._upload_trajectory(filename, payload)
                 self._trajectory_objects.append(description)
+                self._log_progress()
             else:
                 self._trajectory_futures.append(
                     self._executor.submit(
@@ -359,6 +387,7 @@ class S3OutputSet:
             self._resolve_all_futures()
             self._shutdown_executor(cancel=False)
             self._lineage.close()
+            self._log_progress(force=True)
         except Exception:
             self.abort()
             raise

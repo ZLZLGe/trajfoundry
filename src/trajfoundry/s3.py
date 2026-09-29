@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
+import time
 from collections import deque
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -24,6 +26,9 @@ _READ_CHUNK_BYTES = 1024 * 1024
 _READ_WORKERS = 4
 _READ_PREFETCH = 4
 _MAX_POOL_CONNECTIONS = 8
+_PROGRESS_INTERVAL_SECONDS = 60.0
+
+LOGGER = logging.getLogger(__name__)
 
 
 class _CountingBody:
@@ -231,7 +236,11 @@ class S3CaptureSource:
             Bucket=self.location.bucket,
             Prefix=self.location.prefix,
         )
+        started_at = time.monotonic()
+        last_progress_at = started_at
+        page_count = 0
         for page in pages:
+            page_count += 1
             contents = page.get("Contents", [])
             if contents is None:
                 contents = []
@@ -281,7 +290,24 @@ class S3CaptureSource:
                         )
                     )
 
-        return iter(sorted(captures, key=lambda capture: capture.source_ref))
+            now = time.monotonic()
+            if page_count == 1 or now - last_progress_at >= _PROGRESS_INTERVAL_SECONDS:
+                LOGGER.info(
+                    "【输入清单】已扫描分页=%d，已发现候选对象=%d，耗时=%.1f秒",
+                    page_count,
+                    len(captures),
+                    now - started_at,
+                )
+                last_progress_at = now
+
+        captures.sort(key=lambda capture: capture.source_ref)
+        LOGGER.info(
+            "【输入清单】扫描完成：分页=%d，候选对象=%d，耗时=%.1f秒",
+            page_count,
+            len(captures),
+            time.monotonic() - started_at,
+        )
+        return iter(captures)
 
     def iter_capture_payloads(
         self, input_format: InputFormat

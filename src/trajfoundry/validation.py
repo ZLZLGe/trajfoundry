@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
+import time
 from collections import Counter
 from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -32,6 +34,10 @@ from .quality import (
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _SHARD_PATTERN = re.compile(r"^(?:trajectories|records)-[0-9]+\.jsonl$")
 _MAX_REPORTED_ERRORS = 100
+_PROGRESS_INTERVAL_SECONDS = 60.0
+_PROGRESS_ITEM_INTERVAL = 10_000
+
+LOGGER = logging.getLogger(__name__)
 
 NonNegativeInt = Annotated[int, Field(ge=0)]
 PositiveInt = Annotated[int, Field(ge=1)]
@@ -677,6 +683,9 @@ def validate_output_backend(
         observed.counts["excluded_records"] = manifest.counts.excluded_records
     seen_paths: set[str] = set()
     lineage_entries = 0
+    started_at = time.monotonic()
+    last_progress_at = started_at
+    processed_files = 0
 
     pending: list[tuple[int, _ManifestFile, str | None]] = []
     for file_index, entry in enumerate(manifest.files):
@@ -715,6 +724,33 @@ def validate_output_backend(
             },
         )
 
+    def log_progress(*, force: bool = False) -> None:
+        nonlocal last_progress_at
+        now = time.monotonic()
+        if not force and (
+            processed_files % _PROGRESS_ITEM_INTERVAL != 0
+            and now - last_progress_at < _PROGRESS_INTERVAL_SECONDS
+        ):
+            return
+        LOGGER.info(
+            "【校验阶段】已校验文件=%d/%d，JSONL行数=%d，接受轨迹=%d，"
+            "隔离轨迹=%d，错误数=%d，耗时=%.1f秒",
+            processed_files,
+            len(manifest.files),
+            observed.counts["jsonl_rows"],
+            observed.counts["accepted"],
+            observed.counts["quarantined_trajectories"],
+            errors.total,
+            now - started_at,
+        )
+        last_progress_at = now
+
+    LOGGER.info(
+        "【校验阶段】开始校验输出：文件总数=%d，并发线程数=%d",
+        len(manifest.files),
+        max_workers,
+    )
+
     if max_workers == 1 or len(pending) <= 1:
         # Merge each file as soon as it has been scanned.  Keeping this path
         # streaming is important for v4 outputs with a very large number of
@@ -723,6 +759,8 @@ def validate_output_backend(
             file_observed, file_errors = validate_one(item)
             _merge_observed(observed, file_observed)
             errors.extend(file_errors)
+            processed_files += 1
+            log_progress()
     else:
         # Keep only a small ordered window in memory.  Submitting the complete
         # manifest at once would create one Future and one _Observed accumulator
@@ -745,6 +783,8 @@ def validate_output_backend(
                 file_observed, file_errors = future.result()
                 _merge_observed(observed, file_observed)
                 errors.extend(file_errors)
+                processed_files += 1
+                log_progress()
                 try:
                     futures.append(executor.submit(validate_one, next(iterator)))
                 except StopIteration:
@@ -803,6 +843,17 @@ def validate_output_backend(
 
     _compare_manifest_counts(manifest, observed, errors)
     messages = errors.finish()
+    log_progress(force=True)
+    LOGGER.info(
+        "【校验阶段】完成：已校验文件=%d/%d，JSONL行数=%d，错误数=%d，"
+        "结果=%s，耗时=%.1f秒",
+        processed_files,
+        len(manifest.files),
+        observed.counts["jsonl_rows"],
+        errors.total,
+        "通过" if errors.total == 0 else "失败",
+        time.monotonic() - started_at,
+    )
     return ValidationReport(
         valid=errors.total == 0, errors=messages, counts=observed.counts
     )

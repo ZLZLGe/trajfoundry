@@ -9,6 +9,7 @@ import logging
 import multiprocessing
 import os
 import sqlite3
+import time
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -68,6 +69,8 @@ _INGEST_BATCH_ITEMS = 512
 _INGEST_BATCH_BYTES = 64 * 1024 * 1024
 _TRAJECTORY_BUILD_SKIP_REASON = "trajectory_materialization_failed"
 _BUILD_WORKERS_ENV = "TRAJFOUNDRY_BUILD_WORKERS"
+_PROGRESS_INTERVAL_SECONDS = 60.0
+_PROGRESS_ITEM_INTERVAL = 10_000
 
 # These defects are fully representable in the canonical trajectory.  They
 # remain error-level audit evidence (and therefore quarantine the trajectory),
@@ -156,6 +159,11 @@ class PipelineStats:
     leaf_snapshots: int = 0
     stored_trajectories: int = 0
     sessions: int = 0
+    input_bytes: int = 0
+    ingest_seconds: float = 0.0
+    build_seconds: float = 0.0
+    export_seconds: float = 0.0
+    validation_seconds: float = 0.0
 
 
 @dataclass(slots=True)
@@ -1171,6 +1179,42 @@ def _build_trajectories(
     *,
     build_workers: int | None = None,
 ) -> None:
+    started_at = time.monotonic()
+    last_progress_at = started_at
+    completed_scopes = 0
+    completed_roots = 0
+    failed_roots = 0
+    total_scopes = sum(1 for _ in state.aggregation_scopes())
+
+    def log_progress(*, force: bool = False) -> None:
+        nonlocal last_progress_at
+        now = time.monotonic()
+        finished_roots = completed_roots + failed_roots
+        if not force and (
+            finished_roots % _PROGRESS_ITEM_INTERVAL != 0
+            and completed_scopes % _PROGRESS_ITEM_INTERVAL != 0
+            and now - last_progress_at < _PROGRESS_INTERVAL_SECONDS
+        ):
+            return
+        elapsed = max(now - started_at, 0.001)
+        LOGGER.info(
+            "【构建阶段】已完成范围=%d/%d，已处理根轨迹=%d，已生成轨迹=%d，"
+            "失败跳过=%d，耗时=%.1f秒，范围速度=%.2f个/秒",
+            completed_scopes,
+            total_scopes,
+            completed_roots,
+            state.trajectory_count(),
+            failed_roots,
+            elapsed,
+            completed_scopes / elapsed,
+        )
+        last_progress_at = now
+
+    LOGGER.info(
+        "【构建阶段】开始构建轨迹，聚合范围总数=%d，并发进程数=%s",
+        total_scopes,
+        build_workers if build_workers is not None else os.environ.get(_BUILD_WORKERS_ENV, "1"),
+    )
     state.clear_trajectories()
     failed_paths: set[str] = set()
     represented_paths: set[str] = set()
@@ -1229,6 +1273,8 @@ def _build_trajectories(
                 existing.routing_snapshot = _routing_snapshot(leaf)
 
         if not flat_leaves:
+            completed_scopes += 1
+            log_progress()
             continue
         routing_leaves = [
             flat_leaves[key].routing_snapshot for key in sorted(flat_leaves)
@@ -1258,6 +1304,8 @@ def _build_trajectories(
         except Exception as error:  # noqa: BLE001 - skip one broken scope
             failed_paths.update(all_flat_paths)
             _log_trajectory_build_failure(error, all_flat_paths)
+            completed_scopes += 1
+            log_progress()
             continue
 
         # Build one independent job per root.  The coordinator owns prefix
@@ -1360,13 +1408,17 @@ def _build_trajectories(
                                 _origin_rows(state, origin_paths),
                             )
                         except Exception as error:  # noqa: BLE001
+                            failed_roots += 1
                             failed_paths.update(origin_paths)
                             _log_trajectory_build_failure(error, origin_paths)
                         else:
+                            completed_roots += 1
                             represented_paths.update(origin_paths)
                     except Exception as error:  # noqa: BLE001 - skip one bad trajectory
+                        failed_roots += 1
                         failed_paths.update(origin_paths)
                         _log_trajectory_build_failure(error, origin_paths)
+                    log_progress()
             elif root_jobs:
                 # Submit in deterministic root order, but consume and persist in
                 # that same order so trajectory IDs and representative selection
@@ -1399,13 +1451,18 @@ def _build_trajectories(
                                 snapshot,
                                 _origin_rows(state, paths),
                             )
+                            completed_roots += 1
                             represented_paths.update(paths)
                         except Exception as error:  # noqa: BLE001 - skip one bad trajectory
+                            failed_roots += 1
                             failed_paths.update(paths)
                             _log_trajectory_build_failure(error, paths)
+                        log_progress()
                         item = next(iterator, None)
                         if item is not None:
                             futures.append((item, pool.submit(_materialize_root_worker, item[0])))
+        completed_scopes += 1
+        log_progress()
     _skip_failed_trajectory_sources(state, failed_paths, represented_paths)
     state.assign_sub_session_ids()
     # Sub-session assignment validates the materialized rows a second time.
@@ -1415,6 +1472,14 @@ def _build_trajectories(
         status == "skipped" for _, _, status, _, _, _ in state.capture_records()
     )
     stats.stored_trajectories = state.trajectory_count()
+    log_progress(force=True)
+    LOGGER.info(
+        "【构建阶段】完成：范围=%d，生成轨迹=%d，失败跳过=%d，耗时=%.1f秒",
+        stats.sessions,
+        stats.stored_trajectories,
+        failed_roots,
+        time.monotonic() - started_at,
+    )
 
 
 def _snapshot_record(snapshot: Snapshot) -> QuarantineRecord | None:
@@ -1463,8 +1528,39 @@ def _export(
         config.output_root,
         max_shard_bytes=config.max_shard_bytes,
     )
+    started_at = time.monotonic()
+    last_progress_at = started_at
+    processed_records = 0
+    processed_trajectories = 0
+    total_records = state.capture_count()
+    total_trajectories = state.trajectory_count()
+
+    def log_progress(*, force: bool = False) -> None:
+        nonlocal last_progress_at
+        now = time.monotonic()
+        completed = processed_records + processed_trajectories
+        if not force and (
+            completed % _PROGRESS_ITEM_INTERVAL != 0
+            and now - last_progress_at < _PROGRESS_INTERVAL_SECONDS
+        ):
+            return
+        LOGGER.info(
+            "【输出阶段】已处理输入记录=%d/%d，已处理轨迹=%d/%d，耗时=%.1f秒",
+            processed_records,
+            total_records,
+            processed_trajectories,
+            total_trajectories,
+            now - started_at,
+        )
+        last_progress_at = now
+
+    LOGGER.info(
+        "【输出阶段】开始写入结果：输入记录总数=%d，轨迹总数=%d",
+        total_records,
+        total_trajectories,
+    )
     try:
-        output.stats.input_files = state.capture_count()
+        output.stats.input_files = total_records
         for (
             source_ref,
             sha256,
@@ -1475,6 +1571,8 @@ def _export(
         ) in state.capture_records():
             if status == "skipped":
                 output.write_skipped(reason)
+                processed_records += 1
+                log_progress()
                 continue
             if status == "failed":
                 reason_code = reason.partition(":")[0]
@@ -1505,18 +1603,34 @@ def _export(
                         ),
                     )
                 )
+                processed_records += 1
+                log_progress()
                 continue
             snapshot = state.get_snapshot(source_ref)
             if snapshot is not None and (record := _snapshot_record(snapshot)):
                 output.write_record(record)
+            processed_records += 1
+            log_progress()
 
         for _, node, origins in state.iter_trajectories():
             output.write_trajectory(node, origins)
-        return output.close(
+            processed_trajectories += 1
+            log_progress()
+        manifest = output.close(
             input_root=input_root_label or str(config.input_root),
             input_format=config.input_format,
             config_hash=configuration_hash,
         )
+        log_progress(force=True)
+        LOGGER.info(
+            "【输出阶段】完成：已处理输入记录=%d/%d，已处理轨迹=%d/%d，耗时=%.1f秒",
+            processed_records,
+            total_records,
+            processed_trajectories,
+            total_trajectories,
+            time.monotonic() - started_at,
+        )
+        return manifest
     except BaseException:
         output.abort()
         raise
@@ -1530,6 +1644,32 @@ def _ingest_source(
     *,
     source_errors_fatal: bool = False,
 ) -> None:
+    started_at = time.monotonic()
+    last_progress_at = started_at
+    LOGGER.info("【读取阶段】开始读取输入数据")
+
+    def log_progress(*, force: bool = False) -> None:
+        nonlocal last_progress_at
+        now = time.monotonic()
+        if not force and (
+            stats.discovered % _PROGRESS_ITEM_INTERVAL != 0
+            and now - last_progress_at < _PROGRESS_INTERVAL_SECONDS
+        ):
+            return
+        elapsed = max(now - started_at, 0.001)
+        rate = stats.discovered / elapsed
+        LOGGER.info(
+            "【读取阶段】已发现=%d，已解析=%d，已复用=%d，解析失败=%d，"
+            "耗时=%.1f秒，速度=%.1f对象/秒",
+            stats.discovered,
+            stats.parsed,
+            stats.reused,
+            stats.parse_failures,
+            elapsed,
+            rate,
+        )
+        last_progress_at = now
+
     state.begin_scan(uuid.uuid4().hex)
     batch_items = 0
     batch_bytes = 0
@@ -1566,10 +1706,12 @@ def _ingest_source(
 
     def process_payload(source_ref: str, payload: bytes, digest: str) -> None:
         stats.discovered += 1
+        stats.input_bytes += len(payload)
         endpoint = ""
         captured_at = ""
         if state.capture_matches(source_ref, digest):
             stats.reused += 1
+            log_progress()
             return
 
         try:
@@ -1654,6 +1796,7 @@ def _ingest_source(
                 captured_at=captured_at,
             )
             stats.parse_failures += 1
+        log_progress()
 
     try:
         streaming = getattr(source, "iter_capture_payloads", None)
@@ -1679,6 +1822,7 @@ def _ingest_source(
                         captured_at="",
                     )
                     stats.parse_failures += 1
+                    log_progress()
                     rotate_batch(0)
                     continue
                 process_payload(source_ref, payload, digest)
@@ -1691,6 +1835,14 @@ def _ingest_source(
     state.finish_scan()
     stats.skipped_inputs = sum(
         status == "skipped" for _, _, status, _, _, _ in state.capture_records()
+    )
+    log_progress(force=True)
+    LOGGER.info(
+        "【读取阶段】完成：已发现=%d，已解析=%d，解析失败=%d，耗时=%.1f秒",
+        stats.discovered,
+        stats.parsed,
+        stats.parse_failures,
+        time.monotonic() - started_at,
     )
 
 
@@ -1737,6 +1889,7 @@ def normalize_source(
         state.set_meta("config_hash", configuration_hash)
         # Remote read errors are infrastructure failures, rather than content
         # defects, and must fail the scheduler task without publication.
+        stage_started_at = time.monotonic()
         _ingest_source(
             source,
             state,
@@ -1744,15 +1897,26 @@ def normalize_source(
             stats,
             source_errors_fatal=True,
         )
+        stats.ingest_seconds = time.monotonic() - stage_started_at
         if stats.discovered == 0:
             raise ValueError(f"capture source is empty: {source.label}")
+        stage_started_at = time.monotonic()
         _build_trajectories(state, stats, build_workers=build_workers)
+        stats.build_seconds = time.monotonic() - stage_started_at
+        stage_started_at = time.monotonic()
         output_result = _export(
             state,
             runtime_config,
             configuration_hash,
             output=output_factory(),
             input_root_label=source.label,
+        )
+        stats.export_seconds = time.monotonic() - stage_started_at
+        LOGGER.info(
+            "【阶段汇总】读取耗时=%.1f秒，构建耗时=%.1f秒，输出耗时=%.1f秒",
+            stats.ingest_seconds,
+            stats.build_seconds,
+            stats.export_seconds,
         )
     return stats, output_result
 
@@ -1799,14 +1963,26 @@ def normalize(config: PipelineConfig) -> PipelineStats:
         if not normalized_config.resume or previous_hash != configuration_hash:
             state.reset_ingest()
         state.set_meta("config_hash", configuration_hash)
+        stage_started_at = time.monotonic()
         _ingest_source(
             LocalCaptureSource(input_root),
             state,
             normalized_config,
             stats,
         )
+        stats.ingest_seconds = time.monotonic() - stage_started_at
+        stage_started_at = time.monotonic()
         _build_trajectories(state, stats)
+        stats.build_seconds = time.monotonic() - stage_started_at
+        stage_started_at = time.monotonic()
         _export(state, normalized_config, configuration_hash)
+        stats.export_seconds = time.monotonic() - stage_started_at
+        LOGGER.info(
+            "【阶段汇总】读取耗时=%.1f秒，构建耗时=%.1f秒，输出耗时=%.1f秒",
+            stats.ingest_seconds,
+            stats.build_seconds,
+            stats.export_seconds,
+        )
     return stats
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
@@ -154,12 +155,24 @@ def _run_s3_job_with_client(
     output_workers: int = 1,
     validation_workers: int = 1,
 ) -> JobResult:
+    started_at = time.monotonic()
+    LOGGER.info(
+        "【任务开始】输入格式=%s，构建并发=%d，上传并发=%d，校验并发=%d",
+        input_format,
+        build_workers,
+        output_workers,
+        validation_workers,
+    )
     # Existing flat objects are retained while the candidate is being built so
     # validation can ignore files from the previous publication.  They are
     # removed after the new manifest is published.  In particular, do not read
     # manifest.json here: some S3-compatible stores return AccessDenied for a
     # missing object, which must not prevent a first run.
     listed_flat_paths = _list_flat_jsonl_paths(client, output_location)
+    LOGGER.info(
+        "【任务开始】已有输出轨迹文件=%d，准备读取输入数据",
+        len(listed_flat_paths),
+    )
     source = S3CaptureSource(client, input_location)
     with TemporaryDirectory(prefix="trajfoundry-state-", dir=workspace) as directory:
         stats, manifest_bytes = normalize_source(
@@ -175,6 +188,23 @@ def _run_s3_job_with_client(
             max_shard_bytes=max_shard_bytes,
             build_workers=build_workers,
         )
+    LOGGER.info(
+        "【读取与构建完成】已发现=%d，已解析=%d，复用=%d，解析失败=%d，"
+        "范围数=%d，中间前缀=%d，叶节点=%d，生成轨迹=%d，跳过=%d，"
+        "读取耗时=%.1f秒，构建耗时=%.1f秒，输出耗时=%.1f秒",
+        stats.discovered,
+        stats.parsed,
+        stats.reused,
+        stats.parse_failures,
+        stats.sessions,
+        stats.prefix_intermediates,
+        stats.leaf_snapshots,
+        stats.stored_trajectories,
+        stats.skipped_inputs,
+        stats.ingest_seconds,
+        stats.build_seconds,
+        stats.export_seconds,
+    )
 
     current_flat_paths = _flat_manifest_jsonl_paths(manifest_bytes)
     validation_backend = S3ValidationBackend(
@@ -182,6 +212,7 @@ def _run_s3_job_with_client(
         output_location,
         ignored_flat_paths=frozenset(listed_flat_paths - current_flat_paths),
     )
+    validation_started_at = time.monotonic()
     if validation_workers == 1:
         # Preserve compatibility with callers that monkeypatch the historical
         # two-argument validation hook.
@@ -192,6 +223,17 @@ def _run_s3_job_with_client(
             validation_backend,
             max_workers=validation_workers,
         )
+    stats.validation_seconds = time.monotonic() - validation_started_at
+    LOGGER.info(
+        "【输出校验完成】文件数=%d，JSONL行数=%d，接受轨迹=%d，"
+        "隔离轨迹=%d，报告错误条目=%d，耗时=%.1f秒",
+        report.counts.get("checked_files", 0),
+        report.counts.get("jsonl_rows", 0),
+        report.counts.get("accepted", 0),
+        report.counts.get("quarantined_trajectories", 0),
+        len(report.errors),
+        stats.validation_seconds,
+    )
     if not report.valid:
         raise JobValidationError(output_location.uri, report)
 
@@ -242,6 +284,16 @@ def _run_s3_job_with_client(
         report.counts.get("quarantined_records", 0),
         report.counts.get("skipped_inputs", 0),
     )
+    LOGGER.info(
+        "【任务完成】总耗时=%.1f秒，最终轨迹=%d，接受=%d，隔离=%d，"
+        "跳过=%d，校验=%s",
+        time.monotonic() - started_at,
+        stats.stored_trajectories,
+        report.counts.get("accepted", 0),
+        report.counts.get("quarantined_trajectories", 0),
+        report.counts.get("skipped_inputs", 0),
+        "通过" if report.valid else "失败",
+    )
     return JobResult(stats=stats, validation=report)
 
 
@@ -286,7 +338,9 @@ def run_job(
             max_shard_bytes=max_shard_bytes,
         )
     )
+    validation_started_at = time.monotonic()
     report = validate_output(output_path)
+    stats.validation_seconds = time.monotonic() - validation_started_at
 
     if stats.discovered == 0:
         LOGGER.warning("TrajFoundry input contains no capture files: %s", input_path)
@@ -320,6 +374,19 @@ def run_job(
         report.counts.get("quarantined_trajectories", 0),
         report.counts.get("quarantined_records", 0),
         report.counts.get("skipped_inputs", 0),
+    )
+    LOGGER.info(
+        "【任务完成】总耗时=%.1f秒，最终轨迹=%d，接受=%d，隔离=%d，"
+        "跳过=%d，校验=%s",
+        stats.ingest_seconds
+        + stats.build_seconds
+        + stats.export_seconds
+        + stats.validation_seconds,
+        stats.stored_trajectories,
+        report.counts.get("accepted", 0),
+        report.counts.get("quarantined_trajectories", 0),
+        report.counts.get("skipped_inputs", 0),
+        "通过" if report.valid else "失败",
     )
     return JobResult(stats=stats, validation=report)
 
