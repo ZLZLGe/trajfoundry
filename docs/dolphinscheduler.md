@@ -324,6 +324,8 @@ The classifier defaults to a 600,000-character serialized trajectory context
 budget (`max_context_chars`) and a 1,024-token output limit. The character
 budget is a conservative envelope for a 256K-token model rather than a
 tokenizer-level limit; the system prompt and taxonomy are additional context.
+If the gateway still reports a context-limit error, the classifier reduces the
+character budget and retries up to five times.
 
 The classifier revision and independent strategy fingerprint are recorded in
 the output manifest and cache configuration hash. Changing the model, context

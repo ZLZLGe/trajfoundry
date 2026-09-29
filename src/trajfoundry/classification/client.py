@@ -41,6 +41,25 @@ class ClassificationRetryExhausted(ClassificationAPIError):
         super().__init__(reason)
 
 
+class ClassificationContextLimitError(ClassificationAPIError):
+    """The gateway rejected a request because its context is too large."""
+
+
+def _is_context_limit_error(error: urllib.error.HTTPError) -> bool:
+    if error.code == 413:
+        return True
+    try:
+        detail = error.read(8192).decode("utf-8", errors="ignore").lower()
+    except OSError:
+        return False
+    if not detail:
+        return False
+    markers = ("exceed", "maximum", "max_", "limit", "too long", "length")
+    return ("context" in detail or "token" in detail or "prompt" in detail) and any(
+        marker in detail for marker in markers
+    )
+
+
 def _validate_api_url(value: str) -> str:
     if not isinstance(value, str) or not value:
         raise ClassificationConfigurationError("classifier API URL is required")
@@ -147,8 +166,11 @@ class ChatCompletionsClient:
                     raw = response.read()
                 return self._parse_response(raw)
             except urllib.error.HTTPError as error:
-                error.close()
                 status = error.code
+                if status in {400, 413, 422} and _is_context_limit_error(error):
+                    error.close()
+                    raise ClassificationContextLimitError from error
+                error.close()
                 if status in {401, 403, 404, 422}:
                     raise ClassificationConfigurationError(
                         f"classifier API configuration failed with HTTP {status}"
@@ -208,6 +230,7 @@ __all__ = [
     "ChatCompletionsClient",
     "ClassificationAPIError",
     "ClassificationConfigurationError",
+    "ClassificationContextLimitError",
     "ClassificationRequestError",
     "ClassificationRetryExhausted",
 ]

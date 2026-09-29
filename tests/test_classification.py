@@ -14,6 +14,7 @@ from trajfoundry.classification.classifier import (
 from trajfoundry.classification.client import (
     ChatCompletionsClient,
     ClassificationConfigurationError,
+    ClassificationContextLimitError,
     ClassificationRetryExhausted,
 )
 from trajfoundry.classification.taxonomy import ScenarioTaxonomy
@@ -29,6 +30,24 @@ class _Completion:
     def complete(self, messages: list[dict[str, str]]) -> str:
         self.messages.append(messages)
         return orjson.dumps(self.response).decode()
+
+
+class _ContextThenCompletion:
+    model = "classifier-test"
+
+    def __init__(self) -> None:
+        self.calls: list[list[dict[str, str]]] = []
+
+    def complete(self, messages: list[dict[str, str]]) -> str:
+        self.calls.append(messages)
+        if len(self.calls) == 1:
+            raise ClassificationContextLimitError()
+        return orjson.dumps(
+            {
+                "scenario_label_key": "toc|Shopping|购物",
+                "capability_labels": ["Tool Use"],
+            }
+        ).decode()
 
 
 class _HTTPResponse:
@@ -139,6 +158,28 @@ def test_classifier_marks_unknown_model_labels_as_failed(tmp_path) -> None:
     assert attempt.classification["reason"] == "invalid_model_output"
     assert attempt.classification["model_label"] == "unknown"
     assert attempt.classification["harness_label"] == "unknown"
+
+
+def test_classifier_reduces_context_after_gateway_context_error(tmp_path) -> None:
+    client = _ContextThenCompletion()
+    classifier = TrajectoryClassifier(
+        client=client,
+        taxonomy=_taxonomy(tmp_path),
+        input_manifest_sha256="a" * 64,
+        max_context_chars=10_000,
+    )
+
+    attempt = classifier.classify(
+        {"messages": [{"role": "user", "content": "x" * 20_000}]}
+    )
+
+    assert attempt.cacheable
+    assert attempt.classification["context_truncated"] is True
+    assert len(client.calls) == 2
+    first = client.calls[0][1]["content"]
+    second = client.calls[1][1]["content"]
+    assert len(second) < len(first)
+    assert "TRAJECTORY_CONTEXT_TRUNCATED" in second
 
 
 def test_taxonomy_derives_stable_l1_catalog_and_lookup(tmp_path) -> None:
@@ -264,6 +305,27 @@ def test_chat_client_sends_bounded_json_request() -> None:
         "max_tokens": 1_024,
         "response_format": {"type": "json_object"},
     }
+
+
+def test_chat_client_reports_context_limit_separately() -> None:
+    def opener(*_args, **_kwargs):
+        raise urllib.error.HTTPError(
+            "https://classifier.invalid/v1/chat/completions",
+            400,
+            "context too long",
+            {},
+            io.BytesIO(b'{"error":{"message":"maximum context length exceeded"}}'),
+        )
+
+    client = ChatCompletionsClient(
+        api_url="https://classifier.invalid/v1/chat/completions",
+        model="model",
+        api_key="secret",
+        opener=opener,
+    )
+
+    with pytest.raises(ClassificationContextLimitError):
+        client.complete([{"role": "user", "content": "hello"}])
 
 
 def test_chat_client_treats_404_as_configuration_error() -> None:

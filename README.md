@@ -280,7 +280,9 @@ The default serialized trajectory context budget is 600,000 characters via
 256K-token classifier, not a tokenizer-level limit. The system prompt and
 taxonomy consume additional model context, and the request reserves 1,024
 output tokens. The limit can be overridden explicitly when the configured
-model gateway supports a larger or smaller request.
+model gateway supports a larger or smaller request. If the gateway still
+reports a context-limit error, the classifier reduces the character budget and
+retries up to five times.
 
 Classification uses bounded concurrency and a persistent SQLite cache under
 `workspace_parent/.trajfoundry-label-cache/` by default. Pass `state_path` to

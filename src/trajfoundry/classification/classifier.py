@@ -11,6 +11,7 @@ import orjson
 from .client import (
     DEFAULT_MAX_OUTPUT_TOKENS,
     ClassificationConfigurationError,
+    ClassificationContextLimitError,
     ClassificationRequestError,
     ClassificationRetryExhausted,
 )
@@ -31,14 +32,16 @@ CAPABILITY_LABELS = (
 # Bump when the classification contract, model budget, or publication
 # behavior changes so metadata and the persistent cache cannot silently mix
 # runs.
-CLASSIFIER_REVISION = "2026-09-29.1"
+CLASSIFIER_REVISION = "2026-09-30.1"
 PROMPT_VERSION = "v001"
 # The model documentation advertises a 256K-token context window.  The
 # trajectory cap below remains a character budget because no Atria tokenizer
 # is available in this runtime; it is a conservative envelope for current
 # data, not an exact tokenizer-level guarantee.
 CLASSIFIER_CONTEXT_WINDOW_TOKENS = 256_000
-TRUNCATION_STRATEGY = "head_tail_char_v1"
+TRUNCATION_STRATEGY = "head_tail_char_adaptive_v2"
+MAX_CONTEXT_REDUCTIONS = 5
+CONTEXT_REDUCTION_FACTOR = 0.75
 # This is the serialized trajectory budget in characters, not model tokens.
 DEFAULT_MAX_CONTEXT_CHARS = 600_000
 
@@ -92,7 +95,7 @@ def _model_context(
     payload = orjson.dumps(trajectory, option=orjson.OPT_SORT_KEYS).decode("utf-8")
     if len(payload) <= max_context_chars:
         return payload, False
-    marker = '\n"[...TRAJECTORY_CONTEXT_TRUNCATED...]"\n'
+    marker = "\n[...TRAJECTORY_CONTEXT_TRUNCATED...]\n"
     available = max_context_chars - len(marker)
     if available <= 0:
         raise ValueError("max_context_chars is too small")
@@ -148,6 +151,8 @@ class TrajectoryClassifier:
                 self.client, "max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS
             ),
             "truncation_strategy": TRUNCATION_STRATEGY,
+            "context_reduction_factor": CONTEXT_REDUCTION_FACTOR,
+            "max_context_reductions": MAX_CONTEXT_REDUCTIONS,
             "temperature": 0,
             "response_format": "json_object",
         }
@@ -189,56 +194,75 @@ class TrajectoryClassifier:
     def classify(self, trajectory: dict[str, Any]) -> ClassificationAttempt:
         if type(trajectory) is not dict:
             raise TypeError("trajectory must be an object")
-        context, truncated = _model_context(trajectory, self.max_context_chars)
-        base = {
-            "model_label": _display_value(trajectory.get("model")),
-            "harness_label": _display_value(trajectory.get("harness")),
-            "classifier_revision": self.classifier_revision,
-            "prompt_version": self.prompt_version,
-            "taxonomy_sha256": self.taxonomy.sha256,
-            "catalog_sha256": self.catalog_sha256,
-            "policy_sha256": self.policy_sha256,
-            "prompt_sha256": self.prompt_sha256,
-            "strategy_fingerprint": self.strategy_fingerprint,
-            "config_hash": self.config_hash,
-            "input_manifest_sha256": self.input_manifest_sha256,
-            "context_truncated": truncated,
-        }
-        messages = [
-            {"role": "system", "content": self._system_prompt},
-            {
-                "role": "user",
-                "content": (
-                    "Classify this complete root trajectory. Embedded sub-agent "
-                    "trajectories are context for the same classification.\n\n"
-                    f"TRAJECTORY:\n{context}"
-                ),
-            },
-        ]
-        try:
-            response = self.client.complete(messages)
-            decision = self._parse_decision(response)
-        except ClassificationConfigurationError:
-            raise
-        except ClassificationRetryExhausted as error:
-            return ClassificationAttempt(
-                classification={"status": "failed", "reason": error.reason, **base},
-                cacheable=False,
-            )
-        except ClassificationRequestError as error:
-            return ClassificationAttempt(
-                classification={"status": "failed", "reason": error.reason, **base},
-                cacheable=False,
-            )
-        except (ModelDecisionError, TaxonomyError, orjson.JSONDecodeError):
-            return ClassificationAttempt(
-                classification={
-                    "status": "failed",
-                    "reason": "invalid_model_output",
-                    **base,
+        context_budget = self.max_context_chars
+        reductions = 0
+        while True:
+            context, truncated = _model_context(trajectory, context_budget)
+            base = {
+                "model_label": _display_value(trajectory.get("model")),
+                "harness_label": _display_value(trajectory.get("harness")),
+                "classifier_revision": self.classifier_revision,
+                "prompt_version": self.prompt_version,
+                "taxonomy_sha256": self.taxonomy.sha256,
+                "catalog_sha256": self.catalog_sha256,
+                "policy_sha256": self.policy_sha256,
+                "prompt_sha256": self.prompt_sha256,
+                "strategy_fingerprint": self.strategy_fingerprint,
+                "config_hash": self.config_hash,
+                "input_manifest_sha256": self.input_manifest_sha256,
+                "context_truncated": truncated or reductions > 0,
+            }
+            messages = [
+                {"role": "system", "content": self._system_prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        "Classify this complete root trajectory. Embedded sub-agent "
+                        "trajectories are context for the same classification.\n\n"
+                        f"TRAJECTORY:\n{context}"
+                    ),
                 },
-                cacheable=False,
-            )
+            ]
+            try:
+                response = self.client.complete(messages)
+                decision = self._parse_decision(response)
+            except ClassificationContextLimitError:
+                if reductions >= MAX_CONTEXT_REDUCTIONS:
+                    return ClassificationAttempt(
+                        classification={
+                            "status": "failed",
+                            "reason": "context_limit_exhausted",
+                            **base,
+                        },
+                        cacheable=False,
+                    )
+                context_budget = max(
+                    1024, int(context_budget * CONTEXT_REDUCTION_FACTOR)
+                )
+                reductions += 1
+                continue
+            except ClassificationConfigurationError:
+                raise
+            except ClassificationRetryExhausted as error:
+                return ClassificationAttempt(
+                    classification={"status": "failed", "reason": error.reason, **base},
+                    cacheable=False,
+                )
+            except ClassificationRequestError as error:
+                return ClassificationAttempt(
+                    classification={"status": "failed", "reason": error.reason, **base},
+                    cacheable=False,
+                )
+            except (ModelDecisionError, TaxonomyError, orjson.JSONDecodeError):
+                return ClassificationAttempt(
+                    classification={
+                        "status": "failed",
+                        "reason": "invalid_model_output",
+                        **base,
+                    },
+                    cacheable=False,
+                )
+            break
 
         return ClassificationAttempt(
             classification={
@@ -308,6 +332,7 @@ __all__ = [
     "CLASSIFIER_REVISION",
     "DEFAULT_MAX_CONTEXT_CHARS",
     "DEFAULT_MAX_OUTPUT_TOKENS",
+    "MAX_CONTEXT_REDUCTIONS",
     "POLICY_SHA256",
     "PROMPT_VERSION",
     "TRUNCATION_STRATEGY",
