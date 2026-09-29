@@ -135,6 +135,18 @@ def test_validate_output_backend_accepts_memory_streams_and_closes_them(
     )
 
 
+def test_validate_output_backend_supports_bounded_parallel_reads(
+    tmp_path: Path,
+) -> None:
+    manifest_bytes, objects = _build_output(tmp_path)
+    backend = _MemoryBackend(objects)
+
+    report = validate_output_backend(manifest_bytes, backend, max_workers=2)
+
+    assert report.valid
+    assert all(stream.closed for stream in backend.streams)
+
+
 def test_validate_output_backend_checks_reported_and_streamed_size(
     tmp_path: Path,
 ) -> None:

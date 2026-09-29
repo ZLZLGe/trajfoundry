@@ -162,17 +162,20 @@ def create_s3_client(
     region_name: str,
     *,
     credentials: S3Credentials | None = None,
+    max_pool_connections: int = _MAX_POOL_CONNECTIONS,
 ) -> Any:
     """Create the configured S3-compatible client, importing boto3 lazily."""
 
     import boto3
     from botocore.config import Config
 
+    if max_pool_connections <= 0:
+        raise ValueError("max pool connections must be positive")
     config = Config(
         signature_version="s3v4",
         s3={"addressing_style": "path"},
         retries={"mode": "standard", "max_attempts": 10},
-        max_pool_connections=_MAX_POOL_CONNECTIONS,
+        max_pool_connections=max_pool_connections,
     )
     client_kwargs: dict[str, Any] = {
         "endpoint_url": endpoint_url,

@@ -18,6 +18,11 @@ def main():
         endpoint_url="${endpoint_url}",
         region_name="us-east-1",
         workspace_parent=Path("${workspace_parent}"),
+        # Keep each aggregation scope intact while parallelizing independent
+        # roots; output and remote validation use bounded S3 concurrency.
+        build_workers=16,
+        output_workers=16,
+        validation_workers=16,
     )
 
 

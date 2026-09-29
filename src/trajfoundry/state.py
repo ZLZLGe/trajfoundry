@@ -177,6 +177,12 @@ class StateStore:
         self.connection.execute(f"PRAGMA user_version={STATE_SCHEMA_VERSION}")
         self.connection.commit()
         self._scan_id: str | None = None
+        # Rows written through put_trajectory_with_origins have already passed
+        # canonical projection, derived-field validation, and trajectory-id
+        # verification. Keep that fact for the current process so sub-session
+        # assignment does not repeat the expensive quality pass. Rows loaded
+        # from a reopened state database are intentionally not trusted.
+        self._trusted_trajectory_ids: set[str] = set()
 
     def _table_columns(self, table: str) -> tuple[str, ...]:
         return tuple(
@@ -650,6 +656,7 @@ class StateStore:
         return int(row[0]) if row else 0
 
     def clear_trajectories(self) -> None:
+        self._trusted_trajectory_ids.clear()
         with self._write_scope():
             self.connection.execute("DELETE FROM trajectory_origins")
             self.connection.execute("DELETE FROM trajectories")
@@ -719,6 +726,47 @@ class StateStore:
                 skipped_sources += 1
         return skipped_sources
 
+    @staticmethod
+    def _trusted_session_metadata(value: object) -> tuple[str, bool]:
+        """Read assignment metadata from an already canonical trajectory dict."""
+
+        if not isinstance(value, Mapping):
+            raise TypeError("trajectory payload is not an object")
+        metadata = value.get("metadata")
+        if not isinstance(metadata, Mapping):
+            raise TypeError("trajectory payload has no metadata object")
+        session_id = metadata.get("session_id")
+        if not isinstance(session_id, str):
+            raise TypeError("trajectory metadata has invalid session_id")
+        audit = value.get("normalization_audit")
+        synthesized = False
+        if isinstance(audit, Mapping):
+            issues = audit.get("issues")
+            if isinstance(issues, list):
+                synthesized = any(
+                    isinstance(issue, Mapping)
+                    and issue.get("code") == "metadata_session_id_synthesized"
+                    for issue in issues
+                )
+        return session_id, (not session_id or synthesized)
+
+    @staticmethod
+    def _set_sub_session_id_in_projection(value: object, sub_session_id: int) -> None:
+        """Update canonical JSON in place without reparsing a Pydantic tree."""
+
+        if not isinstance(value, Mapping):
+            raise TypeError("trajectory payload is not an object")
+        metadata = value.get("metadata")
+        if not isinstance(metadata, dict):
+            raise TypeError("trajectory payload has no mutable metadata object")
+        metadata["sub_session_id"] = sub_session_id
+        children = value.get("sub_agent_trajectory")
+        if isinstance(children, Mapping):
+            for child in children.values():
+                StateStore._set_sub_session_id_in_projection(
+                    child, sub_session_id
+                )
+
     def assign_sub_session_ids(self) -> int:
         """Number final, deduplicated branches within each real session.
 
@@ -740,7 +788,23 @@ class StateStore:
             for identifier, payload in rows:
                 identifier = str(identifier)
                 try:
-                    node = parse_trajectory_record(loads(_decompress_payload(payload)))
+                    projected = loads(_decompress_payload(payload))
+                    if identifier in self._trusted_trajectory_ids:
+                        session_id, synthesized = self._trusted_session_metadata(projected)
+                        metadata = projected["metadata"]
+                        created_at = metadata.get("created_at")
+                        source_file = metadata.get("source_file")
+                        if not isinstance(created_at, str) or not isinstance(source_file, str):
+                            raise ValueError("trajectory metadata has invalid ordering fields")
+                        if synthesized:
+                            assignments[identifier] = 0
+                            continue
+                        real_sessions[session_id].append((created_at, identifier, source_file))
+                        continue
+
+                    # Rows loaded from a previous process are not trusted and
+                    # retain the original full contract and identity checks.
+                    node = parse_trajectory_record(projected)
                     if identifier != compute_trajectory_id(node):
                         raise ValueError(
                             "stored trajectory_id does not match trajectory content"
@@ -796,16 +860,23 @@ class StateStore:
                     updates: list[tuple[bytes, str]] = []
                     for identifier in identifiers:
                         try:
-                            node = parse_trajectory_record(
-                                loads(_decompress_payload(payloads[identifier]))
-                            )
-                            _set_sub_session_id(node, assignments[identifier])
-                            validate_derived_fields(node)
-                            if identifier != compute_trajectory_id(node):
-                                raise ValueError(
-                                    "sub_session_id changed canonical trajectory identity"
+                            projected = loads(_decompress_payload(payloads[identifier]))
+                            if identifier in self._trusted_trajectory_ids:
+                                # sub_session_id is excluded from semantic identity;
+                                # the row was fully validated on insertion.
+                                self._set_sub_session_id_in_projection(
+                                    projected, assignments[identifier]
                                 )
-                            node_json = dumps(project_trajectory(node), sort_keys=True)
+                                node_json = dumps(projected, sort_keys=True)
+                            else:
+                                node = parse_trajectory_record(projected)
+                                _set_sub_session_id(node, assignments[identifier])
+                                validate_derived_fields(node)
+                                if identifier != compute_trajectory_id(node):
+                                    raise ValueError(
+                                        "sub_session_id changed canonical trajectory identity"
+                                    )
+                                node_json = dumps(project_trajectory(node), sort_keys=True)
                             updates.append(
                                 (_compress_payload(node_json), identifier)
                             )
@@ -938,6 +1009,11 @@ class StateStore:
                     for origin in origins
                 ],
             )
+        # Only trust the payload that was actually inserted/replaced.  An
+        # existing row may have come from an earlier process and must retain
+        # the defensive validation path on this run.
+        if existing is None or replace_payload:
+            self._trusted_trajectory_ids.add(trajectory_id)
 
     def iter_trajectories(
         self,

@@ -150,6 +150,9 @@ def _run_s3_job_with_client(
     input_format: InputFormat,
     workspace: Path,
     max_shard_bytes: int,
+    build_workers: int = 1,
+    output_workers: int = 1,
+    validation_workers: int = 1,
 ) -> JobResult:
     # Existing flat objects are retained while the candidate is being built so
     # validation can ignore files from the previous publication.  They are
@@ -167,19 +170,28 @@ def _run_s3_job_with_client(
                 client,
                 output_location,
                 max_shard_bytes=max_shard_bytes,
+                max_workers=output_workers,
             ),
             max_shard_bytes=max_shard_bytes,
+            build_workers=build_workers,
         )
 
     current_flat_paths = _flat_manifest_jsonl_paths(manifest_bytes)
-    report = validate_output_backend(
-        manifest_bytes,
-        S3ValidationBackend(
-            client,
-            output_location,
-            ignored_flat_paths=frozenset(listed_flat_paths - current_flat_paths),
-        ),
+    validation_backend = S3ValidationBackend(
+        client,
+        output_location,
+        ignored_flat_paths=frozenset(listed_flat_paths - current_flat_paths),
     )
+    if validation_workers == 1:
+        # Preserve compatibility with callers that monkeypatch the historical
+        # two-argument validation hook.
+        report = validate_output_backend(manifest_bytes, validation_backend)
+    else:
+        report = validate_output_backend(
+            manifest_bytes,
+            validation_backend,
+            max_workers=validation_workers,
+        )
     if not report.valid:
         raise JobValidationError(output_location.uri, report)
 
@@ -322,6 +334,9 @@ def run_s3_job(
     workspace_parent: str | Path | None = None,
     max_shard_bytes: int = DEFAULT_MAX_SHARD_BYTES,
     credentials_path: str | Path | None = DEFAULT_S3_CREDENTIALS_PATH,
+    build_workers: int = 1,
+    output_workers: int = 1,
+    validation_workers: int = 1,
 ) -> JobResult:
     """Normalize an S3 prefix directly into a flat S3 output prefix.
 
@@ -341,6 +356,12 @@ def run_s3_job(
         raise ValueError("region_name must not be empty")
     if max_shard_bytes <= 0:
         raise ValueError("max_shard_bytes must be positive")
+    if build_workers <= 0:
+        raise ValueError("build_workers must be positive")
+    if output_workers <= 0:
+        raise ValueError("output_workers must be positive")
+    if validation_workers <= 0:
+        raise ValueError("validation_workers must be positive")
 
     input_location = parse_s3_uri(input_uri)
     output_location = parse_s3_uri(output_uri)
@@ -365,11 +386,18 @@ def run_s3_job(
         output_location.uri,
         input_format,
     )
-    client = create_s3_client(
-        endpoint_url=endpoint_url,
-        region_name=region_name,
-        credentials=credentials,
-    )
+    client_kwargs: dict[str, Any] = {
+        "endpoint_url": endpoint_url,
+        "region_name": region_name,
+        "credentials": credentials,
+    }
+    if max(output_workers, validation_workers) > 1:
+        client_kwargs["max_pool_connections"] = max(
+            8,
+            output_workers,
+            validation_workers,
+        )
+    client = create_s3_client(**client_kwargs)
     try:
         return _run_s3_job_with_client(
             client,
@@ -378,6 +406,9 @@ def run_s3_job(
             input_format=input_format,
             workspace=workspace,
             max_shard_bytes=max_shard_bytes,
+            build_workers=build_workers,
+            output_workers=output_workers,
+            validation_workers=validation_workers,
         )
     finally:
         _close_s3_client(client)

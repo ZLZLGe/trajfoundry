@@ -6,6 +6,7 @@ import hashlib
 import re
 from collections import Counter
 from collections.abc import Iterable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Annotated, BinaryIO, Literal, Protocol
@@ -430,6 +431,67 @@ def _validate_jsonl_stream(
     )
 
 
+def _merge_observed(destination: _Observed, source: _Observed) -> None:
+    """Merge one independent file validation result into the aggregate."""
+
+    for name, value in source.counts.items():
+        destination.counts[name] = destination.counts.get(name, 0) + value
+    destination.reason_counts.update(source.reason_counts)
+    destination.trajectory_ids.update(source.trajectory_ids)
+    destination.lineage_ids.update(source.lineage_ids)
+    destination.covered_sources.update(source.covered_sources)
+    destination.trajectory_contract_valid &= source.trajectory_contract_valid
+    destination.quarantine_contract_valid &= source.quarantine_contract_valid
+    destination.records_contract_valid &= source.records_contract_valid
+    destination.lineage_contract_valid &= source.lineage_contract_valid
+
+
+def _validate_manifest_file(
+    backend: ValidationBackend,
+    *,
+    entry: _ManifestFile,
+    file_index: int,
+    kind: str | None,
+    allow_legacy_metadata: bool,
+) -> tuple[_Observed, _ErrorCollector]:
+    """Validate one manifest object in isolation for bounded parallelism."""
+
+    observed = _Observed()
+    errors = _ErrorCollector()
+    try:
+        source = backend.open_file(entry.path)
+    except _UnsafeBackendPathError:
+        errors.add(f"manifest files[{file_index}] has an unsafe path")
+        return observed, errors
+    # This is the storage boundary; exception details may contain secrets.
+    except Exception:  # noqa: BLE001
+        errors.add(f"manifest files[{file_index}] could not be opened")
+        observed.mark_invalid(kind)
+        return observed, errors
+    if source is None:
+        errors.add(f"manifest files[{file_index}] is missing or not a regular file")
+        observed.mark_invalid(kind)
+        return observed, errors
+
+    observed.counts["checked_files"] += 1
+    result = _validate_jsonl_stream(
+        source.stream,
+        kind=kind,
+        file_index=file_index,
+        relative_path=entry.path,
+        allow_legacy_metadata=allow_legacy_metadata,
+        observed=observed,
+        errors=errors,
+    )
+    if source.size != entry.bytes or (
+        result.complete and result.bytes_read != entry.bytes
+    ):
+        errors.add(f"manifest files[{file_index}] byte count does not match")
+    if result.complete and result.sha256 != entry.sha256:
+        errors.add(f"manifest files[{file_index}] sha256 does not match")
+    return observed, errors
+
+
 def _validate_jsonl_row(
     raw_line: bytes,
     *,
@@ -573,7 +635,10 @@ def _compare_manifest_counts(
 
 
 def validate_output_backend(
-    manifest_bytes: bytes, backend: ValidationBackend
+    manifest_bytes: bytes,
+    backend: ValidationBackend,
+    *,
+    max_workers: int = 1,
 ) -> ValidationReport:
     """Validate output through a storage-neutral streaming backend.
 
@@ -583,6 +648,8 @@ def validate_output_backend(
     Every stream returned by the backend is closed before this function returns.
     """
 
+    if max_workers <= 0:
+        raise ValueError("max workers must be positive")
     errors = _ErrorCollector()
     observed = _Observed()
     try:
@@ -611,6 +678,7 @@ def validate_output_backend(
     seen_paths: set[str] = set()
     lineage_entries = 0
 
+    pending: list[tuple[int, _ManifestFile, str | None]] = []
     for file_index, entry in enumerate(manifest.files):
         if not _is_safe_manifest_path(entry.path):
             errors.add(f"manifest files[{file_index}] has an unsafe path")
@@ -625,44 +693,62 @@ def validate_output_backend(
             errors.add(f"manifest files[{file_index}] is not a supported output file")
         elif kind == "lineage":
             lineage_entries += 1
+        pending.append((file_index, entry, kind))
 
-        try:
-            source = backend.open_file(entry.path)
-        except _UnsafeBackendPathError:
-            errors.add(f"manifest files[{file_index}] has an unsafe path")
-            continue
-        # This is the storage boundary; exception details may contain secrets.
-        except Exception:  # noqa: BLE001
-            errors.add(f"manifest files[{file_index}] could not be opened")
-            observed.mark_invalid(kind)
-            continue
-        if source is None:
-            errors.add(f"manifest files[{file_index}] is missing or not a regular file")
-            observed.mark_invalid(kind)
-            continue
-
-        observed.counts["checked_files"] += 1
-        file_errors = _ErrorCollector()
-        result = _validate_jsonl_stream(
-            source.stream,
-            kind=kind,
+    # Each file is validated with an isolated accumulator.  Merging in manifest
+    # order keeps error ordering deterministic while S3 GET and JSONL scanning
+    # happen concurrently.  The default remains serial for local callers and
+    # backwards compatibility; S3 jobs can opt into a bounded worker count.
+    def validate_one(
+        item: tuple[int, _ManifestFile, str | None],
+    ) -> tuple[_Observed, _ErrorCollector]:
+        file_index, entry, kind = item
+        return _validate_manifest_file(
+            backend,
+            entry=entry,
             file_index=file_index,
-            relative_path=entry.path,
+            kind=kind,
             allow_legacy_metadata=manifest.schema_version
             in {
                 "trajfoundry-v2",
                 "trajfoundry-v3",
             },
-            observed=observed,
-            errors=file_errors,
         )
-        if source.size != entry.bytes or (
-            result.complete and result.bytes_read != entry.bytes
-        ):
-            errors.add(f"manifest files[{file_index}] byte count does not match")
-        if result.complete and result.sha256 != entry.sha256:
-            errors.add(f"manifest files[{file_index}] sha256 does not match")
-        errors.extend(file_errors)
+
+    if max_workers == 1 or len(pending) <= 1:
+        # Merge each file as soon as it has been scanned.  Keeping this path
+        # streaming is important for v4 outputs with a very large number of
+        # one-trajectory files.
+        for item in pending:
+            file_observed, file_errors = validate_one(item)
+            _merge_observed(observed, file_observed)
+            errors.extend(file_errors)
+    else:
+        # Keep only a small ordered window in memory.  Submitting the complete
+        # manifest at once would create one Future and one _Observed accumulator
+        # per output file, defeating the bounded-concurrency guarantee at the
+        # million-file scale.
+        window = max_workers * 2
+        with ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="trajfoundry-s3-get",
+        ) as executor:
+            iterator = iter(pending)
+            futures: list[Future[tuple[_Observed, _ErrorCollector]]] = []
+            for _ in range(min(window, len(pending))):
+                try:
+                    futures.append(executor.submit(validate_one, next(iterator)))
+                except StopIteration:
+                    break
+            while futures:
+                future = futures.pop(0)
+                file_observed, file_errors = future.result()
+                _merge_observed(observed, file_observed)
+                errors.extend(file_errors)
+                try:
+                    futures.append(executor.submit(validate_one, next(iterator)))
+                except StopIteration:
+                    pass
 
     if lineage_entries != 1:
         errors.add("manifest must list lineage.jsonl exactly once")

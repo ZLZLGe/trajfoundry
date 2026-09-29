@@ -6,9 +6,13 @@ import fcntl
 import hashlib
 import json
 import logging
+import multiprocessing
+import os
+import sqlite3
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -45,7 +49,7 @@ from .quality import enrich_trajectory
 from .sources.deepinfra import DeepInfraError, adapt_deepinfra_envelope
 from .sources.sxf import SXFError, adapt_sxf_envelope
 from .sources.tokenplan import TokenPlanError, adapt_tokenplan_envelope
-from .state import StateStore
+from .state import StateStore, _decompress_payload
 from .streaming import streaming_prefix_leaves
 from .subagents import (
     SubagentMountPlan,
@@ -63,6 +67,7 @@ DEFAULT_OUTPUT = Path("/data/trajfoundry")
 _INGEST_BATCH_ITEMS = 512
 _INGEST_BATCH_BYTES = 64 * 1024 * 1024
 _TRAJECTORY_BUILD_SKIP_REASON = "trajectory_materialization_failed"
+_BUILD_WORKERS_ENV = "TRAJFOUNDRY_BUILD_WORKERS"
 
 # These defects are fully representable in the canonical trajectory.  They
 # remain error-level audit evidence (and therefore quarantine the trajectory),
@@ -165,6 +170,35 @@ class _FlatLeaf:
     routing_snapshot: Snapshot
     contributor_paths: set[str]
     issues: dict[bytes, AuditIssue]
+
+
+@dataclass(frozen=True, slots=True)
+class _MaterializationLeaf:
+    """Small, picklable descriptor passed to a build worker."""
+
+    source_path: str
+    contributor_paths: tuple[str, ...]
+    issues: tuple[AuditIssue, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _MaterializationJob:
+    """One independent root materialization unit.
+
+    Prefix aggregation and sub-agent planning happen in the coordinator.  A
+    worker only receives the resulting leaf graph and reads immutable snapshot
+    payloads from SQLite.  This preserves the exact prefix semantics while
+    parallelizing the expensive trajectory construction step.
+    """
+
+    state_path: str
+    immutable_state: bool
+    root_index: int
+    is_subagent: bool
+    leaves: dict[int, _MaterializationLeaf]
+    graph_issues: dict[int, tuple[AuditIssue, ...]]
+    edges_by_parent: dict[int, tuple[tuple[str, int, str], ...]]
+    origin_paths: tuple[str, ...]
 
 
 def config_hash(config: PipelineConfig) -> str:
@@ -969,6 +1003,130 @@ def _materialize_tree(
     return node, representative
 
 
+def _read_snapshot_for_worker(
+    connection: sqlite3.Connection,
+    cache: dict[str, Snapshot],
+    source_path: str,
+) -> Snapshot:
+    cached = cache.get(source_path)
+    if cached is not None:
+        return cached
+    row = connection.execute(
+        "SELECT payload FROM snapshots WHERE source_path=?",
+        (source_path,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(f"missing representative snapshot: {source_path}")
+    snapshot = Snapshot.model_validate_json(_decompress_payload(row[0]))
+    cache[source_path] = snapshot
+    return snapshot
+
+
+def _materialize_root_worker(
+    job: _MaterializationJob,
+) -> tuple[int, TrajectoryNode, Snapshot, tuple[str, ...]]:
+    """Materialize and enrich one root in an isolated process.
+
+    The SQLite state is immutable during this phase.  Each worker opens its own
+    read-only connection; no SQLite connection or Pydantic object is shared
+    between processes.
+    """
+
+    # Ingest has completed before jobs are submitted.  Normal state databases
+    # use WAL, so regular read-only mode is required to see committed WAL
+    # pages.  Ephemeral scheduler state uses an in-memory journal and an
+    # exclusive lock; immutable mode bypasses that retained lock safely after
+    # ingest has finished.
+    state_uri = Path(job.state_path).resolve().as_uri()
+    connection = sqlite3.connect(
+        state_uri + ("?mode=ro&immutable=1" if job.immutable_state else "?mode=ro"),
+        uri=True,
+    )
+    cache: dict[str, Snapshot] = {}
+
+    def load(source_path: str) -> Snapshot:
+        return _read_snapshot_for_worker(connection, cache, source_path)
+
+    leaves = job.leaves
+
+    def load_flat(index: int) -> tuple[TrajectoryNode, Snapshot]:
+        descriptor = leaves[index]
+        representative = load(descriptor.source_path)
+        node = _trajectory_from_leaf(
+            representative,
+            (load(path) for path in descriptor.contributor_paths),
+        )
+        existing = node.normalization_audit
+        issues = _merged_issues(
+            existing.issues if existing else (),
+            descriptor.issues,
+            job.graph_issues.get(index, ()),
+        )
+        node.normalization_audit = _initial_audit(issues)
+        return node, representative
+
+    def materialize(index: int) -> tuple[TrajectoryNode, Snapshot]:
+        node, representative = load_flat(index)
+        children: dict[str, TrajectoryNode] = {}
+        relay_mounts: dict[str, str] = {}
+        for call_id, child_index, relay_id in job.edges_by_parent.get(index, ()):
+            child, _ = materialize(child_index)
+            children[call_id] = child
+            if relay_id and _accept_local_relay_mount(
+                node,
+                call_id=call_id,
+                relay_id=relay_id,
+            ):
+                relay_mounts[call_id] = relay_id
+        node.sub_agent_trajectory = children or None
+        node.sub_agent_relay_mounts = relay_mounts or None
+        return node, representative
+
+    try:
+        node, representative = materialize(job.root_index)
+        enriched = enrich_trajectory(
+            node,
+            top_level=True,
+            is_subagent=job.is_subagent,
+        )
+        return job.root_index, enriched, representative, job.origin_paths
+    finally:
+        connection.close()
+
+
+def _build_worker_count(configured: int | None = None) -> int:
+    """Return the configured trajectory materialization process count."""
+
+    raw = (
+        str(configured)
+        if configured is not None
+        else os.environ.get(_BUILD_WORKERS_ENV, "1").strip()
+    )
+    try:
+        workers = int(raw)
+    except ValueError as error:
+        raise ValueError(f"{_BUILD_WORKERS_ENV} must be a positive integer") from error
+    if workers <= 0:
+        raise ValueError(f"{_BUILD_WORKERS_ENV} must be a positive integer")
+    return workers
+
+
+def _state_database_path(state: StateStore) -> Path:
+    """Resolve the on-disk SQLite path used by materialization workers."""
+
+    row = state.connection.execute("PRAGMA database_list").fetchone()
+    if not row or not row[2]:
+        raise RuntimeError("parallel trajectory materialization requires file-backed state")
+    return Path(str(row[2])).resolve()
+
+
+def _state_database_is_immutable(state: StateStore) -> bool:
+    """Whether workers must bypass the coordinator's ephemeral DB lock."""
+
+    row = state.connection.execute("PRAGMA journal_mode").fetchone()
+    return bool(row and str(row[0]).lower() == "memory")
+
+
 def _log_trajectory_build_failure(
     error: Exception,
     source_paths: Iterable[str],
@@ -1007,7 +1165,12 @@ def _skip_failed_trajectory_sources(
     return skipped
 
 
-def _build_trajectories(state: StateStore, stats: PipelineStats) -> None:
+def _build_trajectories(
+    state: StateStore,
+    stats: PipelineStats,
+    *,
+    build_workers: int | None = None,
+) -> None:
     state.clear_trajectories()
     failed_paths: set[str] = set()
     represented_paths: set[str] = set()
@@ -1097,65 +1260,152 @@ def _build_trajectories(state: StateStore, stats: PipelineStats) -> None:
             _log_trajectory_build_failure(error, all_flat_paths)
             continue
 
-        for root_index in plan.main_root_indices:
-            origin_paths = {
-                path
-                for index in _descendants(plan, root_index)
-                for path in leaves_by_index[index].contributor_paths
-            }
-            try:
-                node, snapshot = _materialize_tree(
-                    state,
-                    leaves_by_index,
-                    graph_issues,
-                    edges_by_parent,
-                    root_index,
+        # Build one independent job per root.  The coordinator owns prefix
+        # aggregation and mount planning; workers only read the immutable
+        # SQLite snapshot and return enriched trees.  Jobs are assembled with
+        # root-local graph slices so large scopes are not pickled repeatedly.
+        worker_count = _build_worker_count(build_workers)
+        root_specs: list[tuple[int, tuple[str, ...], bool]] = []
+        for root_index, is_subagent in [
+            *((index, False) for index in plan.main_root_indices),
+            *((index, True) for index in plan.orphan_indices),
+        ]:
+            descendants = _descendants(plan, root_index)
+            origin_paths = tuple(
+                sorted(
+                    {
+                        path
+                        for index in descendants
+                        for path in leaves_by_index[index].contributor_paths
+                    }
                 )
-                enriched = enrich_trajectory(node, top_level=True, is_subagent=False)
-                _store_trajectory(
-                    state,
-                    enriched,
-                    snapshot,
-                    _origin_rows(state, origin_paths),
-                )
-            except Exception as error:  # noqa: BLE001 - skip one bad trajectory
-                failed_paths.update(origin_paths)
-                _log_trajectory_build_failure(error, origin_paths)
-            else:
-                represented_paths.update(origin_paths)
-            finally:
-                node = None
-                snapshot = None
-                enriched = None
-            del origin_paths
+            )
+            root_specs.append((root_index, origin_paths, is_subagent))
 
-        for orphan_index in plan.orphan_indices:
-            origin_paths = set(leaves_by_index[orphan_index].contributor_paths)
-            try:
-                node, snapshot = _load_flat_node(
-                    state,
-                    leaves_by_index[orphan_index],
-                    graph_issues.get(orphan_index, ()),
+        # Keep a single root in-process even when a larger worker count is
+        # configured; process startup and SQLite handoff would otherwise cost
+        # more than the materialization itself.
+        use_pool = worker_count > 1 and len(root_specs) > 1
+        root_jobs: list[tuple[_MaterializationJob, tuple[str, ...], bool]] = []
+        if use_pool:
+            state_path = _state_database_path(state)
+            immutable_state = _state_database_is_immutable(state)
+            for root_index, origin_paths, is_subagent in root_specs:
+                descendants = _descendants(plan, root_index)
+                root_jobs.append(
+                    (
+                        _MaterializationJob(
+                            state_path=str(state_path),
+                            immutable_state=immutable_state,
+                            root_index=root_index,
+                            is_subagent=is_subagent,
+                            leaves={
+                                index: _MaterializationLeaf(
+                                    source_path=leaves_by_index[index]
+                                    .routing_snapshot.source_path,
+                                    contributor_paths=tuple(
+                                        sorted(leaves_by_index[index].contributor_paths)
+                                    ),
+                                    issues=tuple(leaves_by_index[index].issues.values()),
+                                )
+                                for index in descendants
+                            },
+                            graph_issues={
+                                index: tuple(graph_issues.get(index, ()))
+                                for index in descendants
+                            },
+                            edges_by_parent={
+                                index: tuple(edges_by_parent.get(index, ()))
+                                for index in descendants
+                            },
+                            origin_paths=origin_paths,
+                        ),
+                        origin_paths,
+                        is_subagent,
+                    )
                 )
-                node.sub_agent_trajectory = None
-                node.sub_agent_relay_mounts = None
-                enriched = enrich_trajectory(node, top_level=True, is_subagent=True)
-                _store_trajectory(
-                    state,
-                    enriched,
-                    snapshot,
-                    _origin_rows(state, origin_paths),
-                )
-            except Exception as error:  # noqa: BLE001 - skip one bad trajectory
-                failed_paths.update(origin_paths)
-                _log_trajectory_build_failure(error, origin_paths)
-            else:
-                represented_paths.update(origin_paths)
-            finally:
-                node = None
-                snapshot = None
-                enriched = None
-            del origin_paths
+
+        with state.write_batch():
+            if not use_pool:
+                for root_index, origin_paths, is_subagent in root_specs:
+                    try:
+                        node, snapshot = (
+                            _load_flat_node(
+                                state,
+                                leaves_by_index[root_index],
+                                graph_issues.get(root_index, ()),
+                            )
+                            if is_subagent
+                            else _materialize_tree(
+                                state,
+                                leaves_by_index,
+                                graph_issues,
+                                edges_by_parent,
+                                root_index,
+                            )
+                        )
+                        if is_subagent:
+                            node.sub_agent_trajectory = None
+                            node.sub_agent_relay_mounts = None
+                        enriched = enrich_trajectory(
+                            node,
+                            top_level=True,
+                            is_subagent=is_subagent,
+                        )
+                        try:
+                            _store_trajectory(
+                                state,
+                                enriched,
+                                snapshot,
+                                _origin_rows(state, origin_paths),
+                            )
+                        except Exception as error:  # noqa: BLE001
+                            failed_paths.update(origin_paths)
+                            _log_trajectory_build_failure(error, origin_paths)
+                        else:
+                            represented_paths.update(origin_paths)
+                    except Exception as error:  # noqa: BLE001 - skip one bad trajectory
+                        failed_paths.update(origin_paths)
+                        _log_trajectory_build_failure(error, origin_paths)
+            elif root_jobs:
+                # Submit in deterministic root order, but consume and persist in
+                # that same order so trajectory IDs and representative selection
+                # remain independent of process completion timing.
+                # The scheduler executes generated Python nodes at module
+                # scope, so ``spawn`` would recursively re-enter the node
+                # instead of starting a worker.  Fork is safe here because
+                # workers only use their own read-only SQLite connection and
+                # the coordinator no longer holds an exclusive SQLite lock.
+                with ProcessPoolExecutor(
+                    max_workers=worker_count,
+                    mp_context=multiprocessing.get_context("fork"),
+                ) as pool:
+                    iterator = iter(root_jobs)
+                    futures: list[tuple[tuple[_MaterializationJob, tuple[str, ...], bool], Any]] = []
+                    for _ in range(min(worker_count * 2, len(root_jobs))):
+                        item = next(iterator, None)
+                        if item is None:
+                            break
+                        futures.append((item, pool.submit(_materialize_root_worker, item[0])))
+                    while futures:
+                        (_, origin_paths, _), future = futures.pop(0)
+                        paths = origin_paths
+                        try:
+                            _, enriched, snapshot, returned_paths = future.result()
+                            paths = tuple(returned_paths) or origin_paths
+                            _store_trajectory(
+                                state,
+                                enriched,
+                                snapshot,
+                                _origin_rows(state, paths),
+                            )
+                            represented_paths.update(paths)
+                        except Exception as error:  # noqa: BLE001 - skip one bad trajectory
+                            failed_paths.update(paths)
+                            _log_trajectory_build_failure(error, paths)
+                        item = next(iterator, None)
+                        if item is not None:
+                            futures.append((item, pool.submit(_materialize_root_worker, item[0])))
     _skip_failed_trajectory_sources(state, failed_paths, represented_paths)
     state.assign_sub_session_ids()
     # Sub-session assignment validates the materialized rows a second time.
@@ -1451,6 +1701,7 @@ def normalize_source(
     state_path: Path,
     output_factory: Callable[[], Any],
     max_shard_bytes: int = 512 * 1024 * 1024,
+    build_workers: int | None = None,
 ) -> tuple[PipelineStats, Any]:
     """Normalize a non-filesystem source with ephemeral local state.
 
@@ -1495,7 +1746,7 @@ def normalize_source(
         )
         if stats.discovered == 0:
             raise ValueError(f"capture source is empty: {source.label}")
-        _build_trajectories(state, stats)
+        _build_trajectories(state, stats, build_workers=build_workers)
         output_result = _export(
             state,
             runtime_config,

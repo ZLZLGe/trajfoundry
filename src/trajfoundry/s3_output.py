@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, Self
@@ -190,18 +191,76 @@ class S3OutputSet:
         location: S3Location,
         *,
         max_shard_bytes: int = 512 * 1024 * 1024,
+        max_workers: int = 1,
+        max_pending: int | None = None,
     ) -> None:
         if max_shard_bytes <= 0:
             raise ValueError("max shard bytes must be positive")
+        if max_workers <= 0:
+            raise ValueError("max workers must be positive")
+        if max_pending is not None and max_pending <= 0:
+            raise ValueError("max pending must be positive")
         self.max_shard_bytes = max_shard_bytes
         self._client = client
         self.location = location
+        self.max_workers = max_workers
+        self.max_pending = max_pending or max_workers * 2
         self._trajectory_objects: list[S3ObjectDescription] = []
         self._trajectory_names: set[str] = set()
         self._lineage = _S3ObjectWriter(client, location, "lineage.jsonl")
         self.stats = ExportStats()
         self._manifest_bytes: bytes | None = None
         self._aborted = False
+        self._executor: ThreadPoolExecutor | None = (
+            ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="trajfoundry-s3-put",
+            )
+            if max_workers > 1
+            else None
+        )
+        self._trajectory_futures: list[Future[S3ObjectDescription]] = []
+
+    def _upload_trajectory(
+        self,
+        relative_path: str,
+        payload: bytes,
+    ) -> S3ObjectDescription:
+        """Upload one trajectory object in a worker-owned writer.
+
+        A writer is deliberately created inside the worker.  Multipart state
+        is therefore never shared between threads, while the boto3 client can
+        safely multiplex the bounded set of requests.
+        """
+
+        writer = _S3ObjectWriter(self._client, self.location, relative_path)
+        try:
+            writer.write(payload)
+            return writer.close()
+        except BaseException:
+            writer.abort()
+            raise
+
+    def _resolve_oldest_future(self) -> None:
+        if not self._trajectory_futures:
+            return
+        future = self._trajectory_futures.pop(0)
+        self._trajectory_objects.append(future.result())
+
+    def _resolve_all_futures(self) -> None:
+        while self._trajectory_futures:
+            self._resolve_oldest_future()
+
+    def _shutdown_executor(self, *, cancel: bool) -> None:
+        executor, self._executor = self._executor, None
+        if executor is None:
+            return
+        if cancel:
+            for future in self._trajectory_futures:
+                future.cancel()
+        # ``shutdown(wait=True)`` ensures no worker can continue publishing
+        # after a failed job has returned to the scheduler.
+        executor.shutdown(wait=True, cancel_futures=cancel)
 
     @property
     def written_objects(self) -> tuple[S3ObjectDescription, ...]:
@@ -231,6 +290,10 @@ class S3OutputSet:
                 "trajectory JSONL object exceeds max_shard_bytes: "
                 f"{len(payload)} > {self.max_shard_bytes}"
             )
+        # Reserve the filename before scheduling the upload.  This keeps the
+        # duplicate check deterministic even when an earlier PUT is still in
+        # flight.
+        self._trajectory_names.add(filename)
         self._lineage.write(
             dumps(
                 {
@@ -243,15 +306,23 @@ class S3OutputSet:
             )
             + b"\n"
         )
-        writer = _S3ObjectWriter(self._client, self.location, filename)
         try:
-            writer.write(payload)
-            description = writer.close()
+            if self._executor is None:
+                description = self._upload_trajectory(filename, payload)
+                self._trajectory_objects.append(description)
+            else:
+                self._trajectory_futures.append(
+                    self._executor.submit(
+                        self._upload_trajectory,
+                        filename,
+                        payload,
+                    )
+                )
+                while len(self._trajectory_futures) >= self.max_pending:
+                    self._resolve_oldest_future()
         except Exception:
-            writer.abort()
+            self._trajectory_names.discard(filename)
             raise
-        self._trajectory_names.add(filename)
-        self._trajectory_objects.append(description)
         strict = is_strict_sample(node)
         if strict:
             self.stats.accepted += 1
@@ -285,6 +356,8 @@ class S3OutputSet:
         if self._aborted:
             raise ValueError("cannot close an aborted S3 output set")
         try:
+            self._resolve_all_futures()
+            self._shutdown_executor(cancel=False)
             self._lineage.close()
         except Exception:
             self.abort()
@@ -310,6 +383,16 @@ class S3OutputSet:
         return self._manifest_bytes
 
     def abort(self) -> None:
+        self._shutdown_executor(cancel=True)
+        # A running future may have completed successfully before shutdown;
+        # resolve it so its worker-owned multipart upload can finish cleanly.
+        for future in self._trajectory_futures:
+            if future.done() and not future.cancelled():
+                try:
+                    future.exception()
+                except CancelledError:
+                    continue
+        self._trajectory_futures.clear()
         self._lineage.abort()
         if self._manifest_bytes is None:
             self._aborted = True
