@@ -31,6 +31,20 @@ class _Completion:
         return orjson.dumps(self.response).decode()
 
 
+class _HTTPResponse:
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self.payload
+
+
 def _taxonomy(tmp_path) -> ScenarioTaxonomy:
     path = tmp_path / "taxonomy.json"
     path.write_bytes(
@@ -88,7 +102,7 @@ def test_classifier_expands_taxonomy_and_copies_deterministic_labels(tmp_path) -
     assert "toc|Shopping|购物" in client.messages[0][0]["content"]
 
 
-def test_classifier_default_context_budget_is_one_million_serialized_chars(
+def test_classifier_default_context_budget_is_six_hundred_thousand_serialized_chars(
     tmp_path,
 ) -> None:
     classifier = TrajectoryClassifier(
@@ -102,8 +116,8 @@ def test_classifier_default_context_budget_is_one_million_serialized_chars(
         input_manifest_sha256="a" * 64,
     )
 
-    assert DEFAULT_MAX_CONTEXT_CHARS == 1_000_000
-    assert classifier.max_context_chars == 1_000_000
+    assert DEFAULT_MAX_CONTEXT_CHARS == 600_000
+    assert classifier.max_context_chars == 600_000
 
 
 def test_classifier_marks_unknown_model_labels_as_failed(tmp_path) -> None:
@@ -223,6 +237,33 @@ def test_chat_client_retries_429_without_exposing_key() -> None:
     assert sleeps == [0.5]
     assert "sk-do-not-log-this" not in repr(client)
     assert "must not surface" not in str(caught.value)
+
+
+def test_chat_client_sends_bounded_json_request() -> None:
+    captured: dict[str, object] = {}
+
+    def opener(request, **_kwargs):
+        captured["body"] = orjson.loads(request.data)
+        return _HTTPResponse(
+            orjson.dumps({"choices": [{"message": {"content": '{"ok": true}'}}]})
+        )
+
+    client = ChatCompletionsClient(
+        api_url="https://classifier.invalid/v1/chat/completions",
+        model="model",
+        api_key="secret",
+        max_output_tokens=1_024,
+        opener=opener,
+    )
+
+    assert client.complete([{"role": "user", "content": "hello"}]) == ('{"ok": true}')
+    assert captured["body"] == {
+        "model": "model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "temperature": 0,
+        "max_tokens": 1_024,
+        "response_format": {"type": "json_object"},
+    }
 
 
 def test_chat_client_treats_404_as_configuration_error() -> None:

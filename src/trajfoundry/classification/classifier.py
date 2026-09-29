@@ -9,6 +9,7 @@ from typing import Any, Protocol
 import orjson
 
 from .client import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
     ClassificationConfigurationError,
     ClassificationRequestError,
     ClassificationRetryExhausted,
@@ -27,17 +28,24 @@ CAPABILITY_LABELS = (
     "Interactive Collaboration",
     "Reliability & Safety",
 )
-# Bump when the classification contract or publication behavior changes so
-# scheduler assertions and the persistent cache cannot silently mix runs.
-CLASSIFIER_REVISION = "2026-09-23.1"
+# Bump when the classification contract, model budget, or publication
+# behavior changes so metadata and the persistent cache cannot silently mix
+# runs.
+CLASSIFIER_REVISION = "2026-09-29.1"
 PROMPT_VERSION = "v001"
+# The model documentation advertises a 256K-token context window.  The
+# trajectory cap below remains a character budget because no Atria tokenizer
+# is available in this runtime; it is a conservative envelope for current
+# data, not an exact tokenizer-level guarantee.
+CLASSIFIER_CONTEXT_WINDOW_TOKENS = 256_000
+TRUNCATION_STRATEGY = "head_tail_char_v1"
 # This is the serialized trajectory budget in characters, not model tokens.
-DEFAULT_MAX_CONTEXT_CHARS = 1_000_000
+DEFAULT_MAX_CONTEXT_CHARS = 600_000
 
-# Keep the scheduler-facing revision stable while making changes to the label
-# policy visible to the persistent cache through an independent fingerprint.
-# The policy is intentionally data rather than a version string so its digest
-# changes automatically when a contract limit is edited.
+# Keep label-policy changes visible to the persistent cache through an
+# independent fingerprint. The policy is intentionally data rather than a
+# version string so its digest changes automatically when a contract limit is
+# edited.
 CLASSIFICATION_POLICY = {
     "scenario_selection": "exactly_one_l1",
     "scenario_key_field": "scenario_label_key",
@@ -135,6 +143,13 @@ class TrajectoryClassifier:
             "model": self.client.model,
             "api_url": getattr(self.client, "api_url", "injected-client"),
             "max_context_chars": self.max_context_chars,
+            "context_window_tokens": CLASSIFIER_CONTEXT_WINDOW_TOKENS,
+            "max_output_tokens": getattr(
+                self.client, "max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS
+            ),
+            "truncation_strategy": TRUNCATION_STRATEGY,
+            "temperature": 0,
+            "response_format": "json_object",
         }
         return hashlib.sha256(
             orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)
@@ -289,10 +304,13 @@ __all__ = [
     "CAPABILITY_LABELS",
     "CLASSIFICATION_POLICY",
     "CLASSIFICATION_POLICY_SHA256",
+    "CLASSIFIER_CONTEXT_WINDOW_TOKENS",
     "CLASSIFIER_REVISION",
     "DEFAULT_MAX_CONTEXT_CHARS",
+    "DEFAULT_MAX_OUTPUT_TOKENS",
     "POLICY_SHA256",
     "PROMPT_VERSION",
+    "TRUNCATION_STRATEGY",
     "ClassificationAttempt",
     "CompletionClient",
     "ModelDecisionError",

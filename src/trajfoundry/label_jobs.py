@@ -23,6 +23,7 @@ from .classification.classifier import (
     CLASSIFICATION_POLICY,
     CLASSIFIER_REVISION,
     DEFAULT_MAX_CONTEXT_CHARS,
+    DEFAULT_MAX_OUTPUT_TOKENS,
     PROMPT_VERSION,
     TrajectoryClassifier,
 )
@@ -889,6 +890,7 @@ def run_s3_label_job(
     max_retries: int = 5,
     request_timeout_seconds: float = 120.0,
     max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> LabelJobResult:
     """Classify every complete normalized trajectory under one S3 root.
 
@@ -932,6 +934,7 @@ def run_s3_label_job(
         api_key=api_key,
         timeout_seconds=request_timeout_seconds,
         max_retries=max_retries,
+        max_output_tokens=max_output_tokens,
     )
     credentials = (
         None

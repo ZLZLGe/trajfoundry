@@ -275,11 +275,12 @@ and `CLASSIFIER_API_KEY`.
 The URL must include `/chat/completions`. Keep the key in a worker-side secret
 injection mechanism, never in source, task parameters, or scheduler scripts.
 
-The default serialized trajectory context budget is 1,000,000 characters via
-`max_context_chars`; this is a character limit, not a token limit, and the
-system prompt and taxonomy consume additional model context. The limit can be
-overridden explicitly when the configured model gateway supports a larger or
-smaller request.
+The default serialized trajectory context budget is 600,000 characters via
+`max_context_chars`; this is a conservative character envelope for the
+256K-token classifier, not a tokenizer-level limit. The system prompt and
+taxonomy consume additional model context, and the request reserves 1,024
+output tokens. The limit can be overridden explicitly when the configured
+model gateway supports a larger or smaller request.
 
 Classification uses bounded concurrency and a persistent SQLite cache under
 `workspace_parent/.trajfoundry-label-cache/` by default. Pass `state_path` to
@@ -292,12 +293,10 @@ as write-only. It lists existing top-level JSONL before model calls and removes
 unlisted JSONL only after the replacement manifest is published; a cleanup
 failure is recoverable on retry.
 
-The scheduler-facing `CLASSIFIER_REVISION` is unchanged for this label-policy
-change. The output manifest and classification rows carry independent policy,
-catalog, prompt, and strategy fingerprints. Those fingerprints are part of the
-cache configuration hash, so old multi-L2 or over-tagged results are not reused
-after the policy changes; no manual cache deletion or scheduler version edit is
-needed.
+The output manifest and classification rows carry the classifier revision plus
+independent policy, catalog, prompt, and strategy fingerprints. These values
+are part of the cache configuration hash, so results from a different model or
+context budget are not reused after a deployment change.
 
 ## Development
 

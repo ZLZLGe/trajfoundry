@@ -14,6 +14,8 @@ from urllib.parse import urlsplit
 
 import orjson
 
+DEFAULT_MAX_OUTPUT_TOKENS = 1_024
+
 
 class ClassificationAPIError(RuntimeError):
     """Base class for safe-to-display classifier API failures."""
@@ -86,6 +88,7 @@ class ChatCompletionsClient:
         api_key: str,
         timeout_seconds: float = 120.0,
         max_retries: int = 5,
+        max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         opener: Callable[..., Any] = urllib.request.urlopen,
         sleeper: Callable[[float], None] = time.sleep,
         jitter: Callable[[], float] = random.random,
@@ -99,10 +102,13 @@ class ChatCompletionsClient:
             raise ValueError("timeout_seconds must be positive")
         if max_retries < 0:
             raise ValueError("max_retries must be non-negative")
+        if type(max_output_tokens) is not int or max_output_tokens <= 0:
+            raise ValueError("max_output_tokens must be a positive integer")
         self.model = model
         self._api_key = api_key
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
+        self.max_output_tokens = max_output_tokens
         self._opener = opener
         self._sleeper = sleeper
         self._jitter = jitter
@@ -121,6 +127,7 @@ class ChatCompletionsClient:
                 "model": self.model,
                 "messages": messages,
                 "temperature": 0,
+                "max_tokens": self.max_output_tokens,
                 "response_format": {"type": "json_object"},
             }
         )
@@ -197,6 +204,7 @@ class ChatCompletionsClient:
 
 
 __all__ = [
+    "DEFAULT_MAX_OUTPUT_TOKENS",
     "ChatCompletionsClient",
     "ClassificationAPIError",
     "ClassificationConfigurationError",

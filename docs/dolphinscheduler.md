@@ -320,16 +320,14 @@ or the worker service environment. Never put it in workflow parameters,
 `rawScript`, source control, or task logs. A key pasted into chat or another
 uncontrolled channel must be rotated before use.
 
-The classifier defaults to a 1,000,000-character serialized trajectory context
-budget (`max_context_chars`). This is a character limit rather than a token
-limit; the system prompt and taxonomy are additional context, so the model and
-gateway must have sufficient total context capacity.
+The classifier defaults to a 600,000-character serialized trajectory context
+budget (`max_context_chars`) and a 1,024-token output limit. The character
+budget is a conservative envelope for a 256K-token model rather than a
+tokenizer-level limit; the system prompt and taxonomy are additional context.
 
-The scheduler-facing `CLASSIFIER_REVISION` remains unchanged for the label
-policy. The classifier derives an independent strategy fingerprint from the
-L1 catalog, policy limits, and exact system prompt. It is included in the cache
-configuration hash and recorded in the output manifest, so existing cache rows
-from the former multi-L2 policy are ignored automatically.
+The classifier revision and independent strategy fingerprint are recorded in
+the output manifest and cache configuration hash. Changing the model, context
+budget, output limit, or prompt therefore creates a separate cache namespace.
 
 The default cache is a deterministic SQLite file below
 `workspace_parent/.trajfoundry-label-cache/`. For recovery across worker
