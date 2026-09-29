@@ -303,7 +303,8 @@ The input must be the directory containing `manifest.json`; do not pass an
 `accepted`, `quarantine`, or `generations` child. Both strict and quarantined
 complete trajectories are classified. v004 generation shards and the current
 flat v4 contract are supported. Output is flat and contains each complete
-normalized row plus its top-level `classification` object.
+normalized row plus its top-level `classification` object. Accepted rows have
+exactly one L1 scenario label and one or two capability labels.
 
 The worker process must provide these settings without embedding values in the
 Python task:
@@ -318,6 +319,17 @@ Inject `CLASSIFIER_API_KEY` through the platform's protected secret mechanism
 or the worker service environment. Never put it in workflow parameters,
 `rawScript`, source control, or task logs. A key pasted into chat or another
 uncontrolled channel must be rotated before use.
+
+The classifier defaults to a 1,000,000-character serialized trajectory context
+budget (`max_context_chars`). This is a character limit rather than a token
+limit; the system prompt and taxonomy are additional context, so the model and
+gateway must have sufficient total context capacity.
+
+The scheduler-facing `CLASSIFIER_REVISION` remains unchanged for the label
+policy. The classifier derives an independent strategy fingerprint from the
+L1 catalog, policy limits, and exact system prompt. It is included in the cache
+configuration hash and recorded in the output manifest, so existing cache rows
+from the former multi-L2 policy are ignored automatically.
 
 The default cache is a deterministic SQLite file below
 `workspace_parent/.trajfoundry-label-cache/`. For recovery across worker

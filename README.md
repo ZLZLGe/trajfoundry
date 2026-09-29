@@ -259,18 +259,27 @@ never invokes or changes the normalization pipeline. v004 shard input remains
 readable; current v4 flat input is also supported.
 
 Each output row is the complete normalized row plus one top-level
-`classification` object. Successful results contain the exact full taxonomy
-objects selected by the model, the fixed capability labels, and model/harness
-labels copied from the trajectory. A model or request failure still writes the
-complete row with `classification.status="failed"` and a bounded reason code.
-No `trajectory_id` is added to a trajectory row.
+`classification` object. Successful results contain exactly one first-level
+scenario label, one or two fixed capability labels, and model/harness labels
+copied from the trajectory. The scenario label has the fields `key`, `split`,
+`domain_l1_en`, and `domain_l1_zh`; it does not expose a second-level taxonomy
+ID. A model or request failure still writes the complete row with
+`classification.status="failed"` and a bounded reason code. No `trajectory_id`
+is added to a trajectory row.
 
 The bundled scenario taxonomy is versioned by content hash. The model returns
-only taxonomy IDs and capability names; TrajFoundry validates them and expands
-IDs from the bundled JSON. OpenAI-compatible Chat Completions configuration is
-read from `CLASSIFIER_API_URL`, `CLASSIFIER_MODEL`, and `CLASSIFIER_API_KEY`.
+one L1 `scenario_label_key` and one or two capability names; TrajFoundry
+validates them against the derived L1 catalog. OpenAI-compatible Chat
+Completions configuration is read from `CLASSIFIER_API_URL`, `CLASSIFIER_MODEL`,
+and `CLASSIFIER_API_KEY`.
 The URL must include `/chat/completions`. Keep the key in a worker-side secret
 injection mechanism, never in source, task parameters, or scheduler scripts.
+
+The default serialized trajectory context budget is 1,000,000 characters via
+`max_context_chars`; this is a character limit, not a token limit, and the
+system prompt and taxonomy consume additional model context. The limit can be
+overridden explicitly when the configured model gateway supports a larger or
+smaller request.
 
 Classification uses bounded concurrency and a persistent SQLite cache under
 `workspace_parent/.trajfoundry-label-cache/` by default. Pass `state_path` to
@@ -282,6 +291,13 @@ and validates the normalized input manifest, but treats its own output manifest
 as write-only. It lists existing top-level JSONL before model calls and removes
 unlisted JSONL only after the replacement manifest is published; a cleanup
 failure is recoverable on retry.
+
+The scheduler-facing `CLASSIFIER_REVISION` is unchanged for this label-policy
+change. The output manifest and classification rows carry independent policy,
+catalog, prompt, and strategy fingerprints. Those fingerprints are part of the
+cache configuration hash, so old multi-L2 or over-tagged results are not reused
+after the policy changes; no manual cache deletion or scheduler version edit is
+needed.
 
 ## Development
 

@@ -18,6 +18,16 @@ TAXONOMY_FIELDS = (
     "domain_path_en",
     "domain_path_zh",
 )
+# The published classifier selects one first-level scenario label.  ``key`` is
+# deliberately a readable composite rather than an integer derived from the
+# order of the source taxonomy: it remains stable when L2 rows are reordered.
+L1_TAXONOMY_FIELDS = (
+    "key",
+    "split",
+    "domain_l1_en",
+    "domain_l1_zh",
+)
+L1_KEY_SEPARATOR = "|"
 DEFAULT_TAXONOMY_PATH = Path(__file__).with_name("taxonomy.json")
 
 
@@ -32,6 +42,9 @@ class ScenarioTaxonomy:
     labels: tuple[dict[str, str | int], ...]
     sha256: str
     _by_id: dict[int, dict[str, str | int]]
+    l1_labels: tuple[dict[str, str], ...]
+    l1_sha256: str
+    _l1_by_key: dict[str, dict[str, str]]
 
     @classmethod
     def load(cls, path: str | Path = DEFAULT_TAXONOMY_PATH) -> ScenarioTaxonomy:
@@ -70,11 +83,40 @@ class ScenarioTaxonomy:
             labels.append(label)
             by_id[identifier] = label
 
+        # Derive the L1 catalog from the validated L2 rows. Sort the unique
+        # keys rather than relying on source row order, so reordering L2 rows
+        # does not change the selectable L1 catalog or its digest.
+        l1_values: dict[str, dict[str, str]] = {}
+        for label in labels:
+            split = str(label["split"])
+            domain_l1_en = str(label["domain_l1_en"])
+            domain_l1_zh = str(label["domain_l1_zh"])
+            key = make_l1_key(split, domain_l1_en, domain_l1_zh)
+            candidate = {
+                "key": key,
+                "split": split,
+                "domain_l1_en": domain_l1_en,
+                "domain_l1_zh": domain_l1_zh,
+            }
+            previous = l1_values.get(key)
+            if previous is not None and previous != candidate:
+                # This should be unreachable because the key contains every
+                # field used by the candidate, but keeping the invariant here
+                # makes future key-format changes fail closed.
+                raise TaxonomyError(f"taxonomy has conflicting L1 key: {key}")
+            l1_values[key] = candidate
+        l1_labels = tuple(l1_values[key] for key in sorted(l1_values))
+        l1_by_key = {label["key"]: label for label in l1_labels}
+
         canonical = orjson.dumps(labels, option=orjson.OPT_SORT_KEYS)
+        l1_canonical = orjson.dumps(l1_labels, option=orjson.OPT_SORT_KEYS)
         return cls(
             labels=tuple(labels),
             sha256=hashlib.sha256(canonical).hexdigest(),
             _by_id=by_id,
+            l1_labels=l1_labels,
+            l1_sha256=hashlib.sha256(l1_canonical).hexdigest(),
+            _l1_by_key=l1_by_key,
         )
 
     def expand(self, identifiers: list[int]) -> list[dict[str, str | int]]:
@@ -100,23 +142,53 @@ class ScenarioTaxonomy:
         return expanded
 
     def prompt_catalog(self) -> str:
-        """Return a compact catalog containing only information needed to choose IDs."""
+        """Return the L1 catalog used by the classifier prompt."""
 
-        compact = [
-            {
-                "id": label["id"],
-                "split": label["split"],
-                "path_en": label["domain_path_en"],
-                "path_zh": label["domain_path_zh"],
-            }
-            for label in self.labels
-        ]
-        return orjson.dumps(compact).decode("utf-8")
+        return self.l1_prompt_catalog()
+
+    def expand_l1(self, key: str) -> dict[str, str]:
+        """Return the canonical L1 object selected by its stable key."""
+
+        if type(key) is not str or not key:
+            raise TaxonomyError("scenario_label_key must be a non-empty string")
+        try:
+            label = self._l1_by_key[key]
+        except KeyError as error:
+            raise TaxonomyError(f"unknown scenario L1 taxonomy key: {key}") from error
+        return dict(label)
+
+    # Explicit aliases make the intent clear to callers that need to validate
+    # a model-selected key and keep the lookup name discoverable.
+    expand_l1_key = expand_l1
+
+    def l1_prompt_catalog(self) -> str:
+        """Return a compact, deterministic catalog of selectable L1 labels."""
+
+        return orjson.dumps(self.l1_labels).decode("utf-8")
+
+
+def make_l1_key(split: str, domain_l1_en: str, domain_l1_zh: str) -> str:
+    """Build the canonical stable key for one L1 catalog entry.
+
+    The taxonomy currently contains no separator characters in these fields;
+    reject them explicitly so the key remains unambiguous if source data grows
+    later.
+    """
+
+    values = (split, domain_l1_en, domain_l1_zh)
+    if any(type(value) is not str or not value for value in values):
+        raise TaxonomyError("L1 key fields must be non-empty strings")
+    if any(L1_KEY_SEPARATOR in value for value in values):
+        raise TaxonomyError(f"L1 key fields must not contain {L1_KEY_SEPARATOR!r}")
+    return L1_KEY_SEPARATOR.join(values)
 
 
 __all__ = [
     "DEFAULT_TAXONOMY_PATH",
+    "L1_KEY_SEPARATOR",
+    "L1_TAXONOMY_FIELDS",
     "TAXONOMY_FIELDS",
     "ScenarioTaxonomy",
     "TaxonomyError",
+    "make_l1_key",
 ]

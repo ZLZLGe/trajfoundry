@@ -6,7 +6,11 @@ import urllib.error
 import orjson
 import pytest
 
-from trajfoundry.classification.classifier import TrajectoryClassifier
+from trajfoundry.classification.classifier import (
+    CLASSIFICATION_POLICY_SHA256,
+    DEFAULT_MAX_CONTEXT_CHARS,
+    TrajectoryClassifier,
+)
 from trajfoundry.classification.client import (
     ChatCompletionsClient,
     ClassificationConfigurationError,
@@ -51,7 +55,7 @@ def _taxonomy(tmp_path) -> ScenarioTaxonomy:
 def test_classifier_expands_taxonomy_and_copies_deterministic_labels(tmp_path) -> None:
     client = _Completion(
         {
-            "scenario_label_ids": [10026],
+            "scenario_label_key": "toc|Shopping|购物",
             "capability_labels": ["Tool Use", "Information Gathering"],
         }
     )
@@ -67,21 +71,46 @@ def test_classifier_expands_taxonomy_and_copies_deterministic_labels(tmp_path) -
 
     assert attempt.cacheable
     assert attempt.classification["status"] == "accepted"
-    assert attempt.classification["scenario_labels"][0]["id"] == 10026
+    assert attempt.classification["scenario_labels"] == [
+        {
+            "key": "toc|Shopping|购物",
+            "split": "toc",
+            "domain_l1_en": "Shopping",
+            "domain_l1_zh": "购物",
+        }
+    ]
     assert attempt.classification["capability_labels"] == [
         "Tool Use",
         "Information Gathering",
     ]
     assert attempt.classification["model_label"] == "gpt-test"
     assert attempt.classification["harness_label"] == "codex"
-    assert "10026" in client.messages[0][0]["content"]
+    assert "toc|Shopping|购物" in client.messages[0][0]["content"]
+
+
+def test_classifier_default_context_budget_is_one_million_serialized_chars(
+    tmp_path,
+) -> None:
+    classifier = TrajectoryClassifier(
+        client=_Completion(
+            {
+                "scenario_label_key": "toc|Shopping|购物",
+                "capability_labels": ["Tool Use"],
+            }
+        ),
+        taxonomy=_taxonomy(tmp_path),
+        input_manifest_sha256="a" * 64,
+    )
+
+    assert DEFAULT_MAX_CONTEXT_CHARS == 1_000_000
+    assert classifier.max_context_chars == 1_000_000
 
 
 def test_classifier_marks_unknown_model_labels_as_failed(tmp_path) -> None:
     classifier = TrajectoryClassifier(
         client=_Completion(
             {
-                "scenario_label_ids": [99999],
+                "scenario_label_key": "toc|Unknown|未知",
                 "capability_labels": ["Tool Use"],
             }
         ),
@@ -96,6 +125,69 @@ def test_classifier_marks_unknown_model_labels_as_failed(tmp_path) -> None:
     assert attempt.classification["reason"] == "invalid_model_output"
     assert attempt.classification["model_label"] == "unknown"
     assert attempt.classification["harness_label"] == "unknown"
+
+
+def test_taxonomy_derives_stable_l1_catalog_and_lookup(tmp_path) -> None:
+    taxonomy = _taxonomy(tmp_path)
+
+    assert len(taxonomy.labels) == 1
+    assert taxonomy.l1_labels == (
+        {
+            "key": "toc|Shopping|购物",
+            "split": "toc",
+            "domain_l1_en": "Shopping",
+            "domain_l1_zh": "购物",
+        },
+    )
+    assert taxonomy.expand_l1("toc|Shopping|购物") == taxonomy.l1_labels[0]
+    assert "toc|Shopping|购物" in taxonomy.prompt_catalog()
+    assert len(taxonomy.l1_sha256) == 64
+
+
+@pytest.mark.parametrize(
+    "capability_labels",
+    [[], ["Tool Use", "Information Gathering", "Task Understanding"]],
+)
+def test_classifier_rejects_capability_counts_outside_one_or_two(
+    tmp_path, capability_labels
+) -> None:
+    classifier = TrajectoryClassifier(
+        client=_Completion(
+            {
+                "scenario_label_key": "toc|Shopping|购物",
+                "capability_labels": capability_labels,
+            }
+        ),
+        taxonomy=_taxonomy(tmp_path),
+        input_manifest_sha256="a" * 64,
+    )
+
+    attempt = classifier.classify({"messages": []})
+
+    assert not attempt.cacheable
+    assert attempt.classification["reason"] == "invalid_model_output"
+
+
+def test_classifier_config_hash_includes_policy_catalog_and_prompt(tmp_path) -> None:
+    classifier = TrajectoryClassifier(
+        client=_Completion(
+            {
+                "scenario_label_key": "toc|Shopping|购物",
+                "capability_labels": ["Tool Use"],
+            }
+        ),
+        taxonomy=_taxonomy(tmp_path),
+        input_manifest_sha256="a" * 64,
+    )
+
+    assert classifier.policy_sha256 == CLASSIFICATION_POLICY_SHA256
+    assert len(classifier.catalog_sha256) == 64
+    assert len(classifier.prompt_sha256) == 64
+    assert len(classifier.strategy_fingerprint) == 64
+    original = classifier.config_hash
+    classifier._system_prompt += "\npolicy marker"
+    assert classifier.prompt_sha256 != ""
+    assert classifier.config_hash != original
 
 
 def test_chat_client_retries_429_without_exposing_key() -> None:

@@ -20,6 +20,7 @@ from .canonical import trajectory_id
 from .classification.cache import ClassificationCache
 from .classification.classifier import (
     CAPABILITY_LABELS,
+    CLASSIFICATION_POLICY,
     CLASSIFIER_REVISION,
     DEFAULT_MAX_CONTEXT_CHARS,
     PROMPT_VERSION,
@@ -534,6 +535,11 @@ def _validate_classification(
         "classifier_revision",
         "prompt_version",
         "taxonomy_sha256",
+        "catalog_sha256",
+        "policy_sha256",
+        "prompt_sha256",
+        "strategy_fingerprint",
+        "config_hash",
         "input_manifest_sha256",
         "context_truncated",
     }
@@ -551,6 +557,16 @@ def _validate_classification(
         raise LabelJobError("classification prompt version does not match the job")
     if classification["taxonomy_sha256"] != classifier.taxonomy.sha256:
         raise LabelJobError("classification taxonomy does not match the job")
+    if classification["catalog_sha256"] != classifier.catalog_sha256:
+        raise LabelJobError("classification catalog does not match the job")
+    if classification["policy_sha256"] != classifier.policy_sha256:
+        raise LabelJobError("classification policy does not match the job")
+    if classification["prompt_sha256"] != classifier.prompt_sha256:
+        raise LabelJobError("classification prompt digest does not match the job")
+    if classification["strategy_fingerprint"] != classifier.strategy_fingerprint:
+        raise LabelJobError("classification strategy does not match the job")
+    if classification["config_hash"] != classifier.config_hash:
+        raise LabelJobError("classification config does not match the job")
     if classification["input_manifest_sha256"] != classifier.input_manifest_sha256:
         raise LabelJobError("classification input manifest does not match the job")
     if type(classification["context_truncated"]) is not bool:
@@ -567,18 +583,31 @@ def _validate_classification(
         return
     labels = classification["scenario_labels"]
     capabilities = classification["capability_labels"]
-    if type(labels) is not list or not labels:
-        raise LabelJobError("accepted classification must contain scenario labels")
-    if any(
-        type(label) is not dict or type(label.get("id")) is not int for label in labels
+    # The classifier deliberately emits one first-level scenario label while
+    # retaining the historical outer-list shape for downstream consumers.
+    # Requiring the exact L1 object shape here prevents stale L2 cache rows or
+    # model responses with extra taxonomy fields from being published.
+    if type(labels) is not list or len(labels) != 1:
+        raise LabelJobError(
+            "accepted classification must contain exactly one scenario label"
+        )
+    label = labels[0]
+    expected_l1_keys = {"key", "split", "domain_l1_en", "domain_l1_zh"}
+    if (
+        type(label) is not dict
+        or set(label) != expected_l1_keys
+        or any(type(label[field]) is not str or not label[field] for field in label)
     ):
-        raise LabelJobError("classification scenario labels are invalid")
-    identifiers = [label["id"] for label in labels]
-    if classifier.taxonomy.expand(identifiers) != labels:
-        raise LabelJobError("classification scenario labels do not match taxonomy")
+        raise LabelJobError("classification scenario label is not a valid L1 object")
+    try:
+        expected_label = classifier.taxonomy.expand_l1(label["key"])
+    except (AttributeError, TypeError, ValueError) as error:
+        raise LabelJobError("classification scenario label is invalid") from error
+    if expected_label != label:
+        raise LabelJobError("classification scenario label does not match taxonomy")
     if (
         type(capabilities) is not list
-        or not capabilities
+        or not 1 <= len(capabilities) <= 2
         or any(type(label) is not str for label in capabilities)
         or len(set(capabilities)) != len(capabilities)
         or any(label not in CAPABILITY_LABELS for label in capabilities)
@@ -764,9 +793,14 @@ def _run_s3_label_job_with_client(
             "created_at": datetime.now(UTC).isoformat(),
             "input_root": input_location.uri,
             "input_manifest_sha256": manifest_sha256,
+            "classification_policy": CLASSIFICATION_POLICY,
             "classifier_revision": classifier.classifier_revision,
             "prompt_version": classifier.prompt_version,
             "taxonomy_sha256": classifier.taxonomy.sha256,
+            "catalog_sha256": classifier.catalog_sha256,
+            "policy_sha256": classifier.policy_sha256,
+            "prompt_sha256": classifier.prompt_sha256,
+            "strategy_fingerprint": classifier.strategy_fingerprint,
             "classifier_model": classifier.client.model,
             "config_hash": classifier.config_hash,
             "counts": {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -82,7 +83,7 @@ class _Completion:
         self.calls += 1
         return orjson.dumps(
             {
-                "scenario_label_ids": [10026],
+                "scenario_label_key": "toc|Shopping|购物",
                 "capability_labels": ["Tool Use"],
             }
         ).decode()
@@ -336,6 +337,18 @@ def test_v004_job_classifies_accepted_and_quarantined_into_flat_files(
     output_manifest = orjson.loads(
         client.objects[(output_location.bucket, output_location.key("manifest.json"))]
     )
+    for field in (
+        "catalog_sha256",
+        "policy_sha256",
+        "prompt_sha256",
+        "strategy_fingerprint",
+        "config_hash",
+    ):
+        assert output_manifest[field] == getattr(classifier, field)
+    assert output_manifest["classification_policy"]["scenario_selection"] == (
+        "exactly_one_l1"
+    )
+    assert output_manifest["classification_policy"]["capability_max"] == 2
     trajectory_files = [
         entry for entry in output_manifest["files"] if entry["kind"] == "trajectory"
     ]
@@ -374,6 +387,113 @@ def test_v004_job_classifies_accepted_and_quarantined_into_flat_files(
 
     assert rerun.cache_hits == 3
     assert completion.calls == 3
+
+
+def test_invalid_cached_l2_shape_is_rejected_and_reclassified(
+    tmp_path: Path,
+) -> None:
+    """A stale accepted cache row must not bypass the L1 output contract."""
+
+    client = _MemoryS3()
+    input_location = S3Location("bucket", "normalized/v004/dt=2026-09-14/")
+    output_location = S3Location("bucket", "classified/v001/dt=2026-09-14/")
+    manifest_bytes = _install_v004_input(client, input_location)
+    completion = _Completion()
+    classifier = TrajectoryClassifier(
+        client=completion,
+        taxonomy=_taxonomy(tmp_path),
+        input_manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+    )
+    state_path = tmp_path / "stale-l2-state.sqlite"
+
+    first = _run_s3_label_job_with_client(
+        client,
+        input_location=input_location,
+        output_location=output_location,
+        classifier=classifier,
+        workspace=tmp_path,
+        state_path=state_path,
+        max_workers=1,
+    )
+    assert first.cache_hits == 0
+    assert completion.calls == 3
+
+    with sqlite3.connect(state_path) as connection:
+        cache_key, result = connection.execute(
+            "SELECT cache_key, result FROM classifications ORDER BY cache_key LIMIT 1"
+        ).fetchone()
+        stale = orjson.loads(result)
+        stale["scenario_labels"] = [
+            stale["scenario_labels"][0],
+            stale["scenario_labels"][0],
+        ]
+        connection.execute(
+            "UPDATE classifications SET result = ? WHERE cache_key = ?",
+            (orjson.dumps(stale), cache_key),
+        )
+        connection.commit()
+
+    rerun = _run_s3_label_job_with_client(
+        client,
+        input_location=input_location,
+        output_location=output_location,
+        classifier=classifier,
+        workspace=tmp_path,
+        state_path=state_path,
+        max_workers=1,
+    )
+    assert rerun.cache_hits == 2
+    assert completion.calls == 4
+
+
+def test_strategy_fingerprint_is_part_of_cache_namespace(tmp_path: Path) -> None:
+    client = _MemoryS3()
+    input_location = S3Location("bucket", "normalized/v004/dt=2026-09-14/")
+    output_location = S3Location("bucket", "classified/v001/dt=2026-09-14/")
+    manifest_bytes = _install_v004_input(client, input_location)
+    first_completion = _Completion()
+    first_classifier = TrajectoryClassifier(
+        client=first_completion,
+        taxonomy=_taxonomy(tmp_path),
+        input_manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+    )
+    state_path = tmp_path / "strategy-state.sqlite"
+
+    first = _run_s3_label_job_with_client(
+        client,
+        input_location=input_location,
+        output_location=output_location,
+        classifier=first_classifier,
+        workspace=tmp_path,
+        state_path=state_path,
+        max_workers=1,
+    )
+    assert first.cache_hits == 0
+    assert first_completion.calls == 3
+
+    class AlternateStrategyClassifier(TrajectoryClassifier):
+        @property
+        def strategy_fingerprint(self) -> str:
+            return "b" * 64
+
+    second_completion = _Completion()
+    second_classifier = AlternateStrategyClassifier(
+        client=second_completion,
+        taxonomy=_taxonomy(tmp_path),
+        input_manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+    )
+    assert second_classifier.config_hash != first_classifier.config_hash
+    rerun = _run_s3_label_job_with_client(
+        client,
+        input_location=input_location,
+        output_location=output_location,
+        classifier=second_classifier,
+        workspace=tmp_path,
+        state_path=state_path,
+        max_workers=1,
+    )
+    assert rerun.cache_hits == 0
+    assert second_completion.calls == 3
 
 
 def test_output_manifest_is_write_only_on_first_classification_run(

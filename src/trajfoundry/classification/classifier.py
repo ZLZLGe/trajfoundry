@@ -29,9 +29,33 @@ CAPABILITY_LABELS = (
 )
 # Bump when the classification contract or publication behavior changes so
 # scheduler assertions and the persistent cache cannot silently mix runs.
-CLASSIFIER_REVISION = "2026-09-22.1"
+CLASSIFIER_REVISION = "2026-09-23.1"
 PROMPT_VERSION = "v001"
-DEFAULT_MAX_CONTEXT_CHARS = 500_000
+# This is the serialized trajectory budget in characters, not model tokens.
+DEFAULT_MAX_CONTEXT_CHARS = 1_000_000
+
+# Keep the scheduler-facing revision stable while making changes to the label
+# policy visible to the persistent cache through an independent fingerprint.
+# The policy is intentionally data rather than a version string so its digest
+# changes automatically when a contract limit is edited.
+CLASSIFICATION_POLICY = {
+    "scenario_selection": "exactly_one_l1",
+    "scenario_key_field": "scenario_label_key",
+    "scenario_output_fields": (
+        "key",
+        "split",
+        "domain_l1_en",
+        "domain_l1_zh",
+    ),
+    "capability_min": 1,
+    "capability_max": 2,
+}
+CLASSIFICATION_POLICY_SHA256 = hashlib.sha256(
+    orjson.dumps(CLASSIFICATION_POLICY, option=orjson.OPT_SORT_KEYS)
+).hexdigest()
+# Short aliases are useful to callers building diagnostics without depending
+# on the internal spelling of the policy constant.
+POLICY_SHA256 = CLASSIFICATION_POLICY_SHA256
 
 
 class CompletionClient(Protocol):
@@ -104,9 +128,44 @@ class TrajectoryClassifier:
             "classifier_revision": self.classifier_revision,
             "prompt_version": self.prompt_version,
             "taxonomy_sha256": self.taxonomy.sha256,
+            "catalog_sha256": self.catalog_sha256,
+            "policy_sha256": self.policy_sha256,
+            "prompt_sha256": self.prompt_sha256,
+            "strategy_fingerprint": self.strategy_fingerprint,
             "model": self.client.model,
             "api_url": getattr(self.client, "api_url", "injected-client"),
             "max_context_chars": self.max_context_chars,
+        }
+        return hashlib.sha256(
+            orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)
+        ).hexdigest()
+
+    @property
+    def catalog_sha256(self) -> str:
+        """Digest of the selectable, derived L1 catalog."""
+
+        return self.taxonomy.l1_sha256
+
+    @property
+    def policy_sha256(self) -> str:
+        """Digest of the output and selection policy."""
+
+        return CLASSIFICATION_POLICY_SHA256
+
+    @property
+    def prompt_sha256(self) -> str:
+        """Digest of the exact system prompt sent to the model."""
+
+        return hashlib.sha256(self._system_prompt.encode("utf-8")).hexdigest()
+
+    @property
+    def strategy_fingerprint(self) -> str:
+        """Digest tying policy, catalog, and prompt behavior together."""
+
+        payload = {
+            "policy_sha256": self.policy_sha256,
+            "catalog_sha256": self.catalog_sha256,
+            "prompt_sha256": self.prompt_sha256,
         }
         return hashlib.sha256(
             orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)
@@ -122,6 +181,11 @@ class TrajectoryClassifier:
             "classifier_revision": self.classifier_revision,
             "prompt_version": self.prompt_version,
             "taxonomy_sha256": self.taxonomy.sha256,
+            "catalog_sha256": self.catalog_sha256,
+            "policy_sha256": self.policy_sha256,
+            "prompt_sha256": self.prompt_sha256,
+            "strategy_fingerprint": self.strategy_fingerprint,
+            "config_hash": self.config_hash,
             "input_manifest_sha256": self.input_manifest_sha256,
             "context_truncated": truncated,
         }
@@ -164,34 +228,36 @@ class TrajectoryClassifier:
         return ClassificationAttempt(
             classification={
                 "status": "accepted",
-                "scenario_labels": self.taxonomy.expand(decision["scenario_label_ids"]),
+                "scenario_labels": [
+                    self.taxonomy.expand_l1(decision["scenario_label_key"])
+                ],
                 "capability_labels": decision["capability_labels"],
                 **base,
             },
             cacheable=True,
         )
 
-    def _parse_decision(self, payload: str) -> dict[str, list[Any]]:
+    def _parse_decision(self, payload: str) -> dict[str, Any]:
         try:
             value = orjson.loads(payload)
         except orjson.JSONDecodeError as error:
             raise ModelDecisionError("model output is not JSON") from error
         if type(value) is not dict or set(value) != {
-            "scenario_label_ids",
+            "scenario_label_key",
             "capability_labels",
         }:
             raise ModelDecisionError("model output has unsupported fields")
-        identifiers = value["scenario_label_ids"]
+        key = value["scenario_label_key"]
         capabilities = value["capability_labels"]
-        if type(identifiers) is not list or not identifiers:
-            raise ModelDecisionError("scenario_label_ids must be non-empty")
-        if any(type(identifier) is not int for identifier in identifiers):
-            raise ModelDecisionError("scenario_label_ids must contain integers")
-        if len(set(identifiers)) != len(identifiers):
-            raise ModelDecisionError("scenario_label_ids must be unique")
-        self.taxonomy.expand(identifiers)
+        if type(key) is not str or not key:
+            raise ModelDecisionError("scenario_label_key must be a non-empty string")
+        self.taxonomy.expand_l1(key)
         if type(capabilities) is not list or not capabilities:
             raise ModelDecisionError("capability_labels must be non-empty")
+        if len(capabilities) > 2:
+            raise ModelDecisionError(
+                "capability_labels must contain at most two labels"
+            )
         if any(type(label) is not str for label in capabilities):
             raise ModelDecisionError("capability_labels must contain strings")
         if len(set(capabilities)) != len(capabilities):
@@ -199,7 +265,7 @@ class TrajectoryClassifier:
         if any(label not in CAPABILITY_LABELS for label in capabilities):
             raise ModelDecisionError("capability_labels contains an unknown label")
         return {
-            "scenario_label_ids": identifiers,
+            "scenario_label_key": key,
             "capability_labels": capabilities,
         }
 
@@ -207,11 +273,13 @@ class TrajectoryClassifier:
         capabilities = orjson.dumps(CAPABILITY_LABELS).decode("utf-8")
         return (
             "You classify complete agent trajectories. Return exactly one JSON "
-            "object with two fields: scenario_label_ids (a non-empty array of "
-            "unique integer IDs from the catalog) and capability_labels (a "
-            "non-empty array of unique strings from the allowed capability list). "
-            "Choose only labels supported by the trajectory. Do not return prose, "
-            "markdown, model names, or harness names.\n\n"
+            "object with two fields: scenario_label_key (exactly one string key "
+            "from the L1 catalog) and capability_labels (an array of one or two "
+            "unique strings from the allowed capability list). "
+            "Choose the single scenario that best matches the final task. "
+            "Choose the smallest sufficient capability set supported by direct "
+            "evidence; do not infer capabilities from the domain alone. Do not "
+            "return prose, markdown, model names, or harness names.\n\n"
             f"ALLOWED_CAPABILITIES={capabilities}\n\n"
             f"SCENARIO_CATALOG={self.taxonomy.prompt_catalog()}"
         )
@@ -219,8 +287,11 @@ class TrajectoryClassifier:
 
 __all__ = [
     "CAPABILITY_LABELS",
+    "CLASSIFICATION_POLICY",
+    "CLASSIFICATION_POLICY_SHA256",
     "CLASSIFIER_REVISION",
     "DEFAULT_MAX_CONTEXT_CHARS",
+    "POLICY_SHA256",
     "PROMPT_VERSION",
     "ClassificationAttempt",
     "CompletionClient",
