@@ -11,7 +11,7 @@ import os
 import sqlite3
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import ExitStack, contextmanager
@@ -50,7 +50,7 @@ from .quality import enrich_trajectory
 from .sources.deepinfra import DeepInfraError, adapt_deepinfra_envelope
 from .sources.sxf import SXFError, adapt_sxf_envelope
 from .sources.tokenplan import TokenPlanError, adapt_tokenplan_envelope
-from .state import StateStore, _decompress_payload
+from .state import StateStore, _compress_payload, _decompress_payload
 from .streaming import streaming_prefix_leaves
 from .subagents import (
     SubagentMountPlan,
@@ -164,6 +164,21 @@ class PipelineStats:
     build_seconds: float = 0.0
     export_seconds: float = 0.0
     validation_seconds: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class _IngestParseResult:
+    """Picklable parse outcome returned by an ingest worker."""
+
+    source_ref: str
+    digest: str
+    snapshot_payload: bytes | None
+    session_id: str
+    thread_id: str
+    endpoint: str
+    captured_at: str
+    user_id: str
+    failure_reason: str = ""
 
 
 @dataclass(slots=True)
@@ -314,6 +329,93 @@ def parse_capture(
             item.model_copy(deep=True) for item in multimodal_file_mapping
         ]
     return snapshot.model_copy(update=updates) if updates else snapshot
+
+
+def _parse_ingest_payload(
+    source_ref: str,
+    payload: bytes,
+    digest: str,
+    input_format: Literal["freerouter", "tokenplan", "sxf", "deepinfra"],
+) -> _IngestParseResult:
+    """Decode, adapt, and parse one input outside the SQLite writer process."""
+
+    endpoint = ""
+    captured_at = ""
+    try:
+        capture = decode_capture(payload, input_format=input_format)
+        endpoint_value = capture.get("path")
+        if input_format == "deepinfra":
+            outer_request = capture.get("request")
+            if isinstance(outer_request, Mapping):
+                endpoint_value = outer_request.get("path")
+            request_time = capture.get("request_time")
+            if isinstance(request_time, str):
+                captured_at = request_time
+        endpoint = (
+            endpoint_value.split("?", 1)[0].rstrip("/")
+            if isinstance(endpoint_value, str)
+            else ""
+        )
+        source_name: Literal["freerouter", "tokenplan", "sxf", "deepinfra"] = (
+            "freerouter"
+        )
+        response_is_normalized_final = False
+        multimodal_file_mapping: list[MediaMapping] = []
+        if input_format == "tokenplan":
+            adapted = adapt_tokenplan_envelope(capture)
+            capture = adapted.capture
+            source_name = adapted.source_name
+            endpoint = adapted.endpoint
+            captured_at = adapted.captured_at
+            response_is_normalized_final = adapted.response_is_normalized_final
+            multimodal_file_mapping = adapted.multimodal_file_mapping
+        elif input_format == "sxf":
+            capture = adapt_sxf_envelope(capture)
+            source_name = "sxf"
+        elif input_format == "deepinfra":
+            capture = adapt_deepinfra_envelope(capture)
+            source_name = "deepinfra"
+        captured_value = capture.get("captured_at")
+        captured_at = captured_value if isinstance(captured_value, str) else ""
+        snapshot = parse_capture(
+            capture,
+            source_path=source_ref,
+            source_sha256=digest,
+            source_name=source_name,
+            response_is_normalized_final=response_is_normalized_final,
+            multimodal_file_mapping=multimodal_file_mapping,
+        )
+        return _IngestParseResult(
+            source_ref=source_ref,
+            digest=digest,
+            snapshot_payload=_compress_payload(
+                snapshot.model_dump_json(exclude_none=True).encode("utf-8")
+            ),
+            session_id=snapshot.session_id,
+            thread_id=snapshot.thread_id,
+            endpoint=endpoint,
+            captured_at=snapshot.captured_at,
+            user_id=snapshot.user_id,
+        )
+    except TokenPlanError as error:
+        reason = f"{error.code}: {error.detail}"
+    except SXFError as error:
+        reason = f"sxf_error: {error}"
+    except DeepInfraError as error:
+        reason = f"{error.code}: {error.detail}"
+    except Exception as error:  # noqa: BLE001 - quarantine per-file defects
+        reason = f"{type(error).__name__}: capture could not be normalized"
+    return _IngestParseResult(
+        source_ref=source_ref,
+        digest=digest,
+        snapshot_payload=None,
+        session_id="",
+        thread_id="",
+        endpoint=endpoint,
+        captured_at=captured_at,
+        user_id="",
+        failure_reason=reason,
+    )
 
 
 def _definition_score(definition: ToolDefinition) -> tuple[int, int, int, bytes]:
@@ -1643,7 +1745,10 @@ def _ingest_source(
     stats: PipelineStats,
     *,
     source_errors_fatal: bool = False,
+    parse_workers: int = 1,
 ) -> None:
+    if parse_workers <= 0:
+        raise ValueError("parse_workers must be positive")
     started_at = time.monotonic()
     last_progress_at = started_at
     LOGGER.info("【读取阶段】开始读取输入数据")
@@ -1798,35 +1903,143 @@ def _ingest_source(
             stats.parse_failures += 1
         log_progress()
 
-    try:
-        streaming = getattr(source, "iter_capture_payloads", None)
-        payload_formats = getattr(source, "payload_formats", frozenset({"sxf"}))
-        if config.input_format in payload_formats and callable(streaming):
-            for source_ref, payload, digest in streaming(config.input_format):
-                process_payload(source_ref, payload, digest)
-                rotate_batch(len(payload))
+    def process_parse_result(result: _IngestParseResult) -> None:
+        if result.snapshot_payload is not None:
+            state.put_snapshot_payload(
+                source_path=result.source_ref,
+                source_sha256=result.digest,
+                session_id=result.session_id,
+                thread_id=result.thread_id,
+                captured_at=result.captured_at,
+                user_id=result.user_id,
+                payload=result.snapshot_payload,
+                endpoint=result.endpoint,
+            )
+            stats.parsed += 1
         else:
-            for capture_ref in source.iter_captures(config.input_format):
-                source_ref = capture_ref.source_ref
-                try:
-                    payload, digest = source.read_capture_bytes(capture_ref)
-                except Exception as error:
-                    if source_errors_fatal:
-                        raise
-                    stats.discovered += 1
-                    state.put_failure(
-                        source_ref,
-                        "",
-                        f"{type(error).__name__}: capture could not be normalized",
-                        endpoint="",
-                        captured_at="",
-                    )
-                    stats.parse_failures += 1
+            state.put_failure(
+                result.source_ref,
+                result.digest,
+                result.failure_reason,
+                endpoint=result.endpoint,
+                captured_at=result.captured_at,
+            )
+            stats.parse_failures += 1
+        log_progress()
+
+    try:
+        if parse_workers > 1:
+            # The S3 reader and the SQLite writer stay in this process.  Only
+            # JSON decoding/provider adaptation is forked, so no worker ever
+            # touches a shared SQLite connection or boto client.  Results are
+            # consumed in source order to preserve deterministic state rows.
+            pending: deque[tuple[int, Any]] = deque()
+            pending_bytes = 0
+            pending_limit = max(parse_workers * 4, 16)
+
+            def drain_parse(*, force: bool = False) -> None:
+                nonlocal pending_bytes
+                while pending and (
+                    force
+                    or len(pending) >= pending_limit
+                    or pending_bytes >= _INGEST_BATCH_BYTES
+                ):
+                    payload_bytes, future = pending.popleft()
+                    pending_bytes -= payload_bytes
+                    process_parse_result(future.result())
+                    rotate_batch(payload_bytes)
+
+            def submit_parse(
+                executor: ProcessPoolExecutor,
+                source_ref: str,
+                payload: bytes,
+                digest: str,
+            ) -> None:
+                nonlocal pending_bytes
+                stats.discovered += 1
+                stats.input_bytes += len(payload)
+                if state.capture_matches(source_ref, digest):
+                    stats.reused += 1
+                    rotate_batch(len(payload))
                     log_progress()
-                    rotate_batch(0)
-                    continue
-                process_payload(source_ref, payload, digest)
-                rotate_batch(len(payload))
+                    return
+                pending.append(
+                    (
+                        len(payload),
+                        executor.submit(
+                            _parse_ingest_payload,
+                            source_ref,
+                            payload,
+                            digest,
+                            config.input_format,
+                        ),
+                    )
+                )
+                pending_bytes += len(payload)
+                drain_parse()
+
+            with ProcessPoolExecutor(
+                max_workers=parse_workers,
+                mp_context=multiprocessing.get_context("fork"),
+            ) as executor:
+                streaming = getattr(source, "iter_capture_payloads", None)
+                payload_formats = getattr(
+                    source, "payload_formats", frozenset({"sxf"})
+                )
+                if config.input_format in payload_formats and callable(streaming):
+                    for source_ref, payload, digest in streaming(config.input_format):
+                        submit_parse(executor, source_ref, payload, digest)
+                else:
+                    for capture_ref in source.iter_captures(config.input_format):
+                        source_ref = capture_ref.source_ref
+                        try:
+                            payload, digest = source.read_capture_bytes(capture_ref)
+                        except Exception as error:
+                            if source_errors_fatal:
+                                raise
+                            stats.discovered += 1
+                            state.put_failure(
+                                source_ref,
+                                "",
+                                f"{type(error).__name__}: capture could not be normalized",
+                                endpoint="",
+                                captured_at="",
+                            )
+                            stats.parse_failures += 1
+                            log_progress()
+                            rotate_batch(0)
+                            continue
+                        submit_parse(executor, source_ref, payload, digest)
+                drain_parse(force=True)
+        else:
+            streaming = getattr(source, "iter_capture_payloads", None)
+            payload_formats = getattr(source, "payload_formats", frozenset({"sxf"}))
+            if config.input_format in payload_formats and callable(streaming):
+                for source_ref, payload, digest in streaming(config.input_format):
+                    process_payload(source_ref, payload, digest)
+                    rotate_batch(len(payload))
+            else:
+                for capture_ref in source.iter_captures(config.input_format):
+                    source_ref = capture_ref.source_ref
+                    try:
+                        payload, digest = source.read_capture_bytes(capture_ref)
+                    except Exception as error:
+                        if source_errors_fatal:
+                            raise
+                        stats.discovered += 1
+                        state.put_failure(
+                            source_ref,
+                            "",
+                            f"{type(error).__name__}: capture could not be normalized",
+                            endpoint="",
+                            captured_at="",
+                        )
+                        stats.parse_failures += 1
+                        log_progress()
+                        rotate_batch(0)
+                        continue
+                    process_payload(source_ref, payload, digest)
+                    rotate_batch(len(payload))
     except BaseException as error:
         close_batch(type(error), error, error.__traceback__)
         raise
@@ -1854,6 +2067,7 @@ def normalize_source(
     output_factory: Callable[[], Any],
     max_shard_bytes: int = 512 * 1024 * 1024,
     build_workers: int | None = None,
+    parse_workers: int | None = None,
 ) -> tuple[PipelineStats, Any]:
     """Normalize a non-filesystem source with ephemeral local state.
 
@@ -1867,6 +2081,10 @@ def normalize_source(
         raise ValueError(f"unsupported input format: {input_format!r}")
     if max_shard_bytes <= 0:
         raise ValueError("max_shard_bytes must be positive")
+    if parse_workers is None:
+        parse_workers = 1
+    if parse_workers <= 0:
+        raise ValueError("parse_workers must be positive")
     resolved_state = state_path.resolve()
     if resolved_state.is_symlink():
         raise ValueError("state database path must not be a symlink")
@@ -1890,13 +2108,15 @@ def normalize_source(
         # Remote read errors are infrastructure failures, rather than content
         # defects, and must fail the scheduler task without publication.
         stage_started_at = time.monotonic()
-        _ingest_source(
-            source,
-            state,
-            runtime_config,
-            stats,
-            source_errors_fatal=True,
-        )
+        with state.ingest_write_mode():
+            _ingest_source(
+                source,
+                state,
+                runtime_config,
+                stats,
+                source_errors_fatal=True,
+                parse_workers=parse_workers,
+            )
         stats.ingest_seconds = time.monotonic() - stage_started_at
         if stats.discovered == 0:
             raise ValueError(f"capture source is empty: {source.label}")

@@ -531,6 +531,7 @@ def test_run_s3_job_loads_default_credentials_and_closes_client(
             "endpoint_url": "http://s3.example.invalid",
             "region_name": "us-east-1",
             "credentials": credentials,
+            "max_pool_connections": 16,
         }
     ]
     assert client.closed

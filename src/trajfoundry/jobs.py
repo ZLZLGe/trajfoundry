@@ -154,11 +154,18 @@ def _run_s3_job_with_client(
     build_workers: int = 1,
     output_workers: int = 1,
     validation_workers: int = 1,
+    read_workers: int = 16,
+    read_prefetch: int | None = None,
+    parse_workers: int = 8,
 ) -> JobResult:
     started_at = time.monotonic()
     LOGGER.info(
-        "【任务开始】输入格式=%s，构建并发=%d，上传并发=%d，校验并发=%d",
+        "【任务开始】输入格式=%s，读取并发=%d，读取预取=%s，解析并发=%d，"
+        "构建并发=%d，上传并发=%d，校验并发=%d",
         input_format,
+        read_workers,
+        read_prefetch if read_prefetch is not None else read_workers,
+        parse_workers,
         build_workers,
         output_workers,
         validation_workers,
@@ -173,7 +180,12 @@ def _run_s3_job_with_client(
         "【任务开始】已有输出轨迹文件=%d，准备读取输入数据",
         len(listed_flat_paths),
     )
-    source = S3CaptureSource(client, input_location)
+    source = S3CaptureSource(
+        client,
+        input_location,
+        read_workers=read_workers,
+        read_prefetch=read_prefetch,
+    )
     with TemporaryDirectory(prefix="trajfoundry-state-", dir=workspace) as directory:
         stats, manifest_bytes = normalize_source(
             source,
@@ -187,6 +199,7 @@ def _run_s3_job_with_client(
             ),
             max_shard_bytes=max_shard_bytes,
             build_workers=build_workers,
+            parse_workers=parse_workers,
         )
     LOGGER.info(
         "【读取与构建完成】已发现=%d，已解析=%d，复用=%d，解析失败=%d，"
@@ -404,6 +417,9 @@ def run_s3_job(
     build_workers: int = 1,
     output_workers: int = 1,
     validation_workers: int = 1,
+    read_workers: int = 16,
+    read_prefetch: int | None = None,
+    parse_workers: int = 8,
 ) -> JobResult:
     """Normalize an S3 prefix directly into a flat S3 output prefix.
 
@@ -413,6 +429,9 @@ def run_s3_job(
     only after the complete candidate output passes remote validation. S3
     credentials come from the fixed credential file by default; explicitly pass
     ``credentials_path=None`` only when the standard AWS SDK chain is intended.
+    ``read_workers`` controls concurrent S3 GETs and ``parse_workers`` controls
+    CPU-bound decode/adaptation workers; SQLite writes remain ordered in the
+    coordinator process.
     """
 
     if input_format not in {"freerouter", "tokenplan", "sxf", "deepinfra"}:
@@ -429,6 +448,12 @@ def run_s3_job(
         raise ValueError("output_workers must be positive")
     if validation_workers <= 0:
         raise ValueError("validation_workers must be positive")
+    if read_workers <= 0:
+        raise ValueError("read_workers must be positive")
+    if read_prefetch is not None and read_prefetch <= 0:
+        raise ValueError("read_prefetch must be positive")
+    if parse_workers <= 0:
+        raise ValueError("parse_workers must be positive")
 
     input_location = parse_s3_uri(input_uri)
     output_location = parse_s3_uri(output_uri)
@@ -458,9 +483,10 @@ def run_s3_job(
         "region_name": region_name,
         "credentials": credentials,
     }
-    if max(output_workers, validation_workers) > 1:
+    if max(read_workers, output_workers, validation_workers) > 1:
         client_kwargs["max_pool_connections"] = max(
             8,
+            read_workers,
             output_workers,
             validation_workers,
         )
@@ -476,6 +502,9 @@ def run_s3_job(
             build_workers=build_workers,
             output_workers=output_workers,
             validation_workers=validation_workers,
+            read_workers=read_workers,
+            read_prefetch=read_prefetch,
+            parse_workers=parse_workers,
         )
     finally:
         _close_s3_client(client)

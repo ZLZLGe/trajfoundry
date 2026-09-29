@@ -23,8 +23,7 @@ if TYPE_CHECKING:
 
 InputFormat = Literal["freerouter", "tokenplan", "sxf", "deepinfra"]
 _READ_CHUNK_BYTES = 1024 * 1024
-_READ_WORKERS = 4
-_READ_PREFETCH = 4
+_DEFAULT_READ_WORKERS = 4
 _MAX_POOL_CONNECTIONS = 8
 _PROGRESS_INTERVAL_SECONDS = 60.0
 
@@ -209,9 +208,24 @@ class S3Capture:
 class S3CaptureSource:
     """List and read stable capture objects under one S3 directory prefix."""
 
-    def __init__(self, client: Any, location: S3Location) -> None:
+    def __init__(
+        self,
+        client: Any,
+        location: S3Location,
+        *,
+        read_workers: int = _DEFAULT_READ_WORKERS,
+        read_prefetch: int | None = None,
+    ) -> None:
+        if read_workers <= 0:
+            raise ValueError("read workers must be positive")
+        if read_prefetch is None:
+            read_prefetch = read_workers
+        if read_prefetch <= 0:
+            raise ValueError("read prefetch must be positive")
         self.client = client
         self.location = location
+        self.read_workers = read_workers
+        self.read_prefetch = read_prefetch
 
     @property
     def label(self) -> str:
@@ -314,11 +328,11 @@ class S3CaptureSource:
     ) -> Iterator[tuple[str, bytes, str]]:
         """Yield stable payloads with bounded prefetch for ordinary objects.
 
-        Ordinary JSON captures are fetched by four workers while results remain
-        ordered by source reference.  At most four completed object payloads
-        can wait in memory.  SXF remains a sequential decompression stream so a
-        compressed object is never accumulated in memory.  Each SXF hash covers
-        the exact JSONL row without its line ending.
+        Ordinary JSON captures are fetched by a bounded worker pool while
+        results remain ordered by source reference.  SXF remains a sequential
+        decompression stream so a compressed object is never accumulated in
+        memory.  Each SXF hash covers the exact JSONL row without its line
+        ending.
         """
 
         if input_format != "sxf":
@@ -382,13 +396,13 @@ class S3CaptureSource:
     ) -> Iterator[tuple[str, bytes, str]]:
         captures = iter(self.iter_captures(input_format))
         executor = ThreadPoolExecutor(
-            max_workers=_READ_WORKERS,
+            max_workers=self.read_workers,
             thread_name_prefix="trajfoundry-s3-read",
         )
         pending: deque[tuple[S3Capture, Future[tuple[bytes, str]]]] = deque()
 
         def fill() -> None:
-            while len(pending) < _READ_PREFETCH:
+            while len(pending) < self.read_prefetch:
                 try:
                     capture = next(captures)
                 except StopIteration:

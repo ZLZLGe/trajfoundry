@@ -83,6 +83,7 @@ class StateStore:
     def __init__(self, path: Path, *, ephemeral: bool = False):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(path)
+        self._ephemeral = ephemeral
         self._write_batch_depth = 0
         if int(self.connection.execute("PRAGMA page_count").fetchone()[0]) == 0:
             self.connection.execute(f"PRAGMA page_size={_PAGE_SIZE}")
@@ -274,6 +275,35 @@ class StateStore:
             self.connection.execute("DELETE FROM snapshots")
             self.connection.execute("DELETE FROM captures")
 
+    @contextmanager
+    def ingest_write_mode(self) -> Iterator[Self]:
+        """Suspend aggregation indexes while loading an ephemeral input.
+
+        Remote jobs rebuild their temporary database from scratch, so the
+        grouping indexes cannot serve reads during ingest.  Deferring their
+        maintenance until the single writer has finished reduces SQLite work;
+        durable local/resumable databases keep the historical behavior.
+        """
+
+        if not self._ephemeral:
+            yield self
+            return
+        with self._write_scope():
+            self.connection.execute("DROP INDEX IF EXISTS idx_snapshots_group")
+            self.connection.execute("DROP INDEX IF EXISTS idx_captures_user")
+        try:
+            yield self
+        finally:
+            with self._write_scope():
+                self.connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_snapshots_group "
+                    "ON snapshots(session_id, thread_id, captured_at, source_path)"
+                )
+                self.connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_captures_user "
+                    "ON captures(user_id, source_path)"
+                )
+
     def close(self) -> None:
         self.connection.close()
 
@@ -307,6 +337,33 @@ class StateStore:
         return matched
 
     def put_snapshot(self, snapshot: Snapshot, *, endpoint: str = "") -> None:
+        self.put_snapshot_payload(
+            source_path=snapshot.source_path,
+            source_sha256=snapshot.source_sha256,
+            session_id=snapshot.session_id,
+            thread_id=snapshot.thread_id,
+            captured_at=snapshot.captured_at,
+            user_id=snapshot.user_id,
+            payload=_compress_payload(
+                snapshot.model_dump_json(exclude_none=True).encode("utf-8")
+            ),
+            endpoint=endpoint,
+        )
+
+    def put_snapshot_payload(
+        self,
+        *,
+        source_path: str,
+        source_sha256: str,
+        session_id: str,
+        thread_id: str,
+        captured_at: str,
+        user_id: str,
+        payload: bytes,
+        endpoint: str = "",
+    ) -> None:
+        """Store an already serialized snapshot from a parse worker."""
+
         with self._write_scope():
             self.connection.execute(
                 """
@@ -320,13 +377,11 @@ class StateStore:
                     payload=excluded.payload
                 """,
                 (
-                    snapshot.source_path,
-                    snapshot.session_id,
-                    snapshot.thread_id,
-                    snapshot.captured_at,
-                    _compress_payload(
-                        snapshot.model_dump_json(exclude_none=True).encode("utf-8"),
-                    ),
+                    source_path,
+                    session_id,
+                    thread_id,
+                    captured_at,
+                    payload,
                 ),
             )
             self.connection.execute(
@@ -343,14 +398,14 @@ class StateStore:
                     scan_id=excluded.scan_id,user_id=excluded.user_id
                 """,
                 (
-                    snapshot.source_path,
-                    snapshot.source_sha256,
+                    source_path,
+                    source_sha256,
                     "parsed",
                     "",
                     endpoint,
-                    snapshot.captured_at,
+                    captured_at,
                     self._scan_id or "",
-                    snapshot.user_id,
+                    user_id,
                 ),
             )
 
