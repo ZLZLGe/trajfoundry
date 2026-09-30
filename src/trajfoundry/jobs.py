@@ -156,7 +156,7 @@ def _run_s3_job_with_client(
     validation_workers: int = 1,
     read_workers: int = 128,
     read_prefetch: int | None = None,
-    parse_workers: int = 8,
+    parse_workers: int = 16,
 ) -> JobResult:
     started_at = time.monotonic()
     LOGGER.info(
@@ -419,7 +419,7 @@ def run_s3_job(
     validation_workers: int = 1,
     read_workers: int = 128,
     read_prefetch: int | None = None,
-    parse_workers: int = 8,
+    parse_workers: int = 16,
 ) -> JobResult:
     """Normalize an S3 prefix directly into a flat S3 output prefix.
 
