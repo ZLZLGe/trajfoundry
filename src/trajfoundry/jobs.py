@@ -154,7 +154,7 @@ def _run_s3_job_with_client(
     build_workers: int = 1,
     output_workers: int = 1,
     validation_workers: int = 1,
-    read_workers: int = 16,
+    read_workers: int = 128,
     read_prefetch: int | None = None,
     parse_workers: int = 8,
 ) -> JobResult:
@@ -417,7 +417,7 @@ def run_s3_job(
     build_workers: int = 1,
     output_workers: int = 1,
     validation_workers: int = 1,
-    read_workers: int = 16,
+    read_workers: int = 128,
     read_prefetch: int | None = None,
     parse_workers: int = 8,
 ) -> JobResult:
