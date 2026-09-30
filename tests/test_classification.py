@@ -293,7 +293,7 @@ def test_chat_client_sends_bounded_json_request() -> None:
         api_url="https://classifier.invalid/v1/chat/completions",
         model="model",
         api_key="secret",
-        max_output_tokens=1_024,
+        max_output_tokens=4_096,
         opener=opener,
     )
 
@@ -302,7 +302,8 @@ def test_chat_client_sends_bounded_json_request() -> None:
         "model": "model",
         "messages": [{"role": "user", "content": "hello"}],
         "temperature": 0,
-        "max_tokens": 1_024,
+        "max_tokens": 4_096,
+        "thinking": {"type": "disabled"},
         "response_format": {"type": "json_object"},
     }
 

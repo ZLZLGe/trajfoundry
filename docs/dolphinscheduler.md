@@ -306,12 +306,16 @@ flat v4 contract are supported. Output is flat and contains each complete
 normalized row plus its top-level `classification` object. Accepted rows have
 exactly one L1 scenario label and one or two capability labels.
 
-The worker process must provide these settings without embedding values in the
-Python task:
+The worker process uses the approved GLM configuration by default:
 
 ```text
-CLASSIFIER_API_URL=https://<approved-host>/v1/chat/completions
-CLASSIFIER_MODEL=<available-model-id>
+model=glm-5.3-flash
+api_url=https://token.pjlab.org.cn/v1/chat/completions
+```
+
+Only the API key must be supplied through the worker secret mechanism:
+
+```text
 CLASSIFIER_API_KEY=<secret>
 ```
 
@@ -321,7 +325,7 @@ or the worker service environment. Never put it in workflow parameters,
 uncontrolled channel must be rotated before use.
 
 The classifier defaults to a 600,000-character serialized trajectory context
-budget (`max_context_chars`) and a 1,024-token output limit. The character
+budget (`max_context_chars`) and a 4,096-token output limit. The character
 budget is a conservative envelope for a 256K-token model rather than a
 tokenizer-level limit; the system prompt and taxonomy are additional context.
 If the gateway still reports a context-limit error, the classifier reduces the

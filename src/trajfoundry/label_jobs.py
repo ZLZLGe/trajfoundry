@@ -24,7 +24,10 @@ from .classification.classifier import (
     CLASSIFIER_REVISION,
     DEFAULT_MAX_CONTEXT_CHARS,
     DEFAULT_MAX_OUTPUT_TOKENS,
+    PROJECTION_NAME,
+    PROJECTION_VERSION,
     PROMPT_VERSION,
+    TRUNCATION_STRATEGY,
     TrajectoryClassifier,
 )
 from .classification.client import ChatCompletionsClient
@@ -41,6 +44,8 @@ _FLAT_TRAJECTORY = re.compile(r"^.+_sub_[0-9]+\.jsonl$")
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 _SYNTHESIZED_SESSION_CODE = "metadata_session_id_synthesized"
 _READ_CHUNK_BYTES = 1024 * 1024
+DEFAULT_CLASSIFIER_API_URL = "https://token.pjlab.org.cn/v1/chat/completions"
+DEFAULT_CLASSIFIER_MODEL = "glm-5.3-flash"
 
 
 class LabelJobError(RuntimeError):
@@ -543,6 +548,12 @@ def _validate_classification(
         "config_hash",
         "input_manifest_sha256",
         "context_truncated",
+        "input_projection",
+        "input_projection_version",
+        "user_turn_count",
+        "original_user_chars",
+        "sent_user_chars",
+        "truncation_strategy",
     }
     status = classification.get("status")
     expected_keys = (
@@ -572,6 +583,15 @@ def _validate_classification(
         raise LabelJobError("classification input manifest does not match the job")
     if type(classification["context_truncated"]) is not bool:
         raise LabelJobError("classification context_truncated must be a boolean")
+    if classification["input_projection"] != PROJECTION_NAME:
+        raise LabelJobError("classification input projection does not match the job")
+    if classification["input_projection_version"] != PROJECTION_VERSION:
+        raise LabelJobError("classification input projection version does not match the job")
+    if classification["truncation_strategy"] != TRUNCATION_STRATEGY:
+        raise LabelJobError("classification truncation strategy does not match the job")
+    for field in ("user_turn_count", "original_user_chars", "sent_user_chars"):
+        if type(classification[field]) is not int or classification[field] < 0:
+            raise LabelJobError(f"classification {field} must be non-negative")
     expected_model = value.get("model") or "unknown"
     expected_harness = value.get("harness") or "unknown"
     if classification["model_label"] != expected_model:
@@ -894,9 +914,10 @@ def run_s3_label_job(
 ) -> LabelJobResult:
     """Classify every complete normalized trajectory under one S3 root.
 
-    API configuration may be passed explicitly or through ``CLASSIFIER_API_URL``,
-    ``CLASSIFIER_MODEL``, and ``CLASSIFIER_API_KEY``. The key is never included in
-    logging, manifests, cache keys, or exception messages.
+    The approved GLM endpoint and model are used by default. The endpoint and
+    model may be overridden explicitly for a controlled test. The API key is
+    supplied explicitly or through ``CLASSIFIER_API_KEY``; it is never included
+    in logging, manifests, cache keys, or exception messages.
     """
 
     if not isinstance(endpoint_url, str) or not endpoint_url:
@@ -924,8 +945,8 @@ def run_s3_label_job(
     else:
         configured_state = Path(state_path).expanduser()
 
-    api_url = classifier_api_url or os.environ.get("CLASSIFIER_API_URL", "")
-    model = classifier_model or os.environ.get("CLASSIFIER_MODEL", "")
+    api_url = classifier_api_url or DEFAULT_CLASSIFIER_API_URL
+    model = classifier_model or DEFAULT_CLASSIFIER_MODEL
     api_key = classifier_api_key or os.environ.get("CLASSIFIER_API_KEY", "")
     taxonomy = ScenarioTaxonomy.load(taxonomy_path)
     completion_client = ChatCompletionsClient(
@@ -970,6 +991,8 @@ def run_s3_label_job(
 
 
 __all__ = [
+    "DEFAULT_CLASSIFIER_API_URL",
+    "DEFAULT_CLASSIFIER_MODEL",
     "LabelJobError",
     "LabelJobResult",
     "run_s3_label_job",

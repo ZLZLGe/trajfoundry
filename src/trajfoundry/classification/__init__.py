@@ -14,6 +14,19 @@ from .classifier import (
     TrajectoryClassifier,
 )
 from .client import ChatCompletionsClient
+from .input_projection import (
+    PROJECTION_NAME,
+    TRUNCATION_MARKER,
+    UserInputProjection,
+    project_user_input,
+    serialize_for_model,
+)
+from .input_projection import (
+    TRUNCATION_STRATEGY as USER_INPUT_TRUNCATION_STRATEGY,
+)
+from .input_projection import (
+    VERSION as PROJECTION_VERSION,
+)
 from .taxonomy import (
     L1_KEY_SEPARATOR,
     L1_TAXONOMY_FIELDS,
@@ -33,9 +46,16 @@ __all__ = [
     "L1_TAXONOMY_FIELDS",
     "MAX_CONTEXT_REDUCTIONS",
     "POLICY_SHA256",
+    "PROJECTION_NAME",
+    "PROJECTION_VERSION",
     "PROMPT_VERSION",
+    "TRUNCATION_MARKER",
+    "USER_INPUT_TRUNCATION_STRATEGY",
     "ChatCompletionsClient",
     "ScenarioTaxonomy",
     "TrajectoryClassifier",
+    "UserInputProjection",
     "make_l1_key",
+    "project_user_input",
+    "serialize_for_model",
 ]

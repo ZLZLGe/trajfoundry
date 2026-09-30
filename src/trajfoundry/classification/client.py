@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 
 import orjson
 
-DEFAULT_MAX_OUTPUT_TOKENS = 1_024
+DEFAULT_MAX_OUTPUT_TOKENS = 4_096
 
 
 class ClassificationAPIError(RuntimeError):
@@ -147,6 +147,7 @@ class ChatCompletionsClient:
                 "messages": messages,
                 "temperature": 0,
                 "max_tokens": self.max_output_tokens,
+                "thinking": {"type": "disabled"},
                 "response_format": {"type": "json_object"},
             }
         )

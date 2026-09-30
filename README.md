@@ -269,16 +269,23 @@ is added to a trajectory row.
 
 The bundled scenario taxonomy is versioned by content hash. The model returns
 one L1 `scenario_label_key` and one or two capability names; TrajFoundry
-validates them against the derived L1 catalog. OpenAI-compatible Chat
-Completions configuration is read from `CLASSIFIER_API_URL`, `CLASSIFIER_MODEL`,
-and `CLASSIFIER_API_KEY`.
-The URL must include `/chat/completions`. Keep the key in a worker-side secret
-injection mechanism, never in source, task parameters, or scheduler scripts.
+validates them against the derived L1 catalog. The scheduler defaults to the
+approved `glm-5.3-flash` endpoint at
+`https://token.pjlab.org.cn/v1/chat/completions`; callers may override the URL
+and model explicitly for a controlled test. `CLASSIFIER_API_KEY` remains a
+worker-side secret and is never written to source, results, or logs.
+
+The model receives a projection containing cleaned `role=user` requests only.
+Assistant, tool, system, developer, and harness-generated context is excluded
+from the model input. The projection uses only the current trajectory's own
+`messages`; connected `sub_agent_trajectory` branches are not included. The
+complete normalized row is still preserved in the output, and the
+classification object records the projection and truncation metadata.
 
 The default serialized trajectory context budget is 600,000 characters via
 `max_context_chars`; this is a conservative character envelope for the
 256K-token classifier, not a tokenizer-level limit. The system prompt and
-taxonomy consume additional model context, and the request reserves 1,024
+taxonomy consume additional model context, and the request reserves 4,096
 output tokens. The limit can be overridden explicitly when the configured
 model gateway supports a larger or smaller request. If the gateway still
 reports a context-limit error, the classifier reduces the character budget and
