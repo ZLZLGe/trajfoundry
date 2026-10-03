@@ -1464,7 +1464,6 @@ def _materialize_root_worker(
                         "source_sha256": representative.source_sha256,
                         "captured_at": representative.captured_at,
                     },
-                    "origin_paths": list(job.origin_paths),
                 }
             )
             fd, artifact_path = tempfile.mkstemp(
@@ -1493,7 +1492,7 @@ def _materialize_root_worker(
 
 def _read_materialization_artifact(
     artifact_path: str,
-) -> tuple[TrajectoryNode, _RepresentativeMetadata, tuple[str, ...]]:
+) -> tuple[TrajectoryNode, _RepresentativeMetadata]:
     """Read one worker artifact and reconstruct only the current root."""
 
     path = Path(artifact_path)
@@ -1507,8 +1506,7 @@ def _read_materialization_artifact(
     if not isinstance(document, dict):
         raise TypeError("materialization artifact must contain an object")
     representative = document.get("representative")
-    origin_paths = document.get("origin_paths")
-    if not isinstance(representative, dict) or not isinstance(origin_paths, list):
+    if not isinstance(representative, dict):
         raise TypeError("materialization artifact metadata is invalid")
     metadata = _RepresentativeMetadata(
         source_path=str(representative["source_path"]),
@@ -1516,7 +1514,7 @@ def _read_materialization_artifact(
         captured_at=str(representative["captured_at"]),
     )
     node = TrajectoryNode.model_validate(document["trajectory"])
-    return node, metadata, tuple(str(path) for path in origin_paths)
+    return node, metadata
 
 
 def _build_worker_count(configured: int | None = None) -> int:
@@ -1840,11 +1838,10 @@ def _build_trajectories(
                             try:
                                 _, payload, snapshot, returned_paths = future.result()
                                 if isinstance(payload, str):
-                                    enriched, artifact_snapshot, artifact_paths = (
+                                    enriched, artifact_snapshot = (
                                         _read_materialization_artifact(payload)
                                     )
                                     snapshot = artifact_snapshot
-                                    returned_paths = artifact_paths
                                 else:
                                     enriched = payload
                                 paths = tuple(returned_paths) or origin_paths
