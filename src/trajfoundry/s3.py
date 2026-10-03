@@ -10,6 +10,9 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import os
+import sqlite3
+import tempfile
 import time
 from collections import deque
 from collections.abc import Iterator
@@ -26,6 +29,8 @@ _READ_CHUNK_BYTES = 1024 * 1024
 _DEFAULT_READ_WORKERS = 4
 _MAX_POOL_CONNECTIONS = 8
 _PROGRESS_INTERVAL_SECONDS = 60.0
+_DEFAULT_READ_PREFETCH_BYTES = 512 * 1024 * 1024
+_INVENTORY_INSERT_BATCH = 10_000
 
 LOGGER = logging.getLogger(__name__)
 
@@ -215,6 +220,8 @@ class S3CaptureSource:
         *,
         read_workers: int = _DEFAULT_READ_WORKERS,
         read_prefetch: int | None = None,
+        read_prefetch_bytes: int | None = None,
+        inventory_dir: str | os.PathLike[str] | None = None,
     ) -> None:
         if read_workers <= 0:
             raise ValueError("read workers must be positive")
@@ -222,10 +229,18 @@ class S3CaptureSource:
             read_prefetch = read_workers
         if read_prefetch <= 0:
             raise ValueError("read prefetch must be positive")
+        if read_prefetch_bytes is None:
+            read_prefetch_bytes = _DEFAULT_READ_PREFETCH_BYTES
+        if read_prefetch_bytes <= 0:
+            raise ValueError("read prefetch bytes must be positive")
         self.client = client
         self.location = location
         self.read_workers = read_workers
         self.read_prefetch = read_prefetch
+        self.read_prefetch_bytes = read_prefetch_bytes
+        self.inventory_dir = (
+            None if inventory_dir is None else os.fspath(inventory_dir)
+        )
 
     @property
     def label(self) -> str:
@@ -238,13 +253,54 @@ class S3CaptureSource:
         return frozenset({"freerouter", "tokenplan", "sxf", "deepinfra"})
 
     def iter_captures(self, input_format: InputFormat) -> Iterator[S3Capture]:
-        """Return capture metadata in stable relative-key order."""
+        """Return capture metadata in stable relative-key order.
+
+        Listing is started before this method returns, preserving the
+        historical behavior where listing/service errors are raised at call
+        time.  The returned iterator still streams rows from the temporary
+        inventory instead of materializing all captures in memory.
+        """
+
+        captures = self._iter_captures(input_format)
+        try:
+            first = next(captures)
+        except StopIteration:
+            return iter(())
+
+        def prepend_first() -> Iterator[S3Capture]:
+            try:
+                yield first
+                yield from captures
+            finally:
+                close = getattr(captures, "close", None)
+                if callable(close):
+                    close()
+
+        return prepend_first()
+
+    def _iter_captures(self, input_format: InputFormat) -> Iterator[S3Capture]:
+        """Return capture metadata in stable relative-key order.
+
+        The listing can contain millions of objects.  Keep the inventory in a
+        temporary SQLite file rather than retaining Python objects and a
+        duplicate-detection set for the entire prefix.  The database is
+        deleted when this iterator is exhausted (or closed).
+        """
 
         if input_format not in {"freerouter", "tokenplan", "sxf", "deepinfra"}:
             raise ValueError(f"unsupported input format: {input_format!r}")
 
-        captures: list[S3Capture] = []
-        observed_keys: set[str] = set()
+        inventory_dir = self.inventory_dir
+        if inventory_dir is not None:
+            os.makedirs(inventory_dir, exist_ok=True)
+        fd, inventory_name = tempfile.mkstemp(
+            prefix="trajfoundry-inventory-",
+            suffix=".sqlite",
+            dir=inventory_dir,
+        )
+        os.close(fd)
+        inventory_path = inventory_name
+        connection: sqlite3.Connection | None = None
         paginator = self.client.get_paginator("list_objects_v2")
         pages = paginator.paginate(
             Bucket=self.location.bucket,
@@ -253,75 +309,139 @@ class S3CaptureSource:
         started_at = time.monotonic()
         last_progress_at = started_at
         page_count = 0
-        for page in pages:
-            page_count += 1
-            contents = page.get("Contents", [])
-            if contents is None:
-                contents = []
-            if not isinstance(contents, list):
-                raise TypeError("S3 listing Contents must be a list")
-            for item in contents:
-                if not isinstance(item, dict):
-                    raise TypeError("S3 listing entry must be an object")
-                key = item["Key"]
-                if not isinstance(key, str) or not key.startswith(self.location.prefix):
-                    raise OSError(
-                        "S3 listing returned a key outside the requested prefix"
-                    )
-                if key in observed_keys:
-                    raise OSError("S3 listing returned a duplicate key")
-                observed_keys.add(key)
-                if key.endswith("/"):
-                    continue
-                size = item["Size"]
-                etag = item["ETag"]
-                if not isinstance(size, int) or isinstance(size, bool) or size < 0:
-                    raise TypeError("S3 listing Size must be a non-negative integer")
-                if not isinstance(etag, str) or not etag:
-                    raise TypeError("S3 listing ETag must be a non-empty string")
+        selected_count = 0
+        selected_bytes = 0
+        try:
+            connection = sqlite3.connect(inventory_path)
+            connection.execute("PRAGMA journal_mode=OFF")
+            connection.execute("PRAGMA synchronous=OFF")
+            connection.execute("PRAGMA locking_mode=EXCLUSIVE")
+            connection.execute(
+                """
+                CREATE TABLE inventory (
+                    key TEXT PRIMARY KEY,
+                    source_ref TEXT,
+                    size INTEGER,
+                    etag TEXT,
+                    selected INTEGER NOT NULL
+                ) WITHOUT ROWID
+                """
+            )
+            connection.commit()
+            pending_rows: list[tuple[str, str, int | None, str | None, int]] = []
 
-                source_ref = key[len(self.location.prefix) :]
-                if not source_ref:
-                    continue
-                if self.location.key(source_ref) != key:  # Defensive exact join check.
-                    raise OSError("S3 listing returned an unsafe relative key")
-                basename = source_ref.rsplit("/", 1)[-1]
-                if input_format in {"freerouter", "deepinfra"}:
-                    selected = basename.endswith(".json")
-                elif input_format == "tokenplan":
-                    selected = basename.startswith("req_") and basename.endswith(
-                        ".json"
+            def flush_rows() -> None:
+                if not pending_rows:
+                    return
+                try:
+                    connection.executemany(
+                        "INSERT INTO inventory(key, source_ref, size, etag, selected) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        pending_rows,
                     )
-                else:
-                    selected = basename.endswith(".jsonl.zst")
-                if selected:
-                    captures.append(
-                        S3Capture(
-                            source_ref=source_ref,
-                            key=key,
-                            size=size,
-                            etag=etag,
+                except sqlite3.IntegrityError as error:
+                    raise OSError("S3 listing returned a duplicate key") from error
+                connection.commit()
+                pending_rows.clear()
+
+            for page in pages:
+                page_count += 1
+                contents = page.get("Contents", [])
+                if contents is None:
+                    contents = []
+                if not isinstance(contents, list):
+                    raise TypeError("S3 listing Contents must be a list")
+                for item in contents:
+                    if not isinstance(item, dict):
+                        raise TypeError("S3 listing entry must be an object")
+                    key = item["Key"]
+                    if not isinstance(key, str) or not key.startswith(
+                        self.location.prefix
+                    ):
+                        raise OSError(
+                            "S3 listing returned a key outside the requested prefix"
                         )
+                    if key.endswith("/"):
+                        # Directory markers were previously checked for duplicate
+                        # keys too.  Keep them in the disk-backed inventory so the
+                        # duplicate check remains complete without a Python set.
+                        pending_rows.append((key, "", None, None, 0))
+                        if len(pending_rows) >= _INVENTORY_INSERT_BATCH:
+                            flush_rows()
+                        continue
+                    size = item["Size"]
+                    etag = item["ETag"]
+                    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                        raise TypeError("S3 listing Size must be a non-negative integer")
+                    if not isinstance(etag, str) or not etag:
+                        raise TypeError("S3 listing ETag must be a non-empty string")
+
+                    source_ref = key[len(self.location.prefix) :]
+                    if not source_ref:
+                        continue
+                    if self.location.key(source_ref) != key:  # Defensive exact join check.
+                        raise OSError("S3 listing returned an unsafe relative key")
+                    basename = source_ref.rsplit("/", 1)[-1]
+                    if input_format in {"freerouter", "deepinfra"}:
+                        selected = basename.endswith(".json")
+                    elif input_format == "tokenplan":
+                        selected = basename.startswith("req_") and basename.endswith(
+                            ".json"
+                        )
+                    else:
+                        selected = basename.endswith(".jsonl.zst")
+                    pending_rows.append((key, source_ref, size, etag, int(selected)))
+                    if selected:
+                        selected_count += 1
+                        selected_bytes += size
+                    if len(pending_rows) >= _INVENTORY_INSERT_BATCH:
+                        flush_rows()
+
+                flush_rows()
+                now = time.monotonic()
+                if page_count == 1 or now - last_progress_at >= _PROGRESS_INTERVAL_SECONDS:
+                    LOGGER.info(
+                        "【输入清单】已扫描分页=%d，已发现候选对象=%d，候选字节=%d，耗时=%.1f秒",
+                        page_count,
+                        selected_count,
+                        selected_bytes,
+                        now - started_at,
                     )
+                    last_progress_at = now
 
-            now = time.monotonic()
-            if page_count == 1 or now - last_progress_at >= _PROGRESS_INTERVAL_SECONDS:
-                LOGGER.info(
-                    "【输入清单】已扫描分页=%d，已发现候选对象=%d，耗时=%.1f秒",
-                    page_count,
-                    len(captures),
-                    now - started_at,
+            # The primary key detects duplicates only when rows are inserted.
+            # Querying this index also avoids materializing all captures in RAM.
+            connection.execute(
+                "CREATE INDEX inventory_source_ref_idx ON inventory(source_ref) "
+                "WHERE selected = 1"
+            )
+            connection.commit()
+            LOGGER.info(
+                "【输入清单】扫描完成：分页=%d，候选对象=%d，候选字节=%d，清单文件=%.1fMiB，耗时=%.1f秒",
+                page_count,
+                selected_count,
+                selected_bytes,
+                os.path.getsize(inventory_path) / 1024**2,
+                time.monotonic() - started_at,
+            )
+            rows = connection.execute(
+                "SELECT source_ref, key, size, etag FROM inventory "
+                "WHERE selected = 1 ORDER BY source_ref"
+            )
+            for source_ref, key, size, etag in rows:
+                yield S3Capture(
+                    source_ref=source_ref,
+                    key=key,
+                    size=size,
+                    etag=etag,
                 )
-                last_progress_at = now
-
-        captures.sort(key=lambda capture: capture.source_ref)
-        LOGGER.info(
-            "【输入清单】扫描完成：分页=%d，候选对象=%d，耗时=%.1f秒",
-            page_count,
-            len(captures),
-            time.monotonic() - started_at,
-        )
-        return iter(captures)
+        finally:
+            if connection is not None:
+                connection.close()
+            try:
+                os.unlink(inventory_path)
+            except FileNotFoundError:
+                pass
 
     def iter_capture_payloads(
         self, input_format: InputFormat
@@ -399,27 +519,70 @@ class S3CaptureSource:
             max_workers=self.read_workers,
             thread_name_prefix="trajfoundry-s3-read",
         )
-        pending: deque[tuple[S3Capture, Future[tuple[bytes, str]]]] = deque()
+        pending: deque[tuple[S3Capture, int, Future[tuple[bytes, str]]]] = deque()
+        pending_bytes = 0
+        peak_pending_bytes = 0
+        submitted = 0
+        completed = 0
+        completed_bytes = 0
+        deferred_capture: S3Capture | None = None
+        started_at = time.monotonic()
+        last_progress_at = started_at
 
         def fill() -> None:
+            nonlocal deferred_capture, pending_bytes, peak_pending_bytes, submitted
             while len(pending) < self.read_prefetch:
-                try:
-                    capture = next(captures)
-                except StopIteration:
+                if deferred_capture is None:
+                    try:
+                        deferred_capture = next(captures)
+                    except StopIteration:
+                        return
+                capture = deferred_capture
+                reservation = max(capture.size, 1)
+                # Permit one oversized object so a single large capture cannot
+                # deadlock the iterator, but never submit another object while
+                # the byte budget is full.
+                if pending and pending_bytes + reservation > self.read_prefetch_bytes:
                     return
+                deferred_capture = None
                 pending.append(
-                    (capture, executor.submit(self.read_capture_bytes, capture))
+                    (capture, reservation, executor.submit(self.read_capture_bytes, capture))
                 )
+                pending_bytes += reservation
+                peak_pending_bytes = max(peak_pending_bytes, pending_bytes)
+                submitted += 1
 
         try:
             fill()
             while pending:
-                capture, future = pending.popleft()
+                capture, reservation, future = pending.popleft()
+                pending_bytes -= reservation
                 payload, digest = future.result()
+                completed += 1
+                completed_bytes += len(payload)
                 fill()
                 yield capture.source_ref, payload, digest
+                now = time.monotonic()
+                if now - last_progress_at >= _PROGRESS_INTERVAL_SECONDS:
+                    LOGGER.info(
+                        "【读取预取】已提交=%d，已完成=%d，等待任务=%d，等待字节=%d，峰值等待字节=%d，耗时=%.1f秒",
+                        submitted,
+                        completed,
+                        len(pending),
+                        pending_bytes,
+                        peak_pending_bytes,
+                        now - started_at,
+                    )
+                    last_progress_at = now
+            LOGGER.info(
+                "【读取预取】完成：对象=%d，读取字节=%d，峰值等待字节=%d，耗时=%.1f秒",
+                completed,
+                completed_bytes,
+                peak_pending_bytes,
+                time.monotonic() - started_at,
+            )
         finally:
-            for _, future in pending:
+            for _, _, future in pending:
                 future.cancel()
             executor.shutdown(wait=True, cancel_futures=True)
 
@@ -446,11 +609,22 @@ class S3CaptureSource:
         digest = hashlib.sha256()
         try:
             while True:
-                chunk = body.read(_READ_CHUNK_BYTES)
+                # Keep an inaccurate/changed ContentLength from causing an
+                # unbounded bytearray before the metadata check below.  Read at
+                # most one byte beyond the advertised size so we can still
+                # detect an oversized response.
+                remaining = capture.size - len(payload)
+                chunk = body.read(
+                    min(_READ_CHUNK_BYTES, remaining + 1)
+                    if remaining >= 0
+                    else _READ_CHUNK_BYTES
+                )
                 if not chunk:
                     break
                 if not isinstance(chunk, bytes):
                     raise TypeError("S3 response body must yield bytes")
+                if len(payload) + len(chunk) > capture.size:
+                    raise OSError("S3 capture size changed while it was being read")
                 payload.extend(chunk)
                 digest.update(chunk)
         finally:

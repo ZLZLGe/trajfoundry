@@ -12,7 +12,7 @@ import sqlite3
 import time
 import uuid
 from collections import defaultdict, deque
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
@@ -43,6 +43,7 @@ from .models import (
     ToolDefinition,
     TrajectoryNode,
 )
+from .observability import memory_summary
 from .providers.anthropic import parse_anthropic_capture
 from .providers.chat import parse_chat_capture
 from .providers.responses import parse_responses_capture
@@ -67,6 +68,9 @@ DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 _INGEST_BATCH_ITEMS = 512
 _INGEST_BATCH_BYTES = 64 * 1024 * 1024
+_INGEST_PARSE_QUEUE_BYTES = 512 * 1024 * 1024
+_INGEST_PARSE_RESERVATION_FACTOR = 4
+_INGEST_PARSE_MIN_RESERVATION = 256 * 1024
 _TRAJECTORY_BUILD_SKIP_REASON = "trajectory_materialization_failed"
 _BUILD_WORKERS_ENV = "TRAJFOUNDRY_BUILD_WORKERS"
 _PROGRESS_INTERVAL_SECONDS = 60.0
@@ -1006,10 +1010,11 @@ def _snapshots_for_paths(state: StateStore, paths: Iterable[str]) -> Iterable[Sn
     yield from state.iter_snapshots_for_paths(paths)
 
 
-def _descendants(plan: SubagentMountPlan, root_index: int) -> set[int]:
-    children: dict[int, list[int]] = defaultdict(list)
-    for edge in plan.edges:
-        children[edge.parent_index].append(edge.child_index)
+def _descendants(
+    children: Mapping[int, Sequence[int]], root_index: int
+) -> set[int]:
+    """Return one root's connected component from a prebuilt edge index."""
+
     found: set[int] = set()
     pending = [root_index]
     while pending:
@@ -1019,6 +1024,235 @@ def _descendants(plan: SubagentMountPlan, root_index: int) -> set[int]:
         found.add(index)
         pending.extend(children.get(index, ()))
     return found
+
+
+def _root_materialization_inputs(
+    children_by_parent: Mapping[int, Sequence[int]],
+    leaves_by_index: Mapping[int, _FlatLeaf],
+    root_index: int,
+) -> tuple[set[int], tuple[str, ...]]:
+    descendants = _descendants(children_by_parent, root_index)
+    origin_paths = tuple(
+        sorted(
+            {
+                path
+                for index in descendants
+                for path in leaves_by_index[index].contributor_paths
+            }
+        )
+    )
+    return descendants, origin_paths
+
+
+def _materialization_job(
+    *,
+    state_path: Path,
+    immutable_state: bool,
+    root_index: int,
+    is_subagent: bool,
+    children_by_parent: Mapping[int, Sequence[int]],
+    leaves_by_index: Mapping[int, _FlatLeaf],
+    graph_issues: Mapping[int, Sequence[AuditIssue]],
+    edges_by_parent: Mapping[int, Sequence[tuple[str, int, str]]],
+) -> tuple[_MaterializationJob, tuple[str, ...], bool]:
+    descendants, origin_paths = _root_materialization_inputs(
+        children_by_parent, leaves_by_index, root_index
+    )
+    return (
+        _MaterializationJob(
+            state_path=str(state_path),
+            immutable_state=immutable_state,
+            root_index=root_index,
+            is_subagent=is_subagent,
+            leaves={
+                index: _MaterializationLeaf(
+                    source_path=leaves_by_index[index].routing_snapshot.source_path,
+                    contributor_paths=tuple(
+                        sorted(leaves_by_index[index].contributor_paths)
+                    ),
+                    issues=tuple(leaves_by_index[index].issues.values()),
+                )
+                for index in descendants
+            },
+            graph_issues={
+                index: tuple(graph_issues.get(index, ())) for index in descendants
+            },
+            edges_by_parent={
+                index: tuple(edges_by_parent.get(index, ())) for index in descendants
+            },
+            origin_paths=origin_paths,
+        ),
+        origin_paths,
+        is_subagent,
+    )
+
+
+def _iter_materialization_jobs(
+    root_specs: Sequence[tuple[int, bool]],
+    *,
+    state_path: Path,
+    immutable_state: bool,
+    children_by_parent: Mapping[int, Sequence[int]],
+    leaves_by_index: Mapping[int, _FlatLeaf],
+    graph_issues: Mapping[int, Sequence[AuditIssue]],
+    edges_by_parent: Mapping[int, Sequence[tuple[str, int, str]]],
+    scope: tuple[str, str],
+) -> Iterator[tuple[_MaterializationJob, tuple[str, ...], bool]]:
+    """Lazily assemble bounded root jobs for the build process pool."""
+
+    root_total = len(root_specs)
+    for root_number, (root_index, is_subagent) in enumerate(root_specs, start=1):
+        item = _materialization_job(
+            state_path=state_path,
+            immutable_state=immutable_state,
+            root_index=root_index,
+            is_subagent=is_subagent,
+            children_by_parent=children_by_parent,
+            leaves_by_index=leaves_by_index,
+            graph_issues=graph_issues,
+            edges_by_parent=edges_by_parent,
+        )
+        _log_materialization_job(
+            item[0],
+            scope=scope,
+            root_number=root_number,
+            root_total=root_total,
+            stage="提交前",
+        )
+        yield item
+
+
+def _materialization_job_stats(
+    job: _MaterializationJob,
+) -> tuple[int, int, int, int, int]:
+    """Return cheap size counters for one root's process-boundary payload.
+
+    This is intentionally an estimate rather than ``pickle.dumps(job)``:
+    serializing a large root only for telemetry would recreate the memory
+    spike that the lazy-job queue is meant to avoid.  The counters are still
+    useful for identifying oversized roots and for correlating them with RSS.
+    """
+
+    return _materialization_size_stats(
+        descendant_indices=job.leaves,
+        contributor_paths={
+            index: leaf.contributor_paths for index, leaf in job.leaves.items()
+        },
+        source_paths={
+            index: leaf.source_path for index, leaf in job.leaves.items()
+        },
+        leaf_issue_counts={
+            index: len(leaf.issues) for index, leaf in job.leaves.items()
+        },
+        graph_issue_counts={
+            index: len(issues) for index, issues in job.graph_issues.items()
+        },
+        edges_by_parent=job.edges_by_parent,
+        origin_paths=job.origin_paths,
+    )
+
+
+def _materialization_size_stats(
+    *,
+    descendant_indices: Mapping[int, object],
+    contributor_paths: Mapping[int, Sequence[str]],
+    source_paths: Mapping[int, str],
+    leaf_issue_counts: Mapping[int, int],
+    graph_issue_counts: Mapping[int, int],
+    edges_by_parent: Mapping[int, Sequence[tuple[str, int, str]]],
+    origin_paths: Sequence[str],
+) -> tuple[int, int, int, int, int]:
+    """Estimate root descriptor size without constructing a process payload."""
+
+    leaf_count = len(descendant_indices)
+    contributor_count = sum(len(paths) for paths in contributor_paths.values())
+    issue_count = sum(leaf_issue_counts.values()) + sum(graph_issue_counts.values())
+    edge_count = sum(len(edges) for edges in edges_by_parent.values())
+    path_bytes = sum(len(path.encode("utf-8")) for path in origin_paths)
+    path_bytes += sum(len(path.encode("utf-8")) for path in source_paths.values())
+    path_bytes += sum(
+        len(path.encode("utf-8"))
+        for paths in contributor_paths.values()
+        for path in paths
+    )
+    estimated_bytes = (
+        path_bytes
+        + leaf_count * 128
+        + issue_count * 256
+        + edge_count * 96
+        + len(origin_paths) * 64
+    )
+    return leaf_count, contributor_count, edge_count, issue_count, estimated_bytes
+
+
+def _log_materialization_job(
+    job: _MaterializationJob,
+    *,
+    scope: tuple[str, str],
+    root_number: int,
+    root_total: int,
+    stage: str,
+) -> None:
+    """Log root descriptor counters and coordinator RSS for build diagnostics."""
+
+    leaf_count, contributor_count, edge_count, issue_count, estimated_bytes = (
+        _materialization_job_stats(job)
+    )
+    _log_materialization_stats(
+        scope=scope,
+        root_number=root_number,
+        root_total=root_total,
+        stage=stage,
+        leaf_count=leaf_count,
+        contributor_count=contributor_count,
+        edge_count=edge_count,
+        issue_count=issue_count,
+        origin_count=len(job.origin_paths),
+        estimated_bytes=estimated_bytes,
+    )
+
+
+def _log_materialization_stats(
+    *,
+    scope: tuple[str, str],
+    root_number: int,
+    root_total: int,
+    stage: str,
+    leaf_count: int,
+    contributor_count: int,
+    edge_count: int,
+    issue_count: int,
+    origin_count: int,
+    estimated_bytes: int,
+) -> None:
+    """Emit one root's descriptor counters and current coordinator RSS."""
+
+    # INFO is useful for ordinary-sized scopes, while DEBUG avoids producing
+    # millions of log lines for a very large batch.  Every root remains
+    # observable when debug logging is enabled; oversized roots are always
+    # promoted to INFO because they are the likely OOM culprits.
+    level = (
+        logging.INFO
+        if root_total <= 1_000 or estimated_bytes >= 64 * 1024 * 1024
+        else logging.DEBUG
+    )
+    LOGGER.log(
+        level,
+        "【构建阶段】范围=%s:%s 根=%d/%d 阶段=%s 叶=%d 来源=%d 边=%d 问题=%d "
+        "来源数=%d 任务估计=%dMiB 资源=%s",
+        scope[0],
+        scope[1],
+        root_number,
+        root_total,
+        stage,
+        leaf_count,
+        contributor_count,
+        edge_count,
+        issue_count,
+        origin_count,
+        estimated_bytes / 1024**2,
+        memory_summary(),
+    )
 
 
 def _store_trajectory(
@@ -1301,7 +1535,7 @@ def _build_trajectories(
         elapsed = max(now - started_at, 0.001)
         LOGGER.info(
             "【构建阶段】已完成范围=%d/%d，已处理根轨迹=%d，已生成轨迹=%d，"
-            "失败跳过=%d，耗时=%.1f秒，范围速度=%.2f个/秒",
+            "失败跳过=%d，耗时=%.1f秒，范围速度=%.2f个/秒，资源=%s",
             completed_scopes,
             total_scopes,
             completed_roots,
@@ -1309,6 +1543,7 @@ def _build_trajectories(
             failed_roots,
             elapsed,
             completed_scopes / elapsed,
+            memory_summary(),
         )
         last_progress_at = now
 
@@ -1403,6 +1638,10 @@ def _build_trajectories(
                 edges_by_parent[edge.parent_index].append(
                     (edge.spawn_call_id, edge.child_index, edge.relay_id)
                 )
+            children_by_parent: dict[int, tuple[int, ...]] = {
+                parent_index: tuple(child_index for _, child_index, _ in edges)
+                for parent_index, edges in edges_by_parent.items()
+            }
         except Exception as error:  # noqa: BLE001 - skip one broken scope
             failed_paths.update(all_flat_paths)
             _log_trajectory_build_failure(error, all_flat_paths)
@@ -1415,69 +1654,38 @@ def _build_trajectories(
         # SQLite snapshot and return enriched trees.  Jobs are assembled with
         # root-local graph slices so large scopes are not pickled repeatedly.
         worker_count = _build_worker_count(build_workers)
-        root_specs: list[tuple[int, tuple[str, ...], bool]] = []
+        root_specs: list[tuple[int, bool]] = []
         for root_index, is_subagent in [
             *((index, False) for index in plan.main_root_indices),
             *((index, True) for index in plan.orphan_indices),
         ]:
-            descendants = _descendants(plan, root_index)
-            origin_paths = tuple(
-                sorted(
-                    {
-                        path
-                        for index in descendants
-                        for path in leaves_by_index[index].contributor_paths
-                    }
-                )
-            )
-            root_specs.append((root_index, origin_paths, is_subagent))
+            root_specs.append((root_index, is_subagent))
 
         # Keep a single root in-process even when a larger worker count is
         # configured; process startup and SQLite handoff would otherwise cost
         # more than the materialization itself.
         use_pool = worker_count > 1 and len(root_specs) > 1
-        root_jobs: list[tuple[_MaterializationJob, tuple[str, ...], bool]] = []
+        root_jobs: Iterable[tuple[_MaterializationJob, tuple[str, ...], bool]] = ()
         if use_pool:
             state_path = _state_database_path(state)
             immutable_state = _state_database_is_immutable(state)
-            for root_index, origin_paths, is_subagent in root_specs:
-                descendants = _descendants(plan, root_index)
-                root_jobs.append(
-                    (
-                        _MaterializationJob(
-                            state_path=str(state_path),
-                            immutable_state=immutable_state,
-                            root_index=root_index,
-                            is_subagent=is_subagent,
-                            leaves={
-                                index: _MaterializationLeaf(
-                                    source_path=leaves_by_index[index]
-                                    .routing_snapshot.source_path,
-                                    contributor_paths=tuple(
-                                        sorted(leaves_by_index[index].contributor_paths)
-                                    ),
-                                    issues=tuple(leaves_by_index[index].issues.values()),
-                                )
-                                for index in descendants
-                            },
-                            graph_issues={
-                                index: tuple(graph_issues.get(index, ()))
-                                for index in descendants
-                            },
-                            edges_by_parent={
-                                index: tuple(edges_by_parent.get(index, ()))
-                                for index in descendants
-                            },
-                            origin_paths=origin_paths,
-                        ),
-                        origin_paths,
-                        is_subagent,
-                    )
-                )
+            root_jobs = _iter_materialization_jobs(
+                root_specs,
+                state_path=state_path,
+                immutable_state=immutable_state,
+                children_by_parent=children_by_parent,
+                leaves_by_index=leaves_by_index,
+                graph_issues=graph_issues,
+                edges_by_parent=edges_by_parent,
+                scope=scope,
+            )
 
         with state.write_batch():
             if not use_pool:
-                for root_index, origin_paths, is_subagent in root_specs:
+                for root_index, is_subagent in root_specs:
+                    _, origin_paths = _root_materialization_inputs(
+                        children_by_parent, leaves_by_index, root_index
+                    )
                     try:
                         node, snapshot = (
                             _load_flat_node(
@@ -1536,13 +1744,13 @@ def _build_trajectories(
                 ) as pool:
                     iterator = iter(root_jobs)
                     futures: list[tuple[tuple[_MaterializationJob, tuple[str, ...], bool], Any]] = []
-                    for _ in range(min(worker_count * 2, len(root_jobs))):
+                    for _ in range(worker_count * 2):
                         item = next(iterator, None)
                         if item is None:
                             break
                         futures.append((item, pool.submit(_materialize_root_worker, item[0])))
                     while futures:
-                        (_, origin_paths, _), future = futures.pop(0)
+                        (job, origin_paths, _), future = futures.pop(0)
                         paths = origin_paths
                         try:
                             _, enriched, snapshot, returned_paths = future.result()
@@ -1559,6 +1767,13 @@ def _build_trajectories(
                             failed_roots += 1
                             failed_paths.update(paths)
                             _log_trajectory_build_failure(error, paths)
+                        _log_materialization_job(
+                            job,
+                            scope=scope,
+                            root_number=job.root_index,
+                            root_total=len(root_specs),
+                            stage="完成",
+                        )
                         log_progress()
                         item = next(iterator, None)
                         if item is not None:
@@ -1752,6 +1967,14 @@ def _ingest_source(
     started_at = time.monotonic()
     last_progress_at = started_at
     LOGGER.info("【读取阶段】开始读取输入数据")
+    parse_queue_budget = _INGEST_PARSE_QUEUE_BYTES
+    LOGGER.info(
+        "【读取阶段】解析队列配置：进程=%d，任务上限=%d，字节上限=%dMiB，预估系数=%d",
+        parse_workers,
+        max(parse_workers * 4, 16),
+        parse_queue_budget // 1024**2,
+        _INGEST_PARSE_RESERVATION_FACTOR,
+    )
 
     def log_progress(*, force: bool = False) -> None:
         nonlocal last_progress_at
@@ -1765,13 +1988,15 @@ def _ingest_source(
         rate = stats.discovered / elapsed
         LOGGER.info(
             "【读取阶段】已发现=%d，已解析=%d，已复用=%d，解析失败=%d，"
-            "耗时=%.1f秒，速度=%.1f对象/秒",
+            "输入字节=%d，耗时=%.1f秒，速度=%.1f对象/秒，资源=%s",
             stats.discovered,
             stats.parsed,
             stats.reused,
             stats.parse_failures,
+            stats.input_bytes,
             elapsed,
             rate,
+            memory_summary(),
         )
         last_progress_at = now
 
@@ -1933,8 +2158,10 @@ def _ingest_source(
             # JSON decoding/provider adaptation is forked, so no worker ever
             # touches a shared SQLite connection or boto client.  Results are
             # consumed in source order to preserve deterministic state rows.
-            pending: deque[tuple[int, Any]] = deque()
+            pending: deque[tuple[int, int, Any]] = deque()
             pending_bytes = 0
+            peak_pending_bytes = 0
+            peak_pending_tasks = 0
             pending_limit = max(parse_workers * 4, 16)
 
             def drain_parse(*, force: bool = False) -> None:
@@ -1942,10 +2169,10 @@ def _ingest_source(
                 while pending and (
                     force
                     or len(pending) >= pending_limit
-                    or pending_bytes >= _INGEST_BATCH_BYTES
+                    or pending_bytes >= parse_queue_budget
                 ):
-                    payload_bytes, future = pending.popleft()
-                    pending_bytes -= payload_bytes
+                    reserved_bytes, payload_bytes, future = pending.popleft()
+                    pending_bytes -= reserved_bytes
                     process_parse_result(future.result())
                     rotate_batch(payload_bytes)
 
@@ -1955,7 +2182,7 @@ def _ingest_source(
                 payload: bytes,
                 digest: str,
             ) -> None:
-                nonlocal pending_bytes
+                nonlocal pending_bytes, peak_pending_bytes, peak_pending_tasks
                 stats.discovered += 1
                 stats.input_bytes += len(payload)
                 if state.capture_matches(source_ref, digest):
@@ -1963,8 +2190,17 @@ def _ingest_source(
                     rotate_batch(len(payload))
                     log_progress()
                     return
+                # A parsed Snapshot is compressed before crossing the process
+                # boundary, but it can be larger than the input envelope.  A
+                # conservative reservation keeps both worker inputs and
+                # completed results bounded without reducing parse workers.
+                reserved_bytes = max(
+                    len(payload) * _INGEST_PARSE_RESERVATION_FACTOR,
+                    _INGEST_PARSE_MIN_RESERVATION,
+                )
                 pending.append(
                     (
+                        reserved_bytes,
                         len(payload),
                         executor.submit(
                             _parse_ingest_payload,
@@ -1975,7 +2211,9 @@ def _ingest_source(
                         ),
                     )
                 )
-                pending_bytes += len(payload)
+                pending_bytes += reserved_bytes
+                peak_pending_bytes = max(peak_pending_bytes, pending_bytes)
+                peak_pending_tasks = max(peak_pending_tasks, len(pending))
                 drain_parse()
 
             with ProcessPoolExecutor(
@@ -2011,6 +2249,12 @@ def _ingest_source(
                             continue
                         submit_parse(executor, source_ref, payload, digest)
                 drain_parse(force=True)
+                LOGGER.info(
+                    "【读取阶段】解析队列完成：峰值任务=%d，峰值预估字节=%d，字节上限=%d",
+                    peak_pending_tasks,
+                    peak_pending_bytes,
+                    parse_queue_budget,
+                )
         else:
             streaming = getattr(source, "iter_capture_payloads", None)
             payload_formats = getattr(source, "payload_formats", frozenset({"sxf"}))

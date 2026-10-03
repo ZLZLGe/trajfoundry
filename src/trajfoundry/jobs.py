@@ -13,6 +13,7 @@ import orjson
 
 from .credentials import DEFAULT_S3_CREDENTIALS_PATH, load_s3_credentials
 from .json_codec import loads
+from .observability import memory_summary
 from .pipeline import PipelineConfig, PipelineStats, normalize, normalize_source
 from .s3 import S3CaptureSource, S3Location, create_s3_client, parse_s3_uri
 from .s3_output import S3OutputSet
@@ -156,20 +157,27 @@ def _run_s3_job_with_client(
     validation_workers: int = 1,
     read_workers: int = 128,
     read_prefetch: int | None = None,
+    read_prefetch_bytes: int | None = None,
     parse_workers: int = 16,
 ) -> JobResult:
     started_at = time.monotonic()
     LOGGER.info(
-        "【任务开始】输入格式=%s，读取并发=%d，读取预取=%s，解析并发=%d，"
+        "【任务开始】输入格式=%s，读取并发=%d，读取预取=%s，读取预取字节=%s，解析并发=%d，"
         "构建并发=%d，上传并发=%d，校验并发=%d",
         input_format,
         read_workers,
         read_prefetch if read_prefetch is not None else read_workers,
+        (
+            f"{read_prefetch_bytes / 1024**2:.0f}MiB"
+            if read_prefetch_bytes is not None
+            else "512MiB(默认)"
+        ),
         parse_workers,
         build_workers,
         output_workers,
         validation_workers,
     )
+    LOGGER.info("【资源监控】任务开始：%s", memory_summary())
     # Existing flat objects are retained while the candidate is being built so
     # validation can ignore files from the previous publication.  They are
     # removed after the new manifest is published.  In particular, do not read
@@ -180,13 +188,15 @@ def _run_s3_job_with_client(
         "【任务开始】已有输出轨迹文件=%d，准备读取输入数据",
         len(listed_flat_paths),
     )
-    source = S3CaptureSource(
-        client,
-        input_location,
-        read_workers=read_workers,
-        read_prefetch=read_prefetch,
-    )
     with TemporaryDirectory(prefix="trajfoundry-state-", dir=workspace) as directory:
+        source = S3CaptureSource(
+            client,
+            input_location,
+            read_workers=read_workers,
+            read_prefetch=read_prefetch,
+            read_prefetch_bytes=read_prefetch_bytes,
+            inventory_dir=directory,
+        )
         stats, manifest_bytes = normalize_source(
             source,
             input_format=input_format,
@@ -218,6 +228,7 @@ def _run_s3_job_with_client(
         stats.build_seconds,
         stats.export_seconds,
     )
+    LOGGER.info("【资源监控】读取与构建完成：%s", memory_summary())
 
     current_flat_paths = _flat_manifest_jsonl_paths(manifest_bytes)
     validation_backend = S3ValidationBackend(
@@ -247,6 +258,7 @@ def _run_s3_job_with_client(
         len(report.errors),
         stats.validation_seconds,
     )
+    LOGGER.info("【资源监控】输出校验完成：%s", memory_summary())
     if not report.valid:
         raise JobValidationError(output_location.uri, report)
 
@@ -307,6 +319,7 @@ def _run_s3_job_with_client(
         report.counts.get("skipped_inputs", 0),
         "通过" if report.valid else "失败",
     )
+    LOGGER.info("【资源监控】任务完成：%s", memory_summary())
     return JobResult(stats=stats, validation=report)
 
 
@@ -419,6 +432,7 @@ def run_s3_job(
     validation_workers: int = 1,
     read_workers: int = 128,
     read_prefetch: int | None = None,
+    read_prefetch_bytes: int | None = None,
     parse_workers: int = 16,
 ) -> JobResult:
     """Normalize an S3 prefix directly into a flat S3 output prefix.
@@ -431,7 +445,9 @@ def run_s3_job(
     ``credentials_path=None`` only when the standard AWS SDK chain is intended.
     ``read_workers`` controls concurrent S3 GETs and ``parse_workers`` controls
     CPU-bound decode/adaptation workers; SQLite writes remain ordered in the
-    coordinator process.
+    coordinator process. ``read_prefetch_bytes`` bounds the total advertised
+    payload size retained by the S3 read queue. The temporary inventory and
+    SQLite state are created below ``workspace_parent`` and removed on exit.
     """
 
     if input_format not in {"freerouter", "tokenplan", "sxf", "deepinfra"}:
@@ -452,6 +468,8 @@ def run_s3_job(
         raise ValueError("read_workers must be positive")
     if read_prefetch is not None and read_prefetch <= 0:
         raise ValueError("read_prefetch must be positive")
+    if read_prefetch_bytes is not None and read_prefetch_bytes <= 0:
+        raise ValueError("read_prefetch_bytes must be positive")
     if parse_workers <= 0:
         raise ValueError("parse_workers must be positive")
 
@@ -504,6 +522,7 @@ def run_s3_job(
             validation_workers=validation_workers,
             read_workers=read_workers,
             read_prefetch=read_prefetch,
+            read_prefetch_bytes=read_prefetch_bytes,
             parse_workers=parse_workers,
         )
     finally:
