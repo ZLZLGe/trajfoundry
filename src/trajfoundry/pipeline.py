@@ -8,7 +8,9 @@ import json
 import logging
 import multiprocessing
 import os
+import shutil
 import sqlite3
+import tempfile
 import time
 import uuid
 from collections import defaultdict, deque
@@ -27,6 +29,7 @@ from .canonical import (
 )
 from .export import SCHEMA_VERSION, OutputSet
 from .io import CaptureSource, LocalCaptureSource, decode_capture
+from .json_codec import loads
 from .models import (
     AgentMessageRecord,
     AuditIssue,
@@ -226,6 +229,16 @@ class _MaterializationJob:
     graph_issues: dict[int, tuple[AuditIssue, ...]]
     edges_by_parent: dict[int, tuple[tuple[str, int, str], ...]]
     origin_paths: tuple[str, ...]
+    artifact_dir: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RepresentativeMetadata:
+    """The provenance fields needed after a worker artifact is reloaded."""
+
+    source_path: str
+    source_sha256: str
+    captured_at: str
 
 
 def config_hash(config: PipelineConfig) -> str:
@@ -1054,6 +1067,7 @@ def _materialization_job(
     leaves_by_index: Mapping[int, _FlatLeaf],
     graph_issues: Mapping[int, Sequence[AuditIssue]],
     edges_by_parent: Mapping[int, Sequence[tuple[str, int, str]]],
+    artifact_dir: str | None = None,
 ) -> tuple[_MaterializationJob, tuple[str, ...], bool]:
     descendants, origin_paths = _root_materialization_inputs(
         children_by_parent, leaves_by_index, root_index
@@ -1081,6 +1095,7 @@ def _materialization_job(
                 index: tuple(edges_by_parent.get(index, ())) for index in descendants
             },
             origin_paths=origin_paths,
+            artifact_dir=artifact_dir,
         ),
         origin_paths,
         is_subagent,
@@ -1097,6 +1112,7 @@ def _iter_materialization_jobs(
     graph_issues: Mapping[int, Sequence[AuditIssue]],
     edges_by_parent: Mapping[int, Sequence[tuple[str, int, str]]],
     scope: tuple[str, str],
+    artifact_dir: str | None = None,
 ) -> Iterator[tuple[_MaterializationJob, tuple[str, ...], bool]]:
     """Lazily assemble bounded root jobs for the build process pool."""
 
@@ -1111,6 +1127,7 @@ def _iter_materialization_jobs(
             leaves_by_index=leaves_by_index,
             graph_issues=graph_issues,
             edges_by_parent=edges_by_parent,
+            artifact_dir=artifact_dir,
         )
         _log_materialization_job(
             item[0],
@@ -1258,7 +1275,7 @@ def _log_materialization_stats(
 def _store_trajectory(
     state: StateStore,
     node: TrajectoryNode,
-    representative: Snapshot,
+    representative: Snapshot | _RepresentativeMetadata,
     origins: Sequence[dict[str, str]],
 ) -> None:
     audit = node.normalization_audit or _initial_audit([])
@@ -1368,7 +1385,7 @@ def _read_snapshot_for_worker(
 
 def _materialize_root_worker(
     job: _MaterializationJob,
-) -> tuple[int, TrajectoryNode, Snapshot, tuple[str, ...]]:
+) -> tuple[int, TrajectoryNode | str, Snapshot | _RepresentativeMetadata, tuple[str, ...]]:
     """Materialize and enrich one root in an isolated process.
 
     The SQLite state is immutable during this phase.  Each worker opens its own
@@ -1433,9 +1450,73 @@ def _materialize_root_worker(
             top_level=True,
             is_subagent=job.is_subagent,
         )
+        if job.artifact_dir:
+            # Do not return the full Pydantic graph through the process pipe.
+            # A completed future would otherwise retain that graph in the
+            # coordinator until all earlier roots have been persisted.  The
+            # artifact is local to this task and is removed by the coordinator
+            # immediately after consumption.
+            document = canonical_json(
+                {
+                    "trajectory": enriched.model_dump(mode="json", exclude_none=False),
+                    "representative": {
+                        "source_path": representative.source_path,
+                        "source_sha256": representative.source_sha256,
+                        "captured_at": representative.captured_at,
+                    },
+                    "origin_paths": list(job.origin_paths),
+                }
+            )
+            fd, artifact_path = tempfile.mkstemp(
+                prefix=f"root-{job.root_index}-",
+                suffix=".json.zst",
+                dir=job.artifact_dir,
+            )
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(_compress_payload(document))
+            except BaseException:
+                try:
+                    os.unlink(artifact_path)
+                except FileNotFoundError:
+                    pass
+                raise
+            return job.root_index, artifact_path, _RepresentativeMetadata(
+                source_path=representative.source_path,
+                source_sha256=representative.source_sha256,
+                captured_at=representative.captured_at,
+            ), job.origin_paths
         return job.root_index, enriched, representative, job.origin_paths
     finally:
         connection.close()
+
+
+def _read_materialization_artifact(
+    artifact_path: str,
+) -> tuple[TrajectoryNode, _RepresentativeMetadata, tuple[str, ...]]:
+    """Read one worker artifact and reconstruct only the current root."""
+
+    path = Path(artifact_path)
+    try:
+        document = loads(_decompress_payload(path.read_bytes()))
+    finally:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    if not isinstance(document, dict):
+        raise TypeError("materialization artifact must contain an object")
+    representative = document.get("representative")
+    origin_paths = document.get("origin_paths")
+    if not isinstance(representative, dict) or not isinstance(origin_paths, list):
+        raise TypeError("materialization artifact metadata is invalid")
+    metadata = _RepresentativeMetadata(
+        source_path=str(representative["source_path"]),
+        source_sha256=str(representative["source_sha256"]),
+        captured_at=str(representative["captured_at"]),
+    )
+    node = TrajectoryNode.model_validate(document["trajectory"])
+    return node, metadata, tuple(str(path) for path in origin_paths)
 
 
 def _build_worker_count(configured: int | None = None) -> int:
@@ -1666,9 +1747,11 @@ def _build_trajectories(
         # more than the materialization itself.
         use_pool = worker_count > 1 and len(root_specs) > 1
         root_jobs: Iterable[tuple[_MaterializationJob, tuple[str, ...], bool]] = ()
+        artifact_dir: str | None = None
         if use_pool:
             state_path = _state_database_path(state)
             immutable_state = _state_database_is_immutable(state)
+            artifact_dir = tempfile.mkdtemp(prefix="trajfoundry-build-")
             root_jobs = _iter_materialization_jobs(
                 root_specs,
                 state_path=state_path,
@@ -1678,6 +1761,7 @@ def _build_trajectories(
                 graph_issues=graph_issues,
                 edges_by_parent=edges_by_parent,
                 scope=scope,
+                artifact_dir=artifact_dir,
             )
 
         with state.write_batch():
@@ -1738,46 +1822,60 @@ def _build_trajectories(
                 # instead of starting a worker.  Fork is safe here because
                 # workers only use their own read-only SQLite connection and
                 # the coordinator no longer holds an exclusive SQLite lock.
-                with ProcessPoolExecutor(
-                    max_workers=worker_count,
-                    mp_context=multiprocessing.get_context("fork"),
-                ) as pool:
-                    iterator = iter(root_jobs)
-                    futures: list[tuple[tuple[_MaterializationJob, tuple[str, ...], bool], Any]] = []
-                    for _ in range(worker_count * 2):
-                        item = next(iterator, None)
-                        if item is None:
-                            break
-                        futures.append((item, pool.submit(_materialize_root_worker, item[0])))
-                    while futures:
-                        (job, origin_paths, _), future = futures.pop(0)
-                        paths = origin_paths
-                        try:
-                            _, enriched, snapshot, returned_paths = future.result()
-                            paths = tuple(returned_paths) or origin_paths
-                            _store_trajectory(
-                                state,
-                                enriched,
-                                snapshot,
-                                _origin_rows(state, paths),
-                            )
-                            completed_roots += 1
-                            represented_paths.update(paths)
-                        except Exception as error:  # noqa: BLE001 - skip one bad trajectory
-                            failed_roots += 1
-                            failed_paths.update(paths)
-                            _log_trajectory_build_failure(error, paths)
-                        _log_materialization_job(
-                            job,
-                            scope=scope,
-                            root_number=job.root_index,
-                            root_total=len(root_specs),
-                            stage="完成",
-                        )
-                        log_progress()
-                        item = next(iterator, None)
-                        if item is not None:
+                try:
+                    with ProcessPoolExecutor(
+                        max_workers=worker_count,
+                        mp_context=multiprocessing.get_context("fork"),
+                    ) as pool:
+                        iterator = iter(root_jobs)
+                        futures: list[tuple[tuple[_MaterializationJob, tuple[str, ...], bool], Any]] = []
+                        for _ in range(worker_count * 2):
+                            item = next(iterator, None)
+                            if item is None:
+                                break
                             futures.append((item, pool.submit(_materialize_root_worker, item[0])))
+                        while futures:
+                            (job, origin_paths, _), future = futures.pop(0)
+                            paths = origin_paths
+                            try:
+                                _, payload, snapshot, returned_paths = future.result()
+                                if isinstance(payload, str):
+                                    enriched, artifact_snapshot, artifact_paths = (
+                                        _read_materialization_artifact(payload)
+                                    )
+                                    snapshot = artifact_snapshot
+                                    returned_paths = artifact_paths
+                                else:
+                                    enriched = payload
+                                paths = tuple(returned_paths) or origin_paths
+                                if not isinstance(enriched, TrajectoryNode):
+                                    raise TypeError("materialization worker returned an invalid trajectory")
+                                _store_trajectory(
+                                    state,
+                                    enriched,
+                                    snapshot,
+                                    _origin_rows(state, paths),
+                                )
+                                completed_roots += 1
+                                represented_paths.update(paths)
+                            except Exception as error:  # noqa: BLE001 - skip one bad trajectory
+                                failed_roots += 1
+                                failed_paths.update(paths)
+                                _log_trajectory_build_failure(error, paths)
+                            _log_materialization_job(
+                                job,
+                                scope=scope,
+                                root_number=job.root_index,
+                                root_total=len(root_specs),
+                                stage="完成",
+                            )
+                            log_progress()
+                            item = next(iterator, None)
+                            if item is not None:
+                                futures.append((item, pool.submit(_materialize_root_worker, item[0])))
+                finally:
+                    if artifact_dir is not None:
+                        shutil.rmtree(artifact_dir, ignore_errors=True)
         completed_scopes += 1
         log_progress()
     _skip_failed_trajectory_sources(state, failed_paths, represented_paths)
