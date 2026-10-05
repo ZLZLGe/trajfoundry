@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -76,6 +77,9 @@ CLASSIFICATION_POLICY_SHA256 = hashlib.sha256(
 # Short aliases are useful to callers building diagnostics without depending
 # on the internal spelling of the policy constant.
 POLICY_SHA256 = CLASSIFICATION_POLICY_SHA256
+DEFAULT_SEMANTIC_RETRIES = 2
+
+LOGGER = logging.getLogger(__name__)
 
 
 class CompletionClient(Protocol):
@@ -110,6 +114,7 @@ class TrajectoryClassifier:
         classifier_revision: str = CLASSIFIER_REVISION,
         prompt_version: str = PROMPT_VERSION,
         max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+        semantic_retries: int = DEFAULT_SEMANTIC_RETRIES,
     ) -> None:
         if len(input_manifest_sha256) != 64 or any(
             character not in "0123456789abcdef" for character in input_manifest_sha256
@@ -119,12 +124,15 @@ class TrajectoryClassifier:
             raise ValueError("classifier and prompt versions must not be empty")
         if max_context_chars < 1024:
             raise ValueError("max_context_chars must be at least 1024")
+        if type(semantic_retries) is not int or semantic_retries < 0:
+            raise ValueError("semantic_retries must be a non-negative integer")
         self.client = client
         self.taxonomy = taxonomy
         self.input_manifest_sha256 = input_manifest_sha256
         self.classifier_revision = classifier_revision
         self.prompt_version = prompt_version
         self.max_context_chars = max_context_chars
+        self.semantic_retries = semantic_retries
         self._system_prompt = self._build_system_prompt()
 
     @property
@@ -193,6 +201,7 @@ class TrajectoryClassifier:
             raise TypeError("trajectory must be an object")
         context_budget = self.max_context_chars
         reductions = 0
+        semantic_attempts = 0
         while True:
             projection = project_user_input(trajectory)
             context, truncated, sent_user_chars = serialize_for_model(
@@ -272,7 +281,23 @@ class TrajectoryClassifier:
                     classification={"status": "failed", "reason": error.reason, **base},
                     cacheable=False,
                 )
-            except (ModelDecisionError, TaxonomyError, orjson.JSONDecodeError):
+            except (ModelDecisionError, TaxonomyError, orjson.JSONDecodeError) as error:
+                if semantic_attempts < self.semantic_retries:
+                    semantic_attempts += 1
+                    LOGGER.warning(
+                        "classifier model output validation failed; retrying "
+                        "semantic_attempt=%d/%d error_type=%s",
+                        semantic_attempts,
+                        self.semantic_retries,
+                        type(error).__name__,
+                    )
+                    continue
+                LOGGER.warning(
+                    "classifier model output validation failed after %d attempts; "
+                    "marking trajectory failed error_type=%s",
+                    semantic_attempts + 1,
+                    type(error).__name__,
+                )
                 return ClassificationAttempt(
                     classification={
                         "status": "failed",
@@ -357,6 +382,7 @@ __all__ = [
     "CLASSIFIER_REVISION",
     "DEFAULT_MAX_CONTEXT_CHARS",
     "DEFAULT_MAX_OUTPUT_TOKENS",
+    "DEFAULT_SEMANTIC_RETRIES",
     "MAX_CONTEXT_REDUCTIONS",
     "POLICY_SHA256",
     "PROMPT_VERSION",

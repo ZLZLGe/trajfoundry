@@ -344,8 +344,10 @@ maximum concurrency to `1` per source and date.
 
 The classifier uses bounded concurrency (four requests in the example). HTTP
 429 and 5xx responses are retried; HTTP 404 and 422 indicate a bad endpoint or
-missing model configuration and fail the job. Per-trajectory exhausted retries
-or invalid model output still produce the original trajectory with
+missing model configuration and fail the job. A response that is not valid JSON
+or violates the label contract receives two additional semantic retries,
+separate from the HTTP/network retries. Per-trajectory exhausted retries or
+invalid model output still produce the original trajectory with
 `classification.status="failed"`, allowing a later rerun to inspect and retry
 the failed population. Classification reads and validates the normalized input
 manifest, but does not read its own output manifest. It lists existing

@@ -15,6 +15,7 @@ from trajfoundry.classification.client import (
     ChatCompletionsClient,
     ClassificationConfigurationError,
     ClassificationContextLimitError,
+    ClassificationRequestError,
     ClassificationRetryExhausted,
 )
 from trajfoundry.classification.taxonomy import ScenarioTaxonomy
@@ -30,6 +31,37 @@ class _Completion:
     def complete(self, messages: list[dict[str, str]]) -> str:
         self.messages.append(messages)
         return orjson.dumps(self.response).decode()
+
+
+class _SequenceCompletion:
+    """Deterministic completion stub for semantic retry tests."""
+
+    model = "classifier-test"
+
+    def __init__(self, responses: list[object]) -> None:
+        self.responses = responses
+        self.calls = 0
+
+    def complete(self, _messages: list[dict[str, str]]) -> str:
+        response = self.responses[min(self.calls, len(self.responses) - 1)]
+        self.calls += 1
+        if isinstance(response, str):
+            return response
+        return orjson.dumps(response).decode()
+
+
+class _RaisingCompletion:
+    """Completion stub that records calls before raising a client error."""
+
+    model = "classifier-test"
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.calls = 0
+
+    def complete(self, _messages: list[dict[str, str]]) -> str:
+        self.calls += 1
+        raise self.error
 
 
 class _ContextThenCompletion:
@@ -158,6 +190,84 @@ def test_classifier_marks_unknown_model_labels_as_failed(tmp_path) -> None:
     assert attempt.classification["reason"] == "invalid_model_output"
     assert attempt.classification["model_label"] == "unknown"
     assert attempt.classification["harness_label"] == "unknown"
+
+
+def test_classifier_retries_invalid_model_output_then_accepts(tmp_path) -> None:
+    client = _SequenceCompletion(
+        [
+            {"scenario_label_ids": [99999], "capability_labels": ["Tool Use"]},
+            {
+                "scenario_label_key": "toc|Shopping|购物",
+                "capability_labels": ["Tool Use"],
+            },
+        ]
+    )
+    classifier = TrajectoryClassifier(
+        client=client,
+        taxonomy=_taxonomy(tmp_path),
+        input_manifest_sha256="a" * 64,
+        semantic_retries=2,
+    )
+
+    attempt = classifier.classify({"messages": []})
+
+    assert attempt.cacheable
+    assert attempt.classification["status"] == "accepted"
+    assert client.calls == 2
+
+
+def test_classifier_exhausts_semantic_retries_as_non_cacheable_failure(
+    tmp_path,
+) -> None:
+    invalid = {"scenario_label_ids": [99999], "capability_labels": ["Tool Use"]}
+    client = _SequenceCompletion([invalid, invalid, invalid])
+    classifier = TrajectoryClassifier(
+        client=client,
+        taxonomy=_taxonomy(tmp_path),
+        input_manifest_sha256="a" * 64,
+        semantic_retries=2,
+    )
+
+    attempt = classifier.classify({"messages": []})
+
+    assert not attempt.cacheable
+    assert attempt.classification["status"] == "failed"
+    assert attempt.classification["reason"] == "invalid_model_output"
+    assert client.calls == 3
+
+
+def test_classifier_does_not_semantically_retry_permanent_request_error(
+    tmp_path,
+) -> None:
+    client = _RaisingCompletion(ClassificationRequestError("classifier_http_400"))
+    classifier = TrajectoryClassifier(
+        client=client,
+        taxonomy=_taxonomy(tmp_path),
+        input_manifest_sha256="a" * 64,
+        semantic_retries=2,
+    )
+
+    attempt = classifier.classify({"messages": []})
+
+    assert not attempt.cacheable
+    assert attempt.classification["status"] == "failed"
+    assert attempt.classification["reason"] == "classifier_http_400"
+    assert client.calls == 1
+
+
+def test_classifier_does_not_semantically_retry_configuration_error(tmp_path) -> None:
+    client = _RaisingCompletion(ClassificationConfigurationError("bad config"))
+    classifier = TrajectoryClassifier(
+        client=client,
+        taxonomy=_taxonomy(tmp_path),
+        input_manifest_sha256="a" * 64,
+        semantic_retries=2,
+    )
+
+    with pytest.raises(ClassificationConfigurationError, match="bad config"):
+        classifier.classify({"messages": []})
+
+    assert client.calls == 1
 
 
 def test_classifier_reduces_context_after_gateway_context_error(tmp_path) -> None:
