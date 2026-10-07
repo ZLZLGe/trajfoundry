@@ -34,7 +34,7 @@ _TOKEN_PATTERN = re.compile(r"[\u3400-\u9fff]|[A-Za-z0-9_]+|[^\w\s]", re.UNICODE
 def estimate_tokens(text: str) -> int:
     """Cheap, deterministic approximation; never use for billing."""
 
-    return len(_TOKEN_PATTERN.findall(text))
+    return sum(1 for _ in _TOKEN_PATTERN.finditer(text))
 
 
 def _json_type(value: Any) -> str:
@@ -91,14 +91,15 @@ def check_tool_calls(
                 check.undefined_tool_calls += 1
                 check.mismatch_calls += 1
                 missing.add(call.function.name)
-                details.append(
-                    ToolCallMismatch(
-                        tool=call.function.name,
-                        tool_call_id=call.id,
-                        message_index=message_index,
-                        reasons=["undefined_tool"],
+                if len(details) < 50:
+                    details.append(
+                        ToolCallMismatch(
+                            tool=call.function.name,
+                            tool_call_id=call.id,
+                            message_index=message_index,
+                            reasons=["undefined_tool"],
+                        )
                     )
-                )
                 continue
 
             arguments = call.function.arguments
@@ -154,20 +155,21 @@ def check_tool_calls(
                 check.defaulted_missing_calls += 1
             if reasons:
                 check.mismatch_calls += 1
-                details.append(
-                    ToolCallMismatch(
-                        tool=call.function.name,
-                        tool_call_id=call.id,
-                        message_index=message_index,
-                        reasons=reasons,
-                        extra_args=extra or None,
-                        missing_required=missing_required or None,
-                        type_mismatch=mismatched or None,
+                if len(details) < 50:
+                    details.append(
+                        ToolCallMismatch(
+                            tool=call.function.name,
+                            tool_call_id=call.id,
+                            message_index=message_index,
+                            reasons=reasons,
+                            extra_args=extra or None,
+                            missing_required=missing_required or None,
+                            type_mismatch=mismatched or None,
+                        )
                     )
-                )
 
-    check.mismatches = details[:50]
-    check.mismatches_truncated = max(0, len(details) - 50)
+    check.mismatches = details
+    check.mismatches_truncated = max(0, check.mismatch_calls - 50)
     return check, sorted(missing)
 
 

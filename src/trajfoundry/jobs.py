@@ -206,6 +206,7 @@ def _run_s3_job_with_client(
                 output_location,
                 max_shard_bytes=max_shard_bytes,
                 max_workers=output_workers,
+                spool_dir=Path(directory),
             ),
             max_shard_bytes=max_shard_bytes,
             build_workers=build_workers,
@@ -237,16 +238,12 @@ def _run_s3_job_with_client(
         ignored_flat_paths=frozenset(listed_flat_paths - current_flat_paths),
     )
     validation_started_at = time.monotonic()
-    if validation_workers == 1:
-        # Preserve compatibility with callers that monkeypatch the historical
-        # two-argument validation hook.
-        report = validate_output_backend(manifest_bytes, validation_backend)
-    else:
-        report = validate_output_backend(
-            manifest_bytes,
-            validation_backend,
-            max_workers=validation_workers,
-        )
+    report = validate_output_backend(
+        manifest_bytes,
+        validation_backend,
+        max_workers=validation_workers,
+        max_jsonl_row_bytes=max_shard_bytes,
+    )
     stats.validation_seconds = time.monotonic() - validation_started_at
     LOGGER.info(
         "【输出校验完成】文件数=%d，JSONL行数=%d，接受轨迹=%d，"
@@ -310,8 +307,7 @@ def _run_s3_job_with_client(
         report.counts.get("skipped_inputs", 0),
     )
     LOGGER.info(
-        "【任务完成】总耗时=%.1f秒，最终轨迹=%d，接受=%d，隔离=%d，"
-        "跳过=%d，校验=%s",
+        "【任务完成】总耗时=%.1f秒，最终轨迹=%d，接受=%d，隔离=%d，跳过=%d，校验=%s",
         time.monotonic() - started_at,
         stats.stored_trajectories,
         report.counts.get("accepted", 0),
@@ -402,8 +398,7 @@ def run_job(
         report.counts.get("skipped_inputs", 0),
     )
     LOGGER.info(
-        "【任务完成】总耗时=%.1f秒，最终轨迹=%d，接受=%d，隔离=%d，"
-        "跳过=%d，校验=%s",
+        "【任务完成】总耗时=%.1f秒，最终轨迹=%d，接受=%d，隔离=%d，跳过=%d，校验=%s",
         stats.ingest_seconds
         + stats.build_seconds
         + stats.export_seconds

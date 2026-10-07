@@ -273,9 +273,10 @@ def test_state_configures_page_size_and_ephemeral_pragmas(tmp_path: Path) -> Non
         assert state.connection.execute("PRAGMA page_size").fetchone()[0] == 32 * 1024
         assert (
             state.connection.execute("PRAGMA journal_mode").fetchone()[0].lower()
-            == "memory"
+            == "truncate"
         )
         assert state.connection.execute("PRAGMA synchronous").fetchone()[0] == 0
+        assert state.connection.execute("PRAGMA temp_store").fetchone()[0] == 1
 
 
 def test_iter_snapshot_groups_uses_ordered_groups(tmp_path: Path) -> None:

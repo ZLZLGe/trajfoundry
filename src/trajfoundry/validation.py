@@ -6,9 +6,9 @@ import hashlib
 import logging
 import re
 import time
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Iterable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Annotated, BinaryIO, Literal, Protocol
@@ -36,6 +36,7 @@ _SHARD_PATTERN = re.compile(r"^(?:trajectories|records)-[0-9]+\.jsonl$")
 _MAX_REPORTED_ERRORS = 100
 _PROGRESS_INTERVAL_SECONDS = 60.0
 _PROGRESS_ITEM_INTERVAL = 10_000
+DEFAULT_VALIDATION_PENDING_BYTES = 1024 * 1024**2
 
 LOGGER = logging.getLogger(__name__)
 
@@ -360,13 +361,41 @@ def _validate_jsonl_stream(
     allow_legacy_metadata: bool,
     observed: _Observed,
     errors: _ErrorCollector,
+    max_jsonl_row_bytes: int | None = None,
 ) -> _StreamResult:
     digest = hashlib.sha256()
     bytes_read = 0
     pending = bytearray()
     line_no = 0
-    scan_from = 0
+    oversized = False
     complete = False
+
+    def finish_row() -> None:
+        nonlocal line_no, oversized
+        line_no += 1
+        if oversized:
+            _count_jsonl_row(kind, observed)
+            observed.mark_invalid(kind)
+            errors.add(
+                f"{_row_context(file_index, line_no, kind)} exceeds "
+                f"the configured JSONL row byte limit ({max_jsonl_row_bytes})"
+            )
+        else:
+            # orjson accepts bytearray directly; avoid creating another full
+            # raw-line bytes copy while decoding a large trajectory.
+            _validate_jsonl_row(
+                pending,
+                kind=kind,
+                file_index=file_index,
+                line_no=line_no,
+                relative_path=relative_path,
+                allow_legacy_metadata=allow_legacy_metadata,
+                observed=observed,
+                errors=errors,
+            )
+        pending.clear()
+        oversized = False
+
     try:
         while True:
             try:
@@ -385,39 +414,31 @@ def _validate_jsonl_stream(
                 break
             digest.update(chunk)
             bytes_read += len(chunk)
-            pending.extend(chunk)
-
+            if isinstance(chunk, memoryview):
+                chunk = chunk.tobytes()
+            view = memoryview(chunk)
             start = 0
-            while (newline := pending.find(b"\n", scan_from)) >= 0:
-                line_no += 1
-                _validate_jsonl_row(
-                    bytes(pending[start : newline + 1]),
-                    kind=kind,
-                    file_index=file_index,
-                    line_no=line_no,
-                    relative_path=relative_path,
-                    allow_legacy_metadata=allow_legacy_metadata,
-                    observed=observed,
-                    errors=errors,
-                )
-                start = newline + 1
-                scan_from = start
-            if start:
-                del pending[:start]
-            scan_from = len(pending)
+            while start < len(chunk):
+                newline = chunk.find(b"\n", start)
+                end = len(chunk) if newline < 0 else newline + 1
+                if not oversized:
+                    if (
+                        max_jsonl_row_bytes is not None
+                        and len(pending) + end - start > max_jsonl_row_bytes
+                    ):
+                        # Drain the rest of this row without retaining it.
+                        # Checksums, byte counts and subsequent rows must still
+                        # be checked; rejecting a row is never successful output.
+                        oversized = True
+                        pending.clear()
+                    else:
+                        pending.extend(view[start:end])
+                if newline >= 0:
+                    finish_row()
+                start = end
 
-        if complete and pending:
-            line_no += 1
-            _validate_jsonl_row(
-                bytes(pending),
-                kind=kind,
-                file_index=file_index,
-                line_no=line_no,
-                relative_path=relative_path,
-                allow_legacy_metadata=allow_legacy_metadata,
-                observed=observed,
-                errors=errors,
-            )
+        if complete and (pending or oversized):
+            finish_row()
     finally:
         try:
             stream.close()
@@ -459,6 +480,7 @@ def _validate_manifest_file(
     file_index: int,
     kind: str | None,
     allow_legacy_metadata: bool,
+    max_jsonl_row_bytes: int | None = None,
 ) -> tuple[_Observed, _ErrorCollector]:
     """Validate one manifest object in isolation for bounded parallelism."""
 
@@ -488,6 +510,7 @@ def _validate_manifest_file(
         allow_legacy_metadata=allow_legacy_metadata,
         observed=observed,
         errors=errors,
+        max_jsonl_row_bytes=max_jsonl_row_bytes,
     )
     if source.size != entry.bytes or (
         result.complete and result.bytes_read != entry.bytes
@@ -498,8 +521,16 @@ def _validate_manifest_file(
     return observed, errors
 
 
+def _count_jsonl_row(kind: str | None, observed: _Observed) -> None:
+    observed.counts["jsonl_rows"] += 1
+    if kind in {"accepted", "quarantined_trajectories", "quarantined_records"}:
+        observed.counts[kind] += 1
+    elif kind == "lineage":
+        observed.counts["lineage_records"] += 1
+
+
 def _validate_jsonl_row(
-    raw_line: bytes,
+    raw_line: bytes | bytearray,
     *,
     kind: str | None,
     file_index: int,
@@ -509,15 +540,7 @@ def _validate_jsonl_row(
     observed: _Observed,
     errors: _ErrorCollector,
 ) -> None:
-    observed.counts["jsonl_rows"] += 1
-    if kind in {
-        "accepted",
-        "quarantined_trajectories",
-        "quarantined_records",
-    }:
-        observed.counts[kind] += 1
-    elif kind == "lineage":
-        observed.counts["lineage_records"] += 1
+    _count_jsonl_row(kind, observed)
     try:
         value = loads(raw_line)
     except orjson.JSONDecodeError:
@@ -645,6 +668,8 @@ def validate_output_backend(
     backend: ValidationBackend,
     *,
     max_workers: int = 1,
+    max_pending_bytes: int = DEFAULT_VALIDATION_PENDING_BYTES,
+    max_jsonl_row_bytes: int | None = None,
 ) -> ValidationReport:
     """Validate output through a storage-neutral streaming backend.
 
@@ -652,10 +677,18 @@ def validate_output_backend(
     publication. Backend exceptions and validation details are deliberately
     omitted from errors because storage responses and rows can contain secrets.
     Every stream returned by the backend is closed before this function returns.
+    Pending file bytes bound concurrent raw-data exposure, not Python model
+    expansion. A file larger than the budget is scanned alone, never rejected
+    by total file size. ``max_jsonl_row_bytes`` optionally bounds individual row
+    buffers (including their newline); ``None`` retains legacy compatibility.
     """
 
     if max_workers <= 0:
         raise ValueError("max workers must be positive")
+    if max_pending_bytes <= 0:
+        raise ValueError("max pending bytes must be positive")
+    if max_jsonl_row_bytes is not None and max_jsonl_row_bytes <= 0:
+        raise ValueError("max JSONL row bytes must be positive")
     errors = _ErrorCollector()
     observed = _Observed()
     try:
@@ -686,6 +719,7 @@ def validate_output_backend(
     started_at = time.monotonic()
     last_progress_at = started_at
     processed_files = 0
+    pending_bytes = 0
 
     pending: list[tuple[int, _ManifestFile, str | None]] = []
     for file_index, entry in enumerate(manifest.files):
@@ -722,6 +756,7 @@ def validate_output_backend(
                 "trajfoundry-v2",
                 "trajfoundry-v3",
             },
+            max_jsonl_row_bytes=max_jsonl_row_bytes,
         )
 
     def log_progress(*, force: bool = False) -> None:
@@ -734,21 +769,27 @@ def validate_output_backend(
             return
         LOGGER.info(
             "【校验阶段】已校验文件=%d/%d，JSONL行数=%d，接受轨迹=%d，"
-            "隔离轨迹=%d，错误数=%d，耗时=%.1f秒",
+            "隔离轨迹=%d，错误数=%d，在途原始字节=%.1fMiB，耗时=%.1f秒",
             processed_files,
             len(manifest.files),
             observed.counts["jsonl_rows"],
             observed.counts["accepted"],
             observed.counts["quarantined_trajectories"],
             errors.total,
+            pending_bytes / 1024**2,
             now - started_at,
         )
         last_progress_at = now
 
     LOGGER.info(
-        "【校验阶段】开始校验输出：文件总数=%d，并发线程数=%d",
+        "【校验阶段】开始校验输出：文件总数=%d，并发线程数=%d，"
+        "在途原始字节上限=%.1fMiB，单行字节上限=%s",
         len(manifest.files),
         max_workers,
+        max_pending_bytes / 1024**2,
+        "兼容模式（不限制）"
+        if max_jsonl_row_bytes is None
+        else str(max_jsonl_row_bytes),
     )
 
     if max_workers == 1 or len(pending) <= 1:
@@ -771,24 +812,40 @@ def validate_output_backend(
             max_workers=max_workers,
             thread_name_prefix="trajfoundry-s3-get",
         ) as executor:
-            iterator = iter(pending)
-            futures: list[Future[tuple[_Observed, _ErrorCollector]]] = []
-            for _ in range(min(window, len(pending))):
-                try:
-                    futures.append(executor.submit(validate_one, next(iterator)))
-                except StopIteration:
-                    break
-            while futures:
-                future = futures.pop(0)
-                file_observed, file_errors = future.result()
+            futures: deque[tuple[Future[tuple[_Observed, _ErrorCollector]], int]] = (
+                deque()
+            )
+            next_index = 0
+            while next_index < len(pending) or futures:
+                while next_index < len(pending) and len(futures) < window:
+                    item = pending[next_index]
+                    weight = max(1, item[1].bytes)
+                    if item[2] != "trajectory" and max_jsonl_row_bytes is not None:
+                        # Lineage and legacy shards can legitimately contain
+                        # many small rows. Their total size is not a row limit.
+                        weight = min(weight, max_jsonl_row_bytes)
+                    if futures and pending_bytes + weight > max_pending_bytes:
+                        break
+                    futures.append((executor.submit(validate_one, item), weight))
+                    pending_bytes += weight
+                    next_index += 1
+                future, weight = futures[0]
+                while True:
+                    try:
+                        file_observed, file_errors = future.result(
+                            timeout=_PROGRESS_INTERVAL_SECONDS
+                        )
+                        break
+                    except TimeoutError:
+                        if future.done():
+                            raise
+                        log_progress(force=True)
+                futures.popleft()
+                pending_bytes -= weight
                 _merge_observed(observed, file_observed)
                 errors.extend(file_errors)
                 processed_files += 1
                 log_progress()
-                try:
-                    futures.append(executor.submit(validate_one, next(iterator)))
-                except StopIteration:
-                    pass
 
     if lineage_entries != 1:
         errors.add("manifest must list lineage.jsonl exactly once")
@@ -859,7 +916,13 @@ def validate_output_backend(
     )
 
 
-def validate_output(root: Path) -> ValidationReport:
+def validate_output(
+    root: Path,
+    *,
+    max_workers: int = 1,
+    max_pending_bytes: int = DEFAULT_VALIDATION_PENDING_BYTES,
+    max_jsonl_row_bytes: int | None = None,
+) -> ValidationReport:
     """Validate a completed local output directory without exposing contents.
 
     Validation is streaming at the JSONL level. Error messages identify only a
@@ -885,4 +948,10 @@ def validate_output(root: Path) -> ValidationReport:
             errors=["manifest.json could not be read as valid JSON"],
             counts=observed.counts,
         )
-    return validate_output_backend(manifest_bytes, _LocalValidationBackend(root))
+    return validate_output_backend(
+        manifest_bytes,
+        _LocalValidationBackend(root),
+        max_workers=max_workers,
+        max_pending_bytes=max_pending_bytes,
+        max_jsonl_row_bytes=max_jsonl_row_bytes,
+    )

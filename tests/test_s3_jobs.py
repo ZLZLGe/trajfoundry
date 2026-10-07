@@ -399,7 +399,7 @@ def test_run_s3_job_does_not_publish_manifest_when_validation_fails(
     monkeypatch.setattr(
         jobs,
         "validate_output_backend",
-        lambda manifest, backend: ValidationReport(
+        lambda manifest, backend, **kwargs: ValidationReport(
             valid=False,
             errors=["candidate generation is invalid"],
             counts={},

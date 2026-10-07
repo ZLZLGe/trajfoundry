@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import sqlite3
 import zlib
-from collections import defaultdict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -25,7 +24,6 @@ _PAGE_SIZE = 32 * 1024
 _CACHE_SIZE_KIB = 128 * 1024
 _MMAP_SIZE = 256 * 1024 * 1024
 _PATH_QUERY_BATCH_SIZE = 512
-_TRAJECTORY_UPDATE_BATCH_SIZE = 512
 _PAYLOAD_HEADER = b"TFZ1"
 _ZSTD_COMPRESSOR = zstandard.ZstdCompressor(level=1)
 _ZSTD_DECOMPRESSOR = zstandard.ZstdDecompressor()
@@ -51,6 +49,36 @@ def _decompress_payload(payload: str | bytes) -> bytes:
     # Accept unenveloped zlib rows defensively in an otherwise compatible v2
     # database; replacing either row rewrites it with the TFZ1 envelope.
     return zlib.decompress(payload)
+
+
+def snapshot_metadata_projection(snapshot: Snapshot) -> Snapshot:
+    """Keep contributor metadata without retaining cumulative transcripts."""
+
+    return snapshot.model_copy(update={"history": [], "response": []})
+
+
+def read_snapshot_metadata(
+    connection: sqlite3.Connection, source_path: str
+) -> Snapshot | None:
+    """Read a contributor projection without writing through worker connections.
+
+    The fallback supports pre-existing state databases. New builds populate
+    projections while reading each source once, before workers are started.
+    """
+
+    row = connection.execute(
+        "SELECT payload FROM snapshot_metadata WHERE source_path=?", (source_path,)
+    ).fetchone()
+    if row is not None:
+        return Snapshot.model_validate_json(_decompress_payload(row[0]))
+    row = connection.execute(
+        "SELECT payload FROM snapshots WHERE source_path=?", (source_path,)
+    ).fetchone()
+    if row is None:
+        return None
+    return snapshot_metadata_projection(
+        Snapshot.model_validate_json(_decompress_payload(row[0]))
+    )
 
 
 def _sorted_path_batches(paths: Iterable[str]) -> Iterator[list[str]]:
@@ -88,7 +116,10 @@ class StateStore:
         if int(self.connection.execute("PRAGMA page_count").fetchone()[0]) == 0:
             self.connection.execute(f"PRAGMA page_size={_PAGE_SIZE}")
         if ephemeral:
-            self.connection.execute("PRAGMA journal_mode=MEMORY")
+            # A large build transaction must not accumulate its rollback
+            # journal in RAM. The state is rebuildable, but rollback still
+            # needs to work for Python-level transaction failures.
+            self.connection.execute("PRAGMA journal_mode=TRUNCATE")
             self.connection.execute("PRAGMA synchronous=OFF")
             self.connection.execute("PRAGMA locking_mode=EXCLUSIVE")
         else:
@@ -96,6 +127,7 @@ class StateStore:
             self.connection.execute("PRAGMA synchronous=NORMAL")
         self.connection.execute(f"PRAGMA cache_size=-{_CACHE_SIZE_KIB}")
         self.connection.execute(f"PRAGMA mmap_size={_MMAP_SIZE}")
+        self.connection.execute("PRAGMA temp_store=FILE")
         stored_version = int(
             self.connection.execute("PRAGMA user_version").fetchone()[0]
         )
@@ -150,6 +182,18 @@ class StateStore:
             );
             CREATE INDEX IF NOT EXISTS idx_snapshots_group
             ON snapshots(session_id, thread_id, captured_at, source_path);
+            CREATE TABLE IF NOT EXISTS snapshot_metadata (
+                source_path TEXT PRIMARY KEY,
+                payload BLOB NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS snapshot_metadata_after_update
+            AFTER UPDATE ON snapshots BEGIN
+                DELETE FROM snapshot_metadata WHERE source_path=OLD.source_path;
+            END;
+            CREATE TRIGGER IF NOT EXISTS snapshot_metadata_after_delete
+            AFTER DELETE ON snapshots BEGIN
+                DELETE FROM snapshot_metadata WHERE source_path=OLD.source_path;
+            END;
             CREATE TABLE IF NOT EXISTS trajectories (
                 trajectory_id TEXT PRIMARY KEY,
                 disposition TEXT NOT NULL,
@@ -202,6 +246,7 @@ class StateStore:
         with self.connection:
             self.connection.execute("DROP INDEX IF EXISTS idx_snapshots_group")
             self.connection.execute("DROP TABLE IF EXISTS snapshots")
+            self.connection.execute("DROP TABLE IF EXISTS snapshot_metadata")
             for table in ("trajectory_origins", "trajectories", "captures"):
                 if table in existing_tables:
                     self.connection.execute(f"DELETE FROM {table}")
@@ -306,6 +351,47 @@ class StateStore:
 
     def close(self) -> None:
         self.connection.close()
+
+    def prepare_concurrent_build_reads(self) -> None:
+        """Enable ordinary read-only workers while this coordinator keeps writing.
+
+        Call before opening scope cursors or starting worker processes. Input
+        rows may be stable, but the database file is not immutable while final
+        trajectories and metadata are being inserted. WAL provides the proper
+        reader/writer protocol without copying the input database.
+        """
+
+        if self._write_batch_depth:
+            raise RuntimeError("cannot prepare concurrent reads inside a write_batch")
+        self.connection.commit()
+        journal = str(
+            self.connection.execute("PRAGMA journal_mode").fetchone()[0]
+        ).lower()
+        locking = str(
+            self.connection.execute("PRAGMA locking_mode").fetchone()[0]
+        ).lower()
+        if journal == "wal" and locking == "exclusive":
+            # WAL entered under EXCLUSIVE can omit the shared-memory index;
+            # SQLite requires leaving WAL before NORMAL can take effect.
+            self.connection.execute("PRAGMA journal_mode=TRUNCATE").fetchall()
+        self.connection.execute("PRAGMA locking_mode=NORMAL").fetchall()
+        # Changing the pragma alone does not release an existing exclusive
+        # file lock. Complete a real database read before entering WAL.
+        self.connection.execute("SELECT name FROM sqlite_schema LIMIT 1").fetchall()
+        mode = str(
+            self.connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        ).lower()
+        locking = str(
+            self.connection.execute("PRAGMA locking_mode").fetchone()[0]
+        ).lower()
+        if mode != "wal" or locking != "normal":
+            raise RuntimeError(
+                "state database could not enable WAL concurrent build reads"
+            )
+        # The writer can briefly contend with a reader/checkpoint, but must
+        # not wait indefinitely. Per-worker connections set their own timeout.
+        self.connection.execute("PRAGMA busy_timeout=5000")
+        self.connection.execute("SELECT name FROM sqlite_schema LIMIT 1").fetchall()
 
     def set_meta(self, key: str, value: str) -> None:
         with self._write_scope():
@@ -641,6 +727,101 @@ class StateStore:
         ).fetchone()
         return self._decode_snapshot(row[0]) if row else None
 
+    def put_snapshot_metadata(self, snapshot: Snapshot) -> None:
+        """Persist a compact, lossless contributor view of an existing source."""
+
+        payload = _compress_payload(
+            snapshot.model_dump_json(
+                exclude={"history", "response"}, exclude_none=True
+            ).encode("utf-8")
+        )
+        with self._write_scope():
+            self.connection.execute(
+                "INSERT INTO snapshot_metadata(source_path,payload) "
+                "SELECT source_path,? FROM snapshots WHERE source_path=? "
+                "ON CONFLICT(source_path) DO UPDATE SET payload=excluded.payload",
+                (payload, snapshot.source_path),
+            )
+
+    def get_snapshot_metadata(self, source_path: str) -> Snapshot | None:
+        return read_snapshot_metadata(self.connection, source_path)
+
+    def iter_snapshot_metadata_for_paths(
+        self, paths: Iterable[str]
+    ) -> Iterator[Snapshot]:
+        """Stream compact contributor views in the historical source order.
+
+        Missing projections are backfilled once by this coordinator-only API.
+        It never batches full snapshot payloads in Python.
+        """
+
+        for batch in _sorted_path_batches(paths):
+            placeholders = ",".join("?" for _ in batch)
+            rows = self.connection.execute(
+                "SELECT snapshots.source_path,snapshot_metadata.payload "
+                "FROM snapshots LEFT JOIN snapshot_metadata USING(source_path) "
+                f"WHERE snapshots.source_path IN ({placeholders}) "
+                "ORDER BY snapshots.source_path",
+                batch,
+            )
+            # Only this row's projection is decoded. Fallback writes target
+            # the cache table; source identities and scan order stay stable.
+            for source_path, payload in rows:
+                if payload is not None:
+                    yield self._decode_snapshot(payload)
+                    continue
+                snapshot = self.get_snapshot(str(source_path))
+                if snapshot is not None:
+                    self.put_snapshot_metadata(snapshot)
+                    metadata = snapshot_metadata_projection(snapshot)
+                    del snapshot
+                    yield metadata
+
+    def snapshot_payload_bytes_for_paths(
+        self, paths: Iterable[str]
+    ) -> dict[str, int | None]:
+        """Inspect frame headers without inflating histories for admission.
+
+        ``None`` explicitly means unknown (legacy zlib/plain JSON, or a Zstd
+        frame without a content size); compressed size is not a memory bound.
+        """
+
+        return self._payload_frame_bytes_for_paths("snapshots", paths)
+
+    def snapshot_metadata_bytes_for_paths(
+        self, paths: Iterable[str]
+    ) -> dict[str, int | None]:
+        """Return compact contributor frame sizes without loading any bodies."""
+
+        return self._payload_frame_bytes_for_paths("snapshot_metadata", paths)
+
+    def _payload_frame_bytes_for_paths(
+        self,
+        table: Literal["snapshots", "snapshot_metadata"],
+        paths: Iterable[str],
+    ) -> dict[str, int | None]:
+        sizes: dict[str, int | None] = {}
+        for batch in _sorted_path_batches(paths):
+            placeholders = ",".join("?" for _ in batch)
+            rows = self.connection.execute(
+                f"SELECT source_path,substr(payload,1,32) FROM {table} "
+                f"WHERE source_path IN ({placeholders}) ORDER BY source_path",
+                batch,
+            )
+            for source_path, header in rows:
+                size: int | None = None
+                if isinstance(header, bytes) and header.startswith(_PAYLOAD_HEADER):
+                    try:
+                        parsed = zstandard.frame_content_size(
+                            header[len(_PAYLOAD_HEADER) :]
+                        )
+                        if parsed >= 0:
+                            size = parsed
+                    except zstandard.ZstdError:
+                        pass
+                sizes[str(source_path)] = size
+        return sizes
+
     def iter_snapshots_for_paths(self, paths: Iterable[str]) -> Iterator[Snapshot]:
         """Stream existing snapshots for paths in stable source-path order."""
 
@@ -751,8 +932,7 @@ class StateStore:
                 unique_ids,
             )
             self.connection.execute(
-                "DELETE FROM trajectories "
-                f"WHERE trajectory_id IN ({placeholders})",
+                f"DELETE FROM trajectories WHERE trajectory_id IN ({placeholders})",
                 unique_ids,
             )
             if not failed_sources:
@@ -818,9 +998,7 @@ class StateStore:
         children = value.get("sub_agent_trajectory")
         if isinstance(children, Mapping):
             for child in children.values():
-                StateStore._set_sub_session_id_in_projection(
-                    child, sub_session_id
-                )
+                StateStore._set_sub_session_id_in_projection(child, sub_session_id)
 
     def assign_sub_session_ids(self) -> int:
         """Number final, deduplicated branches within each real session.
@@ -834,8 +1012,16 @@ class StateStore:
 
         skipped = 0
         while True:
-            assignments: dict[str, int] = {}
-            real_sessions: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
+            # Sort assignment metadata on disk instead of retaining every
+            # trajectory's ordering tuple and assignment in Python mappings.
+            self.connection.execute("DROP TABLE IF EXISTS temp.branch_metadata")
+            self.connection.execute("DROP TABLE IF EXISTS temp.branch_assignments")
+            self.connection.execute(
+                "CREATE TEMP TABLE branch_metadata("
+                "identifier TEXT PRIMARY KEY,session_id TEXT NOT NULL,"
+                "created_at TEXT NOT NULL,source_file TEXT NOT NULL,"
+                "synthesized INTEGER NOT NULL)"
+            )
             bad_ids: list[str] = []
             rows = self.connection.execute(
                 "SELECT trajectory_id,payload FROM trajectories ORDER BY trajectory_id"
@@ -845,35 +1031,41 @@ class StateStore:
                 try:
                     projected = loads(_decompress_payload(payload))
                     if identifier in self._trusted_trajectory_ids:
-                        session_id, synthesized = self._trusted_session_metadata(projected)
+                        session_id, synthesized = self._trusted_session_metadata(
+                            projected
+                        )
                         metadata = projected["metadata"]
                         created_at = metadata.get("created_at")
                         source_file = metadata.get("source_file")
-                        if not isinstance(created_at, str) or not isinstance(source_file, str):
-                            raise ValueError("trajectory metadata has invalid ordering fields")
-                        if synthesized:
-                            assignments[identifier] = 0
-                            continue
-                        real_sessions[session_id].append((created_at, identifier, source_file))
-                        continue
-
-                    # Rows loaded from a previous process are not trusted and
-                    # retain the original full contract and identity checks.
-                    node = parse_trajectory_record(projected)
-                    if identifier != compute_trajectory_id(node):
-                        raise ValueError(
-                            "stored trajectory_id does not match trajectory content"
-                        )
-                    if _has_synthesized_session(node):
-                        assignments[identifier] = 0
-                        continue
-                    real_sessions[node.metadata.session_id].append(
+                        if not isinstance(created_at, str) or not isinstance(
+                            source_file, str
+                        ):
+                            raise ValueError(
+                                "trajectory metadata has invalid ordering fields"
+                            )
+                    else:
+                        # Reopened state retains full contract/identity checks.
+                        node = parse_trajectory_record(projected)
+                        if identifier != compute_trajectory_id(node):
+                            raise ValueError(
+                                "stored trajectory_id does not match trajectory content"
+                            )
+                        session_id = node.metadata.session_id
+                        synthesized = _has_synthesized_session(node)
+                        created_at = node.metadata.created_at
+                        source_file = node.metadata.source_file
+                        del node
+                    self.connection.execute(
+                        "INSERT INTO branch_metadata VALUES(?,?,?,?,?)",
                         (
-                            node.metadata.created_at,
                             identifier,
-                            node.metadata.source_file,
-                        )
+                            session_id,
+                            created_at,
+                            source_file,
+                            int(synthesized),
+                        ),
                     )
+                    del projected
                 except (
                     ValueError,
                     TypeError,
@@ -884,74 +1076,74 @@ class StateStore:
                     bad_ids.append(identifier)
 
             if bad_ids:
-                skipped += self._discard_trajectories(bad_ids)
+                for offset in range(0, len(bad_ids), _PATH_QUERY_BATCH_SIZE):
+                    skipped += self._discard_trajectories(
+                        bad_ids[offset : offset + _PATH_QUERY_BATCH_SIZE]
+                    )
                 continue
 
-            for session_rows in real_sessions.values():
-                session_rows.sort()
-                for sub_session_id, (_, identifier, _) in enumerate(session_rows):
-                    assignments[identifier] = sub_session_id
-
-            ordered_ids = sorted(assignments)
+            self.connection.execute(
+                "CREATE TEMP TABLE branch_assignments AS "
+                "SELECT identifier,CASE WHEN synthesized=1 THEN 0 ELSE "
+                "ROW_NUMBER() OVER (PARTITION BY synthesized,session_id "
+                "ORDER BY created_at,identifier,source_file)-1 END AS ordinal "
+                "FROM branch_metadata"
+            )
             update_bad_ids: list[str] = []
             with self._write_scope():
-                for offset in range(
-                    0,
-                    len(ordered_ids),
-                    _TRAJECTORY_UPDATE_BATCH_SIZE,
-                ):
-                    identifiers = ordered_ids[
-                        offset : offset + _TRAJECTORY_UPDATE_BATCH_SIZE
-                    ]
-                    placeholders = ",".join("?" for _ in identifiers)
-                    payloads = {
-                        str(identifier): payload
-                        for identifier, payload in self.connection.execute(
-                            "SELECT trajectory_id,payload FROM trajectories "
-                            f"WHERE trajectory_id IN ({placeholders})",
-                            identifiers,
-                        )
-                    }
-                    updates: list[tuple[bytes, str]] = []
-                    for identifier in identifiers:
-                        try:
-                            projected = loads(_decompress_payload(payloads[identifier]))
-                            if identifier in self._trusted_trajectory_ids:
-                                # sub_session_id is excluded from semantic identity;
-                                # the row was fully validated on insertion.
-                                self._set_sub_session_id_in_projection(
-                                    projected, assignments[identifier]
-                                )
-                                node_json = dumps(projected, sort_keys=True)
-                            else:
-                                node = parse_trajectory_record(projected)
-                                _set_sub_session_id(node, assignments[identifier])
-                                validate_derived_fields(node)
-                                if identifier != compute_trajectory_id(node):
-                                    raise ValueError(
-                                        "sub_session_id changed canonical trajectory identity"
-                                    )
-                                node_json = dumps(project_trajectory(node), sort_keys=True)
-                            updates.append(
-                                (_compress_payload(node_json), identifier)
+                rows = self.connection.execute(
+                    "SELECT identifier,ordinal FROM branch_assignments ORDER BY identifier"
+                )
+                for identifier, ordinal in rows:
+                    try:
+                        # Exactly one serialized trajectory is retained, not
+                        # 512 source blobs plus 512 rewritten/compressed blobs.
+                        row = self.connection.execute(
+                            "SELECT payload FROM trajectories WHERE trajectory_id=?",
+                            (identifier,),
+                        ).fetchone()
+                        if row is None:
+                            raise KeyError(identifier)
+                        projected = loads(_decompress_payload(row[0]))
+                        del row
+                        if identifier in self._trusted_trajectory_ids:
+                            self._set_sub_session_id_in_projection(
+                                projected, int(ordinal)
                             )
-                        except (
-                            ValueError,
-                            TypeError,
-                            KeyError,
-                            zlib.error,
-                            zstandard.ZstdError,
-                        ):
-                            update_bad_ids.append(identifier)
-                    if updates:
-                        self.connection.executemany(
+                            node_json = dumps(projected, sort_keys=True)
+                        else:
+                            node = parse_trajectory_record(projected)
+                            _set_sub_session_id(node, int(ordinal))
+                            validate_derived_fields(node)
+                            if identifier != compute_trajectory_id(node):
+                                raise ValueError(
+                                    "sub_session_id changed canonical trajectory identity"
+                                )
+                            node_json = dumps(project_trajectory(node), sort_keys=True)
+                            del node
+                        del projected
+                        self.connection.execute(
                             "UPDATE trajectories SET payload=? WHERE trajectory_id=?",
-                            updates,
+                            (_compress_payload(node_json), identifier),
                         )
+                        del node_json
+                    except (
+                        ValueError,
+                        TypeError,
+                        KeyError,
+                        zlib.error,
+                        zstandard.ZstdError,
+                    ):
+                        update_bad_ids.append(identifier)
 
             if update_bad_ids:
-                skipped += self._discard_trajectories(update_bad_ids)
+                for offset in range(0, len(update_bad_ids), _PATH_QUERY_BATCH_SIZE):
+                    skipped += self._discard_trajectories(
+                        update_bad_ids[offset : offset + _PATH_QUERY_BATCH_SIZE]
+                    )
                 continue
+            self.connection.execute("DROP TABLE temp.branch_assignments")
+            self.connection.execute("DROP TABLE temp.branch_metadata")
             return skipped
 
     def put_trajectory(

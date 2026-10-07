@@ -8,7 +8,6 @@ import json
 import logging
 import multiprocessing
 import os
-import shutil
 import sqlite3
 import tempfile
 import time
@@ -19,17 +18,18 @@ from concurrent.futures import ProcessPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Literal
+from typing import Any, BinaryIO, Literal, NoReturn
 
+from .build_storage import BuildCollections, DiskPathSet
 from .canonical import (
     canonical_compaction_records,
     canonical_json,
     semantic_payload,
     trajectory_id,
 )
+from .disk_prefix import disk_prefix_leaves
 from .export import SCHEMA_VERSION, OutputSet
 from .io import CaptureSource, LocalCaptureSource, decode_capture
-from .json_codec import loads
 from .models import (
     AgentMessageRecord,
     AuditIssue,
@@ -43,6 +43,7 @@ from .models import (
     ServerToolCall,
     Severity,
     Snapshot,
+    StrictModel,
     ToolDefinition,
     TrajectoryNode,
 )
@@ -54,8 +55,12 @@ from .quality import enrich_trajectory
 from .sources.deepinfra import DeepInfraError, adapt_deepinfra_envelope
 from .sources.sxf import SXFError, adapt_sxf_envelope
 from .sources.tokenplan import TokenPlanError, adapt_tokenplan_envelope
-from .state import StateStore, _compress_payload, _decompress_payload
-from .streaming import streaming_prefix_leaves
+from .state import (
+    StateStore,
+    _compress_payload,
+    _decompress_payload,
+    read_snapshot_metadata,
+)
 from .subagents import (
     SubagentMountPlan,
     _accept_local_relay_mount,
@@ -66,7 +71,7 @@ from .tool_names import is_spawn_tool_name
 
 LOGGER = logging.getLogger(__name__)
 
-NORMALIZER_REVISION = "2026-10-03.1"
+NORMALIZER_REVISION = "2026-10-07.1"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 _INGEST_BATCH_ITEMS = 512
@@ -193,12 +198,12 @@ class _FlatLeaf:
     """Small session-level descriptor for one distinct flat trajectory.
 
     Full snapshots and materialized trajectories are deliberately not retained
-    here.  They are reloaded one root at a time after the sub-agent graph has
-    been planned, which bounds peak memory by one thread plus one output tree.
+    here. They are reloaded by admitted root jobs after the sub-agent graph
+    has been planned. The routing graph itself remains scope-wide.
     """
 
     routing_snapshot: Snapshot
-    contributor_paths: set[str]
+    contributor_paths: set[str] | DiskPathSet
     issues: dict[bytes, AuditIssue]
 
 
@@ -216,13 +221,12 @@ class _MaterializationJob:
     """One independent root materialization unit.
 
     Prefix aggregation and sub-agent planning happen in the coordinator.  A
-    worker only receives the resulting leaf graph and reads immutable snapshot
+    worker only receives the resulting leaf graph and reads committed snapshot
     payloads from SQLite.  This preserves the exact prefix semantics while
     parallelizing the expensive trajectory construction step.
     """
 
     state_path: str
-    immutable_state: bool
     root_index: int
     is_subagent: bool
     leaves: dict[int, _MaterializationLeaf]
@@ -512,7 +516,7 @@ def _merge_contributor_metadata(
     server_variants: set[tuple[str, int, bytes]] = set()
     server_issues: list[AuditIssue] = []
     agent_messages: dict[bytes, AgentMessageRecord] = {}
-    compaction_items: list[CompactionRecord] = []
+    compaction_items: dict[bytes, CompactionRecord] = {}
     contributor_issues: dict[bytes, AuditIssue] = {}
     for snapshot in snapshots:
         for definition in snapshot.tools:
@@ -526,7 +530,9 @@ def _merge_contributor_metadata(
             )
             key = canonical_json(projected.model_dump(mode="json", exclude_none=False))
             agent_messages.setdefault(key, projected)
-        compaction_items.extend(snapshot.compaction_items)
+        for record in snapshot.compaction_items:
+            encoded = canonical_json(record.model_dump(mode="json", exclude_none=False))
+            compaction_items.setdefault(encoded, record)
         for issue in snapshot.issues:
             contributor_issues.setdefault(_issue_key(issue), issue)
         occurrences: dict[str, int] = defaultdict(int)
@@ -607,7 +613,7 @@ def _merge_contributor_metadata(
         [agent_messages[key] for key in sorted(agent_messages)],
         [
             record.model_copy(deep=True)
-            for record in canonical_compaction_records(compaction_items)
+            for record in canonical_compaction_records(compaction_items.values())
         ],
         [
             *[contributor_issues[key] for key in sorted(contributor_issues)],
@@ -620,25 +626,85 @@ def _merge_contributor_metadata(
 def _contributor_leaf_warnings(
     leaf: Snapshot, contributors: Iterable[Snapshot]
 ) -> list[AuditIssue]:
-    warnings: list[AuditIssue] = []
-    for field in ("instructions", "model", "harness", "termination"):
-        leaf_value = getattr(leaf, field)
-        variants = {getattr(snapshot, field) for snapshot in contributors}
-        if variants <= {leaf_value}:
-            continue
-        warnings.append(
-            AuditIssue(
-                code=f"contributor_{field}_changed",
-                stage="aggregation",
-                severity=Severity.WARNING,
-                path=f"/{field}",
-                detail=(
-                    f"prefix contributors contain {field} values different "
-                    "from the leaf; the leaf value was retained"
-                ),
-            )
+    fields = ("instructions", "model", "harness", "termination")
+    changed: set[str] = set()
+    for snapshot in contributors:
+        changed.update(
+            field
+            for field in fields
+            if getattr(snapshot, field) != getattr(leaf, field)
         )
-    return warnings
+    return _contributor_changed_field_warnings(changed)
+
+
+def _contributor_changed_field_warnings(changed: set[str]) -> list[AuditIssue]:
+    return [
+        AuditIssue(
+            code=f"contributor_{field}_changed",
+            stage="aggregation",
+            severity=Severity.WARNING,
+            path=f"/{field}",
+            detail=(
+                f"prefix contributors contain {field} values different "
+                "from the leaf; the leaf value was retained"
+            ),
+        )
+        for field in ("instructions", "model", "harness", "termination")
+        if field in changed
+    ]
+
+
+class _ContributorLeafSummary:
+    """Retain only output media mappings and constant-size warning flags.
+
+    Contributors can be one-shot iterators over disk metadata.  In particular,
+    neither complete snapshots nor their repeated transcript histories survive
+    the current iteration.  Media ordering is equivalent to a stable sort of
+    captures, without retaining those captures merely to sort them.
+    """
+
+    def __init__(self, leaf: Snapshot):
+        self.leaf = leaf
+        self.changed: set[str] = set()
+        self.user_id_changed = False
+        self.has_leaf = False
+        self.leaf_media: dict[str, MediaMapping] = {}
+        for entry in leaf.multimodal_file_mapping:
+            self.leaf_media[entry.part_id] = entry.model_copy(deep=True)
+        self.prefix_media: dict[str, tuple[tuple[str, ...], int, MediaMapping]] = {}
+
+    def observe(self, snapshot: Snapshot) -> None:
+        self.has_leaf |= snapshot.source_path == self.leaf.source_path
+        self.changed.update(
+            field
+            for field in ("instructions", "model", "harness", "termination")
+            if getattr(snapshot, field) != getattr(self.leaf, field)
+        )
+        self.user_id_changed |= bool(
+            snapshot.user_id and snapshot.user_id != self.leaf.user_id
+        )
+        order = _snapshot_order_key(snapshot)
+        for ordinal, entry in enumerate(snapshot.multimodal_file_mapping):
+            if entry.part_id in self.leaf_media:
+                continue
+            previous = self.prefix_media.get(entry.part_id)
+            if previous is None or (order, ordinal) < previous[:2]:
+                self.prefix_media[entry.part_id] = (
+                    order,
+                    ordinal,
+                    entry.model_copy(deep=True),
+                )
+
+    def media(self) -> list[MediaMapping]:
+        return [
+            *self.leaf_media.values(),
+            *[
+                item[2]
+                for item in sorted(
+                    self.prefix_media.values(), key=lambda item: item[:2]
+                )
+            ],
+        ]
 
 
 def _merged_multimodal_file_mapping(
@@ -651,30 +717,10 @@ def _merged_multimodal_file_mapping(
     authoritative if a replay supplied a different filename for that part.
     """
 
-    snapshots = list(contributors)
-    snapshots.sort(key=_snapshot_order_key)
-
-    by_part: dict[str, MediaMapping] = {}
-    part_order: list[str] = []
-
-    # The leaf contains the complete request history in normal cumulative
-    # captures, so its order is the most faithful representation of first use
-    # in the published transcript.  It is also authoritative when a replay
-    # reused a part id with a different storage name.
-    for entry in leaf.multimodal_file_mapping:
-        if entry.part_id not in by_part:
-            part_order.append(entry.part_id)
-        by_part[entry.part_id] = entry.model_copy(deep=True)
-
-    # Prefix captures can contain a media reference omitted by a later replay
-    # (for example after provider-side compaction).  Retain those mappings, but
-    # append them deterministically after the leaf's first-use order.
-    for snapshot in snapshots:
-        for entry in snapshot.multimodal_file_mapping:
-            if entry.part_id not in by_part:
-                part_order.append(entry.part_id)
-                by_part[entry.part_id] = entry.model_copy(deep=True)
-    return [by_part[part_id] for part_id in part_order]
+    summary = _ContributorLeafSummary(leaf)
+    for snapshot in contributors:
+        summary.observe(snapshot)
+    return summary.media()
 
 
 def _initial_audit(issues: Sequence[AuditIssue]) -> NormalizationAudit:
@@ -700,19 +746,26 @@ def _source_file_and_line(source_path: str) -> tuple[str, int]:
 def _trajectory_from_leaf(
     leaf: Snapshot, contributors: Iterable[Snapshot]
 ) -> TrajectoryNode:
-    contributor_list = list(contributors)
-    if not any(item.source_path == leaf.source_path for item in contributor_list):
-        contributor_list.append(leaf)
+    summary = _ContributorLeafSummary(leaf)
+
+    def observed_contributors() -> Iterator[Snapshot]:
+        for contributor in contributors:
+            summary.observe(contributor)
+            yield contributor
+        if not summary.has_leaf:
+            summary.observe(leaf)
+            yield leaf
+
     tools, server_calls, agent_messages, compaction_items, contributor_issues = (
         _merge_contributor_metadata(
-            contributor_list,
+            observed_contributors(),
             server_origin_source_path=leaf.source_path,
         )
     )
     issues = _merged_issues(
         leaf.issues,
         contributor_issues,
-        _contributor_leaf_warnings(leaf, contributor_list),
+        _contributor_changed_field_warnings(summary.changed),
     )
     synthesized_identity_issues: list[AuditIssue] = []
     if not leaf.user_id:
@@ -736,7 +789,7 @@ def _trajectory_from_leaf(
             )
         )
     issues = _merged_issues(issues, synthesized_identity_issues)
-    multimodal_file_mapping = _merged_multimodal_file_mapping(leaf, contributor_list)
+    multimodal_file_mapping = summary.media()
     basename, line_no = _source_file_and_line(leaf.source_path)
     source_type, specific_source = {
         "freerouter": ("api-router", "free-router"),
@@ -744,14 +797,7 @@ def _trajectory_from_leaf(
         "sxf": ("traj-cooperate", "SXF"),
         "deepinfra": ("api-router", "deep-infra"),
     }[leaf.source_name]
-    contributor_user_ids = {
-        snapshot.user_id for snapshot in contributor_list if snapshot.user_id
-    }
-    if contributor_user_ids and any(
-        snapshot.user_id != leaf.user_id
-        for snapshot in contributor_list
-        if snapshot.user_id
-    ):
+    if summary.user_id_changed:
         issues = _merged_issues(
             issues,
             [
@@ -987,9 +1033,7 @@ def _flat_semantic_key(snapshot: Snapshot, node: TrajectoryNode) -> str:
         "response_spawn_bindings": response_spawns,
         "trajectory": semantic_payload(node),
     }
-    if any(
-        issue.code == "metadata_session_id_masked" for issue in snapshot.issues
-    ):
+    if any(issue.code == "metadata_session_id_masked" for issue in snapshot.issues):
         payload["masked_identity_source"] = snapshot.source_path
     return hashlib.sha256(canonical_json(payload)).hexdigest()
 
@@ -1020,12 +1064,10 @@ def _origin_rows(state: StateStore, paths: Iterable[str]) -> list[dict[str, str]
 
 
 def _snapshots_for_paths(state: StateStore, paths: Iterable[str]) -> Iterable[Snapshot]:
-    yield from state.iter_snapshots_for_paths(paths)
+    yield from state.iter_snapshot_metadata_for_paths(paths)
 
 
-def _descendants(
-    children: Mapping[int, Sequence[int]], root_index: int
-) -> set[int]:
+def _descendants(children: Mapping[int, Sequence[int]], root_index: int) -> set[int]:
     """Return one root's connected component from a prebuilt edge index."""
 
     found: set[int] = set()
@@ -1060,7 +1102,6 @@ def _root_materialization_inputs(
 def _materialization_job(
     *,
     state_path: Path,
-    immutable_state: bool,
     root_index: int,
     is_subagent: bool,
     children_by_parent: Mapping[int, Sequence[int]],
@@ -1075,7 +1116,6 @@ def _materialization_job(
     return (
         _MaterializationJob(
             state_path=str(state_path),
-            immutable_state=immutable_state,
             root_index=root_index,
             is_subagent=is_subagent,
             leaves={
@@ -1106,7 +1146,6 @@ def _iter_materialization_jobs(
     root_specs: Sequence[tuple[int, bool]],
     *,
     state_path: Path,
-    immutable_state: bool,
     children_by_parent: Mapping[int, Sequence[int]],
     leaves_by_index: Mapping[int, _FlatLeaf],
     graph_issues: Mapping[int, Sequence[AuditIssue]],
@@ -1120,7 +1159,6 @@ def _iter_materialization_jobs(
     for root_number, (root_index, is_subagent) in enumerate(root_specs, start=1):
         item = _materialization_job(
             state_path=state_path,
-            immutable_state=immutable_state,
             root_index=root_index,
             is_subagent=is_subagent,
             children_by_parent=children_by_parent,
@@ -1155,9 +1193,7 @@ def _materialization_job_stats(
         contributor_paths={
             index: leaf.contributor_paths for index, leaf in job.leaves.items()
         },
-        source_paths={
-            index: leaf.source_path for index, leaf in job.leaves.items()
-        },
+        source_paths={index: leaf.source_path for index, leaf in job.leaves.items()},
         leaf_issue_counts={
             index: len(leaf.issues) for index, leaf in job.leaves.items()
         },
@@ -1248,15 +1284,13 @@ def _log_materialization_stats(
     # millions of log lines for a very large batch.  Every root remains
     # observable when debug logging is enabled; oversized roots are always
     # promoted to INFO because they are the likely OOM culprits.
-    level = (
-        logging.INFO
-        if root_total <= 1_000 or estimated_bytes >= 64 * 1024 * 1024
-        else logging.DEBUG
-    )
+    level = logging.INFO if estimated_bytes >= 64 * 1024 * 1024 else logging.DEBUG
+    if not LOGGER.isEnabledFor(level):
+        return
     LOGGER.log(
         level,
         "【构建阶段】范围=%s:%s 根=%d/%d 阶段=%s 叶=%d 来源=%d 边=%d 问题=%d "
-        "来源数=%d 任务估计=%dMiB 资源=%s",
+        "来源数=%d 描述符估计=%.2fMiB 资源=%s",
         scope[0],
         scope[1],
         root_number,
@@ -1366,47 +1400,57 @@ def _materialize_tree(
 
 def _read_snapshot_for_worker(
     connection: sqlite3.Connection,
-    cache: dict[str, Snapshot],
     source_path: str,
 ) -> Snapshot:
-    cached = cache.get(source_path)
-    if cached is not None:
-        return cached
+    """Load one representative without retaining a root-wide history cache."""
+
     row = connection.execute(
         "SELECT payload FROM snapshots WHERE source_path=?",
         (source_path,),
     ).fetchone()
     if row is None:
         raise RuntimeError(f"missing representative snapshot: {source_path}")
-    snapshot = Snapshot.model_validate_json(_decompress_payload(row[0]))
-    cache[source_path] = snapshot
-    return snapshot
+    return Snapshot.model_validate_json(_decompress_payload(row[0]))
+
+
+class _ArtifactRepresentative(StrictModel):
+    source_path: str
+    source_sha256: str
+    captured_at: str
+
+
+class _MaterializationArtifact(StrictModel):
+    """Validate the artifact in JSON mode, preserving strict enum semantics."""
+
+    trajectory: TrajectoryNode
+    representative: _ArtifactRepresentative
 
 
 def _materialize_root_worker(
     job: _MaterializationJob,
-) -> tuple[int, TrajectoryNode | str, Snapshot | _RepresentativeMetadata, tuple[str, ...]]:
+) -> tuple[
+    int, TrajectoryNode | str, Snapshot | _RepresentativeMetadata, tuple[str, ...]
+]:
     """Materialize and enrich one root in an isolated process.
 
-    The SQLite state is immutable during this phase.  Each worker opens its own
-    read-only connection; no SQLite connection or Pydantic object is shared
-    between processes.
+    Each worker opens its own read-only connection. WAL allows the coordinator
+    to store completed trajectories while other workers read committed inputs.
+    Workers do not use the coordinator's SQLite connection.
     """
 
-    # Ingest has completed before jobs are submitted.  Normal state databases
-    # use WAL, so regular read-only mode is required to see committed WAL
-    # pages.  Ephemeral scheduler state uses an in-memory journal and an
-    # exclusive lock; immutable mode bypasses that retained lock safely after
-    # ingest has finished.
+    # The coordinator prepares NORMAL locking + WAL before launching workers.
+    # Do not use immutable=1: this same database receives trajectory writes.
     state_uri = Path(job.state_path).resolve().as_uri()
-    connection = sqlite3.connect(
-        state_uri + ("?mode=ro&immutable=1" if job.immutable_state else "?mode=ro"),
-        uri=True,
-    )
-    cache: dict[str, Snapshot] = {}
+    connection = sqlite3.connect(state_uri + "?mode=ro", uri=True, timeout=30.0)
 
     def load(source_path: str) -> Snapshot:
-        return _read_snapshot_for_worker(connection, cache, source_path)
+        return _read_snapshot_for_worker(connection, source_path)
+
+    def load_metadata(source_path: str) -> Snapshot:
+        snapshot = read_snapshot_metadata(connection, source_path)
+        if snapshot is None:
+            raise RuntimeError(f"missing contributor snapshot: {source_path}")
+        return snapshot
 
     leaves = job.leaves
 
@@ -1415,7 +1459,7 @@ def _materialize_root_worker(
         representative = load(descriptor.source_path)
         node = _trajectory_from_leaf(
             representative,
-            (load(path) for path in descriptor.contributor_paths),
+            (load_metadata(path) for path in descriptor.contributor_paths),
         )
         existing = node.normalization_audit
         issues = _merged_issues(
@@ -1456,15 +1500,19 @@ def _materialize_root_worker(
             # coordinator until all earlier roots have been persisted.  The
             # artifact is local to this task and is removed by the coordinator
             # immediately after consumption.
-            document = canonical_json(
-                {
-                    "trajectory": enriched.model_dump(mode="json", exclude_none=False),
-                    "representative": {
-                        "source_path": representative.source_path,
-                        "source_sha256": representative.source_sha256,
-                        "captured_at": representative.captured_at,
-                    },
-                }
+            # Pydantic's JSON serializer avoids first constructing another
+            # complete nested dict graph alongside the materialized root.
+            document = (
+                _MaterializationArtifact(
+                    trajectory=enriched,
+                    representative=_ArtifactRepresentative(
+                        source_path=representative.source_path,
+                        source_sha256=representative.source_sha256,
+                        captured_at=representative.captured_at,
+                    ),
+                )
+                .model_dump_json(exclude_none=False)
+                .encode("utf-8")
             )
             fd, artifact_path = tempfile.mkstemp(
                 prefix=f"root-{job.root_index}-",
@@ -1480,11 +1528,16 @@ def _materialize_root_worker(
                 except FileNotFoundError:
                     pass
                 raise
-            return job.root_index, artifact_path, _RepresentativeMetadata(
-                source_path=representative.source_path,
-                source_sha256=representative.source_sha256,
-                captured_at=representative.captured_at,
-            ), job.origin_paths
+            return (
+                job.root_index,
+                artifact_path,
+                _RepresentativeMetadata(
+                    source_path=representative.source_path,
+                    source_sha256=representative.source_sha256,
+                    captured_at=representative.captured_at,
+                ),
+                job.origin_paths,
+            )
         return job.root_index, enriched, representative, job.origin_paths
     finally:
         connection.close()
@@ -1496,25 +1549,19 @@ def _read_materialization_artifact(
     """Read one worker artifact and reconstruct only the current root."""
 
     path = Path(artifact_path)
-    try:
-        document = loads(_decompress_payload(path.read_bytes()))
-    finally:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
-    if not isinstance(document, dict):
-        raise TypeError("materialization artifact must contain an object")
-    representative = document.get("representative")
-    if not isinstance(representative, dict):
-        raise TypeError("materialization artifact metadata is invalid")
-    metadata = _RepresentativeMetadata(
-        source_path=str(representative["source_path"]),
-        source_sha256=str(representative["source_sha256"]),
-        captured_at=str(representative["captured_at"]),
+    document = _MaterializationArtifact.model_validate_json(
+        _decompress_payload(path.read_bytes())
     )
-    node = TrajectoryNode.model_validate(document["trajectory"])
-    return node, metadata
+    representative = document.representative
+    metadata = _RepresentativeMetadata(
+        source_path=representative.source_path,
+        source_sha256=representative.source_sha256,
+        captured_at=representative.captured_at,
+    )
+    # Keep invalid artifacts available until the failed task cleans up.  A
+    # validation defect must not erase its only completed worker result first.
+    path.unlink(missing_ok=True)
+    return document.trajectory, metadata
 
 
 def _build_worker_count(configured: int | None = None) -> int:
@@ -1539,15 +1586,10 @@ def _state_database_path(state: StateStore) -> Path:
 
     row = state.connection.execute("PRAGMA database_list").fetchone()
     if not row or not row[2]:
-        raise RuntimeError("parallel trajectory materialization requires file-backed state")
+        raise RuntimeError(
+            "parallel trajectory materialization requires file-backed state"
+        )
     return Path(str(row[2])).resolve()
-
-
-def _state_database_is_immutable(state: StateStore) -> bool:
-    """Whether workers must bypass the coordinator's ephemeral DB lock."""
-
-    row = state.connection.execute("PRAGMA journal_mode").fetchone()
-    return bool(row and str(row[0]).lower() == "memory")
 
 
 def _log_trajectory_build_failure(
@@ -1588,38 +1630,117 @@ def _skip_failed_trajectory_sources(
     return skipped
 
 
+class TrajectoryBuildError(RuntimeError):
+    """Internal construction errors must not publish incomplete successful output."""
+
+
+def _fail_build(error: Exception, paths: Iterable[str], *, stage: str) -> NoReturn:
+    from pydantic import ValidationError
+
+    sample: list[str] = []
+    count = 0
+    for path in paths:
+        count += 1
+        if len(sample) < 3:
+            sample.append(path)
+    fields: list[dict[str, object]] = []
+    if isinstance(error, ValidationError):
+        fields = [
+            {"loc": item["loc"], "type": item["type"]}
+            for item in error.errors(
+                include_input=False, include_context=False, include_url=False
+            )[:5]
+        ]
+    LOGGER.error(
+        "【构建失败】阶段=%s 异常=%s 来源数=%d 来源示例=%s 字段=%s；停止发布，不能跳过后报告成功",
+        stage,
+        type(error).__name__,
+        count,
+        sample,
+        fields,
+    )
+    raise TrajectoryBuildError(
+        f"trajectory construction failed at {stage}: {type(error).__name__}; "
+        "see sanitized build diagnostics; no successful manifest was published"
+    ) from None
+
+
+def _eligible_with_metadata(
+    state: StateStore, scope: tuple[str, str]
+) -> Iterator[Snapshot]:
+    """Populate compact contributor metadata in bounded transactions."""
+    iterator = iter(state.snapshots_for_aggregation_scope(scope))
+    exhausted = False
+    while not exhausted:
+        with state.write_batch():
+            for _ in range(_INGEST_BATCH_ITEMS):
+                snapshot = next(iterator, None)
+                if snapshot is None:
+                    exhausted = True
+                    break
+                if _eligible(snapshot):
+                    state.put_snapshot_metadata(snapshot)
+                    yield snapshot
+
+
+def _estimate_root_working_bytes(state: StateStore, job: _MaterializationJob) -> int:
+    # Account for full leaf bodies, but only metadata from prefix contributors.
+    # These are planning estimates, not promises about Python allocator usage.
+    from .build_budget import BuildMemoryError
+
+    body_paths = {leaf.source_path for leaf in job.leaves.values()}
+    bodies = state.snapshot_payload_bytes_for_paths(body_paths)
+    metadata = state.snapshot_metadata_bytes_for_paths(job.origin_paths)
+    if (
+        set(bodies) != body_paths
+        or len(metadata) != len(set(job.origin_paths))
+        or any(value is None for value in bodies.values())
+        or any(value is None for value in metadata.values())
+    ):
+        raise BuildMemoryError(
+            "root size is unknown or a source/projection is missing; rebuild the "
+            "local normalization cache from input instead of assuming a zero-size root"
+        )
+    descriptor = _materialization_job_stats(job)[-1]
+    return max(
+        64 * 1024**2,
+        sum(bodies.values()) * 24 + sum(metadata.values()) * 8 + descriptor * 4,
+    )
+
+
 def _build_trajectories(
     state: StateStore,
     stats: PipelineStats,
     *,
     build_workers: int | None = None,
 ) -> None:
+    from concurrent.futures import wait
+
+    from .build_budget import BuildBudget
+
     started_at = time.monotonic()
     last_progress_at = started_at
     completed_scopes = 0
     completed_roots = 0
-    failed_roots = 0
     total_scopes = sum(1 for _ in state.aggregation_scopes())
+    worker_count = _build_worker_count(build_workers)
+    state_path = _state_database_path(state)
+    state.prepare_concurrent_build_reads()
+    budget = BuildBudget()
 
     def log_progress(*, force: bool = False) -> None:
         nonlocal last_progress_at
         now = time.monotonic()
-        finished_roots = completed_roots + failed_roots
-        if not force and (
-            finished_roots % _PROGRESS_ITEM_INTERVAL != 0
-            and completed_scopes % _PROGRESS_ITEM_INTERVAL != 0
-            and now - last_progress_at < _PROGRESS_INTERVAL_SECONDS
-        ):
+        if not force and now - last_progress_at < _PROGRESS_INTERVAL_SECONDS:
             return
         elapsed = max(now - started_at, 0.001)
         LOGGER.info(
             "【构建阶段】已完成范围=%d/%d，已处理根轨迹=%d，已生成轨迹=%d，"
-            "失败跳过=%d，耗时=%.1f秒，范围速度=%.2f个/秒，资源=%s",
+            "耗时=%.1f秒，范围速度=%.2f个/秒，资源=%s",
             completed_scopes,
             total_scopes,
             completed_roots,
             state.trajectory_count(),
-            failed_roots,
             elapsed,
             completed_scopes / elapsed,
             memory_summary(),
@@ -1627,269 +1748,260 @@ def _build_trajectories(
         last_progress_at = now
 
     LOGGER.info(
-        "【构建阶段】开始构建轨迹，聚合范围总数=%d，并发进程数=%s",
+        "【构建阶段】磁盘前缀索引与元数据模式：聚合范围=%d，构建并发=%d，"
+        "常态软预算=80GiB，弹性软上限=96GiB；根据容器限制和其他任务占用缩减，非硬内存隔离",
         total_scopes,
-        build_workers if build_workers is not None else os.environ.get(_BUILD_WORKERS_ENV, "1"),
+        worker_count,
     )
     state.clear_trajectories()
-    failed_paths: set[str] = set()
-    represented_paths: set[str] = set()
-    # A real session is one mount-planning universe; the prefix index itself
-    # keeps its threads separate.  Captures without a session are partitioned
-    # by user (or the explicit no-user bucket) so they can merge across noisy
-    # thread/request labels without ever crossing user boundaries.
-    for scope in state.aggregation_scopes():
-        stats.sessions += 1
-        flat_leaves: dict[str, _FlatLeaf] = {}
-        evidence_by_path: dict[str, Snapshot] = {}
-        eligible = (
-            snapshot
-            for snapshot in state.snapshots_for_aggregation_scope(scope)
-            if _eligible(snapshot)
+    with ExitStack() as stack:
+        workspace = Path(
+            stack.enter_context(
+                tempfile.TemporaryDirectory(
+                    prefix="trajfoundry-build-",
+                    dir=state_path.parent,
+                )
+            )
         )
-        result = streaming_prefix_leaves(eligible)
-        stats.prefix_intermediates += len(result.intermediate_paths)
-        stats.leaf_snapshots += len(result.leaves)
-        stats.eligible_snapshots += len(result.intermediate_paths) + len(result.leaves)
-        for evidence in result.spawn_evidence:
-            evidence_by_path[evidence.source_path] = evidence
-        for leaf in result.leaves:
-            evidence_by_path.setdefault(leaf.source_path, _minimal_evidence(leaf))
-            contributor_paths = result.contributor_paths.get(
-                leaf.source_path, (leaf.source_path,)
-            )
-            try:
-                candidate = _trajectory_from_leaf(
-                    leaf, _snapshots_for_paths(state, contributor_paths)
+        pool = None
+        if worker_count > 1:
+            pool = stack.enter_context(
+                ProcessPoolExecutor(
+                    max_workers=worker_count,
+                    mp_context=multiprocessing.get_context("fork"),
                 )
-                semantic_key = _flat_semantic_key(leaf, candidate)
-            except Exception as error:  # noqa: BLE001 - skip one bad trajectory
-                failed_paths.update(contributor_paths)
-                _log_trajectory_build_failure(error, contributor_paths)
-                continue
-            candidate_issues = (
-                candidate.normalization_audit.issues
-                if candidate.normalization_audit
-                else ()
             )
-            existing = flat_leaves.get(semantic_key)
-            if existing is None:
-                flat_leaves[semantic_key] = _FlatLeaf(
-                    routing_snapshot=_routing_snapshot(leaf),
-                    contributor_paths=set(contributor_paths),
-                    issues={_issue_key(issue): issue for issue in candidate_issues},
+            # Start the reusable pool BEFORE building a scope's index or routing
+            # graph: workers must not inherit the large coordinator graph.
+            pool.submit(os.getpid).result()
+        budget.snapshot()
+        for scope_number, scope in enumerate(state.aggregation_scopes()):
+            stats.sessions += 1
+            scope_started = time.monotonic()
+            with ExitStack() as scope_stack:
+                collections = BuildCollections(
+                    workspace / f"paths-{scope_number}.sqlite"
                 )
-                continue
-            existing.contributor_paths.update(contributor_paths)
-            for issue in candidate_issues:
-                existing.issues[_issue_key(issue)] = issue
-            if _snapshot_order_key(leaf) < _snapshot_order_key(
-                existing.routing_snapshot
-            ):
-                existing.routing_snapshot = _routing_snapshot(leaf)
-
-        if not flat_leaves:
-            completed_scopes += 1
-            log_progress()
-            continue
-        routing_leaves = [
-            flat_leaves[key].routing_snapshot for key in sorted(flat_leaves)
-        ]
-        evidence = tuple(evidence_by_path.values())
-        all_flat_paths = {
-            path
-            for flat_leaf in flat_leaves.values()
-            for path in flat_leaf.contributor_paths
-        }
-        try:
-            plan = plan_subagent_mounts(routing_leaves, all_snapshots=evidence)
-            leaves_by_identity = {
-                _snapshot_identity(leaf.routing_snapshot): leaf
-                for leaf in flat_leaves.values()
-            }
-            leaves_by_index = {
-                index: leaves_by_identity[_snapshot_identity(snapshot)]
-                for index, snapshot in enumerate(plan.leaves)
-            }
-            graph_issues = _mount_issues_by_index(plan)
-            edges_by_parent: dict[int, list[tuple[str, int, str]]] = defaultdict(list)
-            for edge in plan.edges:
-                edges_by_parent[edge.parent_index].append(
-                    (edge.spawn_call_id, edge.child_index, edge.relay_id)
+                scope_stack.callback(
+                    (workspace / f"paths-{scope_number}.sqlite").unlink,
+                    missing_ok=True,
                 )
-            children_by_parent: dict[int, tuple[int, ...]] = {
-                parent_index: tuple(child_index for _, child_index, _ in edges)
-                for parent_index, edges in edges_by_parent.items()
-            }
-        except Exception as error:  # noqa: BLE001 - skip one broken scope
-            failed_paths.update(all_flat_paths)
-            _log_trajectory_build_failure(error, all_flat_paths)
-            completed_scopes += 1
-            log_progress()
-            continue
-
-        # Build one independent job per root.  The coordinator owns prefix
-        # aggregation and mount planning; workers only read the immutable
-        # SQLite snapshot and return enriched trees.  Jobs are assembled with
-        # root-local graph slices so large scopes are not pickled repeatedly.
-        worker_count = _build_worker_count(build_workers)
-        root_specs: list[tuple[int, bool]] = []
-        for root_index, is_subagent in [
-            *((index, False) for index in plan.main_root_indices),
-            *((index, True) for index in plan.orphan_indices),
-        ]:
-            root_specs.append((root_index, is_subagent))
-
-        # Keep a single root in-process even when a larger worker count is
-        # configured; process startup and SQLite handoff would otherwise cost
-        # more than the materialization itself.
-        use_pool = worker_count > 1 and len(root_specs) > 1
-        root_jobs: Iterable[tuple[_MaterializationJob, tuple[str, ...], bool]] = ()
-        artifact_dir: str | None = None
-        if use_pool:
-            state_path = _state_database_path(state)
-            immutable_state = _state_database_is_immutable(state)
-            artifact_dir = tempfile.mkdtemp(prefix="trajfoundry-build-")
-            root_jobs = _iter_materialization_jobs(
-                root_specs,
-                state_path=state_path,
-                immutable_state=immutable_state,
-                children_by_parent=children_by_parent,
-                leaves_by_index=leaves_by_index,
-                graph_issues=graph_issues,
-                edges_by_parent=edges_by_parent,
-                scope=scope,
-                artifact_dir=artifact_dir,
-            )
-
-        with state.write_batch():
-            if not use_pool:
-                for root_index, is_subagent in root_specs:
-                    _, origin_paths = _root_materialization_inputs(
-                        children_by_parent, leaves_by_index, root_index
+                scope_stack.callback(collections.close)
+                result = scope_stack.enter_context(
+                    disk_prefix_leaves(
+                        _eligible_with_metadata(state, scope),
+                        directory=workspace,
+                        fetch_snapshot=state.get_snapshot,
+                    )
+                )
+                stats.prefix_intermediates += len(result.intermediate_paths)
+                stats.leaf_snapshots += len(result.leaves)
+                stats.eligible_snapshots += len(result.intermediate_paths) + len(
+                    result.leaves
+                )
+                flat_leaves: dict[str, _FlatLeaf] = {}
+                evidence_by_path = {
+                    evidence.source_path: evidence for evidence in result.spawn_evidence
+                }
+                for leaf in result.leaves:
+                    evidence_by_path.setdefault(
+                        leaf.source_path, _minimal_evidence(leaf)
+                    )
+                    contributor_paths = result.contributor_paths.get(
+                        leaf.source_path,
+                        (leaf.source_path,),
                     )
                     try:
-                        node, snapshot = (
-                            _load_flat_node(
-                                state,
-                                leaves_by_index[root_index],
-                                graph_issues.get(root_index, ()),
-                            )
-                            if is_subagent
-                            else _materialize_tree(
-                                state,
-                                leaves_by_index,
-                                graph_issues,
-                                edges_by_parent,
-                                root_index,
-                            )
+                        candidate = _trajectory_from_leaf(
+                            leaf,
+                            _snapshots_for_paths(state, contributor_paths),
                         )
-                        if is_subagent:
-                            node.sub_agent_trajectory = None
-                            node.sub_agent_relay_mounts = None
-                        enriched = enrich_trajectory(
-                            node,
-                            top_level=True,
-                            is_subagent=is_subagent,
+                        semantic_key = _flat_semantic_key(leaf, candidate)
+                    except Exception as error:  # noqa: BLE001 - sanitize then fail closed
+                        _fail_build(error, contributor_paths, stage="flat-leaf")
+                    candidate_issues = (
+                        candidate.normalization_audit.issues
+                        if candidate.normalization_audit
+                        else ()
+                    )
+                    existing = flat_leaves.get(semantic_key)
+                    if existing is None:
+                        paths = collections.paths(semantic_key)
+                        paths.update(contributor_paths)
+                        flat_leaves[semantic_key] = _FlatLeaf(
+                            routing_snapshot=_routing_snapshot(leaf),
+                            contributor_paths=paths,
+                            issues={
+                                _issue_key(issue): issue for issue in candidate_issues
+                            },
                         )
-                        try:
-                            _store_trajectory(
-                                state,
-                                enriched,
-                                snapshot,
-                                _origin_rows(state, origin_paths),
-                            )
-                        except Exception as error:  # noqa: BLE001
-                            failed_roots += 1
-                            failed_paths.update(origin_paths)
-                            _log_trajectory_build_failure(error, origin_paths)
-                        else:
-                            completed_roots += 1
-                            represented_paths.update(origin_paths)
-                    except Exception as error:  # noqa: BLE001 - skip one bad trajectory
-                        failed_roots += 1
-                        failed_paths.update(origin_paths)
-                        _log_trajectory_build_failure(error, origin_paths)
+                    else:
+                        existing.contributor_paths.update(contributor_paths)
+                        for issue in candidate_issues:
+                            existing.issues[_issue_key(issue)] = issue
+                        if _snapshot_order_key(leaf) < _snapshot_order_key(
+                            existing.routing_snapshot
+                        ):
+                            existing.routing_snapshot = _routing_snapshot(leaf)
+                    # Do not keep the final large leaf/candidate alive for the
+                    # entire materialization of its scope.
+                    del candidate, candidate_issues, leaf
+                collections.commit()
+                if not flat_leaves:
+                    completed_scopes += 1
                     log_progress()
-            elif root_jobs:
-                # Submit in deterministic root order, but consume and persist in
-                # that same order so trajectory IDs and representative selection
-                # remain independent of process completion timing.
-                # The scheduler executes generated Python nodes at module
-                # scope, so ``spawn`` would recursively re-enter the node
-                # instead of starting a worker.  Fork is safe here because
-                # workers only use their own read-only SQLite connection and
-                # the coordinator no longer holds an exclusive SQLite lock.
+                    continue
                 try:
-                    with ProcessPoolExecutor(
-                        max_workers=worker_count,
-                        mp_context=multiprocessing.get_context("fork"),
-                    ) as pool:
-                        iterator = iter(root_jobs)
-                        futures: list[tuple[tuple[_MaterializationJob, tuple[str, ...], bool], Any]] = []
-                        for _ in range(worker_count * 2):
-                            item = next(iterator, None)
-                            if item is None:
-                                break
-                            futures.append((item, pool.submit(_materialize_root_worker, item[0])))
-                        while futures:
-                            (job, origin_paths, _), future = futures.pop(0)
-                            paths = origin_paths
-                            try:
-                                _, payload, snapshot, returned_paths = future.result()
-                                if isinstance(payload, str):
-                                    enriched, artifact_snapshot = (
-                                        _read_materialization_artifact(payload)
-                                    )
-                                    snapshot = artifact_snapshot
-                                else:
-                                    enriched = payload
-                                paths = tuple(returned_paths) or origin_paths
-                                if not isinstance(enriched, TrajectoryNode):
-                                    raise TypeError("materialization worker returned an invalid trajectory")
-                                _store_trajectory(
-                                    state,
-                                    enriched,
-                                    snapshot,
-                                    _origin_rows(state, paths),
-                                )
-                                completed_roots += 1
-                                represented_paths.update(paths)
-                            except Exception as error:  # noqa: BLE001 - skip one bad trajectory
-                                failed_roots += 1
-                                failed_paths.update(paths)
-                                _log_trajectory_build_failure(error, paths)
-                            _log_materialization_job(
-                                job,
-                                scope=scope,
-                                root_number=job.root_index,
-                                root_total=len(root_specs),
-                                stage="完成",
+                    plan = plan_subagent_mounts(
+                        [
+                            flat_leaves[key].routing_snapshot
+                            for key in sorted(flat_leaves)
+                        ],
+                        all_snapshots=tuple(evidence_by_path.values()),
+                    )
+                    leaves_by_identity = {
+                        _snapshot_identity(leaf.routing_snapshot): leaf
+                        for leaf in flat_leaves.values()
+                    }
+                    leaves_by_index = {
+                        index: leaves_by_identity[_snapshot_identity(snapshot)]
+                        for index, snapshot in enumerate(plan.leaves)
+                    }
+                    graph_issues = _mount_issues_by_index(plan)
+                    edges_by_parent: dict[int, list[tuple[str, int, str]]] = (
+                        defaultdict(list)
+                    )
+                    for edge in plan.edges:
+                        edges_by_parent[edge.parent_index].append(
+                            (edge.spawn_call_id, edge.child_index, edge.relay_id),
+                        )
+                    children_by_parent = {
+                        parent: tuple(child for _, child, _ in edges)
+                        for parent, edges in edges_by_parent.items()
+                    }
+                except Exception as error:  # noqa: BLE001 - sanitize then fail closed
+                    _fail_build(error, (), stage="subagent-plan")
+                root_specs = [
+                    *((index, False) for index in plan.main_root_indices),
+                    *((index, True) for index in plan.orphan_indices),
+                ]
+                del evidence_by_path, leaves_by_identity
+                LOGGER.info(
+                    "【构建阶段】索引与挂载完成：范围=%s:%s 叶=%d 根=%d 前缀中间记录=%d "
+                    "规划耗时=%.1f秒，资源=%s",
+                    scope[0],
+                    scope[1],
+                    len(result.leaves),
+                    len(root_specs),
+                    len(result.intermediate_paths),
+                    time.monotonic() - scope_started,
+                    memory_summary(),
+                )
+                jobs = iter(
+                    _iter_materialization_jobs(
+                        root_specs,
+                        state_path=state_path,
+                        children_by_parent=children_by_parent,
+                        leaves_by_index=leaves_by_index,
+                        graph_issues=graph_issues,
+                        edges_by_parent=edges_by_parent,
+                        scope=scope,
+                        artifact_dir=str(workspace),
+                    )
+                )
+                state.commit()
+                pending: dict[
+                    Any, tuple[_MaterializationJob, tuple[str, ...], int]
+                ] = {}
+                reserved = 0
+                next_item = next(jobs, None)
+                next_estimate = None
+
+                def consume(
+                    job: _MaterializationJob, paths: tuple[str, ...], outcome: Any
+                ) -> None:
+                    nonlocal completed_roots
+                    try:
+                        _, payload, representative, returned_paths = outcome
+                        if isinstance(payload, str):
+                            enriched, representative = _read_materialization_artifact(
+                                payload
                             )
+                        else:
+                            enriched = payload
+                        if not isinstance(enriched, TrajectoryNode):
+                            raise TypeError(
+                                "materialization worker returned an invalid trajectory"
+                            )
+                        _store_trajectory(
+                            state,
+                            enriched,
+                            representative,
+                            _origin_rows(state, tuple(returned_paths) or paths),
+                        )
+                        completed_roots += 1
+                    except Exception as error:  # noqa: BLE001 - sanitize then fail closed
+                        _fail_build(error, paths, stage="materialize-or-store")
+                    log_progress()
+
+                while next_item is not None or pending:
+                    while next_item is not None and len(pending) < worker_count * 2:
+                        job, paths, _ = next_item
+                        if next_estimate is None:
+                            next_estimate = _estimate_root_working_bytes(state, job)
+                        if not budget.can_submit(
+                            reserved, next_estimate, pending=bool(pending)
+                        ):
+                            break
+                        if pool is None:
+                            try:
+                                outcome = _materialize_root_worker(job)
+                            except Exception as error:  # noqa: BLE001 - sanitize then fail closed
+                                _fail_build(error, paths, stage="materialize")
+                            consume(job, paths, outcome)
+                        else:
+                            future = pool.submit(_materialize_root_worker, job)
+                            pending[future] = (job, paths, next_estimate)
+                            reserved += next_estimate
+                        next_item = next(jobs, None)
+                        next_estimate = None
+                    if pending:
+                        first = next(iter(pending))
+                        done, _ = wait((first,), timeout=5.0)
+                        if not done:
                             log_progress()
-                            item = next(iterator, None)
-                            if item is not None:
-                                futures.append((item, pool.submit(_materialize_root_worker, item[0])))
-                finally:
-                    if artifact_dir is not None:
-                        shutil.rmtree(artifact_dir, ignore_errors=True)
-        completed_scopes += 1
-        log_progress()
-    _skip_failed_trajectory_sources(state, failed_paths, represented_paths)
-    state.assign_sub_session_ids()
-    # Sub-session assignment validates the materialized rows a second time.
-    # A malformed cached row can therefore be skipped after the initial
-    # materialization pass; count those inputs before exporting the manifest.
+                            continue
+                        # Store in submission order: overlapping source lineage
+                        # can be first-writer-wins even when the representative
+                        # trajectory winner itself is deterministic. Completed
+                        # futures hold disk artifact paths, not full root bodies.
+                        while pending:
+                            future = next(iter(pending))
+                            if not future.done():
+                                break
+                            job, paths, estimate = pending.pop(future)
+                            reserved -= estimate
+                            try:
+                                outcome = future.result()
+                            except Exception as error:  # noqa: BLE001 - sanitize then fail closed
+                                _fail_build(error, paths, stage="worker-result")
+                            consume(job, paths, outcome)
+                completed_scopes += 1
+                log_progress()
+    skipped = state.assign_sub_session_ids()
+    if skipped:
+        raise TrajectoryBuildError(
+            "stored trajectory failed final branch assignment; refusing incomplete publication",
+        )
     stats.skipped_inputs = sum(
         status == "skipped" for _, _, status, _, _, _ in state.capture_records()
     )
     stats.stored_trajectories = state.trajectory_count()
     log_progress(force=True)
     LOGGER.info(
-        "【构建阶段】完成：范围=%d，生成轨迹=%d，失败跳过=%d，耗时=%.1f秒",
+        "【构建阶段】完成：范围=%d，生成轨迹=%d，耗时=%.1f秒",
         stats.sessions,
         stats.stored_trajectories,
-        failed_roots,
         time.monotonic() - started_at,
     )
 
@@ -2018,7 +2130,7 @@ def _export(
                 processed_records += 1
                 log_progress()
                 continue
-            snapshot = state.get_snapshot(source_ref)
+            snapshot = state.get_snapshot_metadata(source_ref)
             if snapshot is not None and (record := _snapshot_record(snapshot)):
                 output.write_record(record)
             processed_records += 1
@@ -2316,9 +2428,7 @@ def _ingest_source(
                 mp_context=multiprocessing.get_context("fork"),
             ) as executor:
                 streaming = getattr(source, "iter_capture_payloads", None)
-                payload_formats = getattr(
-                    source, "payload_formats", frozenset({"sxf"})
-                )
+                payload_formats = getattr(source, "payload_formats", frozenset({"sxf"}))
                 if config.input_format in payload_formats and callable(streaming):
                     for source_ref, payload, digest in streaming(config.input_format):
                         submit_parse(executor, source_ref, payload, digest)

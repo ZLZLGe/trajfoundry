@@ -168,7 +168,7 @@ def test_trajectory_preserves_integer_larger_than_orjson_range(
     assert validate_output(output_root).valid
 
 
-def test_bad_trajectory_is_skipped_without_discarding_other_trajectories(
+def test_internal_trajectory_defect_does_not_publish_incomplete_success(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -194,21 +194,11 @@ def test_bad_trajectory_is_skipped_without_discarding_other_trajectories(
         return original(snapshot, node)
 
     monkeypatch.setattr(pipeline_module, "_flat_semantic_key", fail_one)
-    stats = normalize(PipelineConfig(input_root=input_root, output_root=output_root))
-
-    manifest = orjson.loads((output_root / "manifest.json").read_bytes())
-    assert stats.stored_trajectories == 1
-    assert stats.skipped_inputs == 1
-    assert manifest["counts"]["skipped_inputs"] == 1
-    assert manifest["counts"]["skip_reason_counts"] == {
-        "trajectory_materialization_failed": 1
-    }
-    trajectory_path = output_root / next(
-        entry["path"] for entry in manifest["files"] if entry["path"] != "lineage.jsonl"
-    )
-    trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
-    assert trajectory["metadata"]["source_file"] == "good.json"
-    assert validate_output(output_root).valid
+    with pytest.raises(pipeline_module.TrajectoryBuildError, match="flat-leaf"):
+        normalize(PipelineConfig(input_root=input_root, output_root=output_root))
+    assert not (output_root / "manifest.json").exists()
+    assert (input_root / "bad.json").exists()
+    assert (input_root / "good.json").exists()
 
 
 def test_end_to_end_prefix_tool_union_resume_and_deleted_input(tmp_path: Path) -> None:

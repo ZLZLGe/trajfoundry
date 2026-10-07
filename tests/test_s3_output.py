@@ -1,4 +1,6 @@
 import hashlib
+from concurrent.futures import Future
+from pathlib import Path
 from typing import Any
 
 import orjson
@@ -17,7 +19,7 @@ from trajfoundry.models import (
 )
 from trajfoundry.quality import enrich_trajectory
 from trajfoundry.s3 import S3Location
-from trajfoundry.s3_output import S3OutputSet
+from trajfoundry.s3_output import S3OutputSet, _S3ObjectWriter
 
 
 class FakeS3Client:
@@ -348,3 +350,133 @@ def test_failed_multipart_abort_keeps_upload_id_for_outer_retry(
     assert "will retry" in caplog.text
     assert "injected abort failure" not in caplog.text
     assert not any(name.startswith("delete") for name, _ in client.calls)
+
+
+class DeferredExecutor:
+    """Deterministically inspect/cancel queued uploads before they start."""
+
+    def __init__(self) -> None:
+        self.pending: list[tuple[Future, Any, tuple[Any, ...]]] = []
+
+    def submit(self, function: Any, *args: Any) -> Future:
+        future = Future()
+        self.pending.append((future, function, args))
+        return future
+
+    def run(self) -> None:
+        for future, function, args in self.pending:
+            if future.set_running_or_notify_cancel():
+                try:
+                    future.set_result(function(*args))
+                except BaseException as error:  # noqa: BLE001 - match Future execution
+                    future.set_exception(error)
+
+    def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+        assert wait
+        if cancel_futures:
+            for future, _, _ in self.pending:
+                future.cancel()
+
+
+def _deferred_output(tmp_path: Path) -> tuple[S3OutputSet, DeferredExecutor]:
+    output = S3OutputSet(
+        FakeS3Client(), _location(), max_workers=2, max_pending=4, spool_dir=tmp_path
+    )
+    output._executor.shutdown(wait=True)
+    executor = DeferredExecutor()
+    output._executor = executor
+    return output, executor
+
+
+def test_parallel_upload_queue_holds_files_instead_of_serialized_bytes(
+    tmp_path: Path,
+) -> None:
+    output, executor = _deferred_output(tmp_path)
+    for name in ("one.json", "two.json"):
+        output.write_trajectory(_trajectory(name), [_origin(name)])
+    files = [args[1] for _, _, args in executor.pending]
+    assert len(files) == 2
+    for spool in files:
+        assert not isinstance(spool, bytes)
+        assert not spool.closed
+        assert spool.read(1) == b"{"
+        spool.seek(0)
+    executor.run()
+    manifest = orjson.loads(
+        output.close(input_root="s3://bucket/input/", config_hash="config")
+    )
+    assert manifest["counts"]["accepted"] == 2
+    assert all(spool.closed for spool in files)
+    assert list(tmp_path.iterdir()) == []
+    for description in output.written_objects:
+        body = output._client.objects[(description.bucket, description.key)]
+        assert description.sha256 == hashlib.sha256(body).hexdigest()
+
+
+def test_cancelled_uploads_close_unstarted_spool_files(tmp_path: Path) -> None:
+    output, executor = _deferred_output(tmp_path)
+    output.write_trajectory(_trajectory("cancelled.json"), [_origin("cancelled.json")])
+    future, _, args = executor.pending[0]
+    spool = args[1]
+    output.abort()
+    assert future.cancelled()
+    assert spool.closed
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_failed_upload_closes_spool_file(tmp_path: Path) -> None:
+    output, executor = _deferred_output(tmp_path)
+    output.write_trajectory(_trajectory("failed.json"), [_origin("failed.json")])
+    spool = executor.pending[0][2][1]
+
+    def fail_put(**_kwargs: Any) -> None:
+        raise OSError("injected put failure")
+
+    output._client.put_object = fail_put
+    executor.run()
+    with pytest.raises(OSError, match="injected put failure"):
+        output.close(input_root="s3://bucket/input/", config_hash="config")
+    assert spool.closed
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_spool_submission_failure_closes_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import trajfoundry.s3_output as module
+
+    output, executor = _deferred_output(tmp_path)
+    opened = []
+    original = module.tempfile.TemporaryFile
+
+    def tracked_file(**kwargs: Any):
+        assert kwargs["dir"] == tmp_path
+        handle = original(**kwargs)
+        opened.append(handle)
+        return handle
+
+    def fail_submit(*_args: Any):
+        raise RuntimeError("executor unavailable")
+
+    monkeypatch.setattr(module.tempfile, "TemporaryFile", tracked_file)
+    monkeypatch.setattr(executor, "submit", fail_submit)
+    with pytest.raises(RuntimeError, match="executor unavailable"), output:
+        output.write_trajectory(_trajectory("failed.json"), [_origin("failed.json")])
+    assert len(opened) == 1
+    assert opened[0].closed
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_single_large_write_keeps_multipart_buffer_bounded() -> None:
+    class ObservedWriter(_S3ObjectWriter):
+        def _upload_part(self, body: bytes) -> None:
+            assert len(self._buffer) <= self._buffer_bytes
+            super()._upload_part(body)
+
+    client = FakeS3Client()
+    writer = ObservedWriter(client, _location(), "bounded.jsonl")
+    payload = b"x" * (17 * 1024 * 1024)
+    writer.write(payload)
+    description = writer.close()
+    assert client.objects[(description.bucket, description.key)] == payload
+    assert description.sha256 == hashlib.sha256(payload).hexdigest()

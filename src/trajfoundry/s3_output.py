@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import tempfile
 import time
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal, Self
+from pathlib import Path
+from typing import Any, BinaryIO, Literal, Self
 
 from .canonical import trajectory_id
 from .export import SCHEMA_VERSION, ExportStats, trajectory_filename
@@ -129,12 +131,22 @@ class _S3ObjectWriter:
             return
         self._digest.update(payload)
         self._size += len(payload)
-        self._buffer.extend(payload)
         try:
-            if self._upload_id is None and len(self._buffer) > self._buffer_bytes:
+            if (
+                self._upload_id is None
+                and len(self._buffer) + len(payload) > self._buffer_bytes
+            ):
                 self._start_multipart()
-            if self._upload_id is not None:
-                self._flush_full_parts()
+            # A single JSONL line can be hundreds of MiB. Never copy that
+            # entire line into the multipart buffer before flushing it.
+            view = memoryview(payload)
+            offset = 0
+            while offset < len(view):
+                end = min(len(view), offset + self._buffer_bytes - len(self._buffer))
+                self._buffer.extend(view[offset:end])
+                offset = end
+                if self._upload_id is not None:
+                    self._flush_full_parts()
         except Exception:
             self._failed = True
             self._abort_multipart()
@@ -196,6 +208,7 @@ class S3OutputSet:
         max_shard_bytes: int = 512 * 1024 * 1024,
         max_workers: int = 1,
         max_pending: int | None = None,
+        spool_dir: Path | None = None,
     ) -> None:
         if max_shard_bytes <= 0:
             raise ValueError("max shard bytes must be positive")
@@ -208,6 +221,7 @@ class S3OutputSet:
         self.location = location
         self.max_workers = max_workers
         self.max_pending = max_pending or max_workers * 2
+        self._spool_dir = spool_dir
         self._trajectory_objects: list[S3ObjectDescription] = []
         self._trajectory_names: set[str] = set()
         self._lineage = _S3ObjectWriter(client, location, "lineage.jsonl")
@@ -274,6 +288,45 @@ class S3OutputSet:
         self._trajectory_objects.append(future.result())
         self._log_progress()
 
+    def _upload_spooled_trajectory(
+        self, relative_path: str, spool: BinaryIO
+    ) -> S3ObjectDescription:
+        """Upload a disk-backed queue item using a bounded multipart buffer."""
+
+        writer = _S3ObjectWriter(self._client, self.location, relative_path)
+        try:
+            while chunk := spool.read(_BUFFER_BYTES):
+                writer.write(chunk)
+            return writer.close()
+        except BaseException:
+            writer.abort()
+            raise
+        finally:
+            spool.close()
+
+    def _submit_spooled_trajectory(self, relative_path: str, payload: bytes) -> None:
+        assert self._executor is not None
+        spool = tempfile.TemporaryFile(  # noqa: SIM115 - ownership transfers to the future
+            mode="w+b", prefix="trajfoundry-upload-", dir=self._spool_dir
+        )
+        try:
+            spool.write(payload)
+            spool.seek(0)
+            future = self._executor.submit(
+                self._upload_spooled_trajectory, relative_path, spool
+            )
+        except BaseException:
+            spool.close()
+            raise
+
+        def release_cancelled_file(completed: Future[S3ObjectDescription]) -> None:
+            # A cancelled task never entered the worker's finally block.
+            if completed.cancelled():
+                spool.close()
+
+        future.add_done_callback(release_cancelled_file)
+        self._trajectory_futures.append(future)
+
     def _resolve_all_futures(self) -> None:
         while self._trajectory_futures:
             self._resolve_oldest_future()
@@ -339,13 +392,7 @@ class S3OutputSet:
                 self._trajectory_objects.append(description)
                 self._log_progress()
             else:
-                self._trajectory_futures.append(
-                    self._executor.submit(
-                        self._upload_trajectory,
-                        filename,
-                        payload,
-                    )
-                )
+                self._submit_spooled_trajectory(filename, payload)
                 while len(self._trajectory_futures) >= self.max_pending:
                     self._resolve_oldest_future()
         except Exception:
