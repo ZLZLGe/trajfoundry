@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import http.client
 import io
 import json
+import traceback
 import urllib.error
 
 import orjson
@@ -87,17 +89,60 @@ class _ContextThenCompletion:
 
 
 class _HTTPResponse:
-    def __init__(self, payload: bytes) -> None:
+    def __init__(self, payload: bytes, *, read_error: Exception | None = None) -> None:
         self.payload = payload
+        self.read_error = read_error
+        self.closed = False
 
     def __enter__(self):
         return self
 
     def __exit__(self, *_args: object) -> None:
-        return None
+        self.close()
 
-    def read(self) -> bytes:
+    def close(self) -> None:
+        self.closed = True
+
+    def read(self, _size: int = -1) -> bytes:
+        if self.read_error is not None:
+            raise self.read_error
         return self.payload
+
+
+class _SequenceOpener:
+    """Raise failures while opening or reading, without network access."""
+
+    def __init__(self, outcomes: list[bytes | Exception], failure_stage: str) -> None:
+        self.outcomes = outcomes
+        self.failure_stage = failure_stage
+        self.calls = 0
+        self.responses: list[_HTTPResponse] = []
+
+    def __call__(self, *_args, **_kwargs) -> _HTTPResponse:
+        outcome = self.outcomes[self.calls]
+        self.calls += 1
+        if isinstance(outcome, Exception):
+            if self.failure_stage == "open":
+                raise outcome
+            response = _HTTPResponse(b"", read_error=outcome)
+        else:
+            response = _HTTPResponse(outcome)
+        self.responses.append(response)
+        return response
+
+
+_NETWORK_ERROR_FACTORIES = [
+    pytest.param(http.client.RemoteDisconnected, id="remote-disconnected"),
+    pytest.param(ConnectionResetError, id="connection-reset"),
+    pytest.param(ConnectionAbortedError, id="connection-aborted"),
+    pytest.param(BrokenPipeError, id="broken-pipe"),
+    pytest.param(
+        lambda message: http.client.IncompleteRead(message.encode(), 100),
+        id="incomplete-read",
+    ),
+    pytest.param(urllib.error.URLError, id="url-error"),
+    pytest.param(TimeoutError, id="timeout"),
+]
 
 
 def _taxonomy(tmp_path) -> ScenarioTaxonomy:
@@ -584,6 +629,168 @@ def test_chat_client_retries_429_without_exposing_key() -> None:
     assert "must not surface" not in str(caught.value)
 
 
+@pytest.mark.parametrize("error_factory", _NETWORK_ERROR_FACTORIES)
+@pytest.mark.parametrize("failure_stage", ["open", "read"])
+def test_chat_client_recovers_from_transient_network_failures(
+    error_factory, failure_stage
+) -> None:
+    content = '{"ok": true}'
+    opener = _SequenceOpener(
+        [
+            error_factory("first failure"),
+            error_factory("second failure"),
+            orjson.dumps({"choices": [{"message": {"content": content}}]}),
+        ],
+        failure_stage,
+    )
+    sleeps: list[float] = []
+    client = ChatCompletionsClient(
+        api_url="https://classifier.invalid/v1/chat/completions",
+        model="model",
+        api_key="secret",
+        max_retries=2,
+        opener=opener,
+        sleeper=sleeps.append,
+        jitter=lambda: 0.0,
+    )
+
+    assert client.complete([{"role": "user", "content": "hello"}]) == content
+
+    assert opener.calls == 3
+    assert sleeps == [0.5, 1.0]
+    assert len(opener.responses) == (3 if failure_stage == "read" else 1)
+    assert all(response.closed for response in opener.responses)
+
+
+@pytest.mark.parametrize("error_factory", _NETWORK_ERROR_FACTORIES)
+@pytest.mark.parametrize("failure_stage", ["open", "read"])
+@pytest.mark.parametrize("max_retries", [0, 2])
+def test_chat_client_bounds_network_retries_and_closes_failed_responses(
+    error_factory, failure_stage, max_retries
+) -> None:
+    opener = _SequenceOpener(
+        [error_factory("transport failed") for _ in range(max_retries + 1)],
+        failure_stage,
+    )
+    sleeps: list[float] = []
+    client = ChatCompletionsClient(
+        api_url="https://classifier.invalid/v1/chat/completions",
+        model="model",
+        api_key="secret",
+        max_retries=max_retries,
+        opener=opener,
+        sleeper=sleeps.append,
+        jitter=lambda: 0.0,
+    )
+
+    with pytest.raises(ClassificationRetryExhausted) as caught:
+        client.complete([{"role": "user", "content": "hello"}])
+
+    assert caught.value.reason == "network_retry_exhausted"
+    assert opener.calls == max_retries + 1
+    assert sleeps == ([] if max_retries == 0 else [0.5, 1.0])
+    assert len(opener.responses) == (max_retries + 1 if failure_stage == "read" else 0)
+    assert all(response.closed for response in opener.responses)
+
+
+@pytest.mark.parametrize("error_factory", _NETWORK_ERROR_FACTORIES)
+@pytest.mark.parametrize("failure_stage", ["open", "read"])
+def test_classifier_network_exhaustion_is_not_cacheable_or_semantically_retried(
+    tmp_path, error_factory, failure_stage
+) -> None:
+    opener = _SequenceOpener(
+        [error_factory("transport failed") for _ in range(3)], failure_stage
+    )
+    sleeps: list[float] = []
+    client = ChatCompletionsClient(
+        api_url="https://classifier.invalid/v1/chat/completions",
+        model="model",
+        api_key="secret",
+        max_retries=2,
+        opener=opener,
+        sleeper=sleeps.append,
+        jitter=lambda: 0.0,
+    )
+    classifier = TrajectoryClassifier(
+        client=client,
+        taxonomy=_taxonomy(tmp_path),
+        input_manifest_sha256="a" * 64,
+        semantic_retries=2,
+    )
+
+    attempt = classifier.classify({"messages": []})
+
+    assert not attempt.cacheable
+    assert attempt.classification["status"] == "failed"
+    assert attempt.classification["reason"] == "network_retry_exhausted"
+    assert opener.calls == 3
+    assert sleeps == [0.5, 1.0]
+    assert all(response.closed for response in opener.responses)
+
+
+@pytest.mark.parametrize("error_factory", _NETWORK_ERROR_FACTORIES)
+@pytest.mark.parametrize("failure_stage", ["open", "read"])
+def test_chat_client_network_logs_and_traceback_do_not_expose_secrets(
+    caplog, error_factory, failure_stage
+) -> None:
+    secrets = ["sk-do-not-log-this", "private-user-request", "raw-response-marker"]
+    opener = _SequenceOpener(
+        [error_factory(" ".join(secrets)) for _ in range(2)], failure_stage
+    )
+    sleeps: list[float] = []
+    client = ChatCompletionsClient(
+        api_url="https://classifier.invalid/v1/chat/completions",
+        model="model",
+        api_key=secrets[0],
+        max_retries=1,
+        opener=opener,
+        sleeper=sleeps.append,
+        jitter=lambda: 0.0,
+    )
+
+    with pytest.raises(ClassificationRetryExhausted) as caught:
+        client.complete([{"role": "user", "content": secrets[1]}])
+
+    formatted = "".join(traceback.format_exception(caught.value))
+    assert "network_retry_exhausted" in formatted
+    assert all(secret not in formatted for secret in secrets)
+    assert all(secret not in caplog.text for secret in secrets)
+    assert all(secret not in repr(client) for secret in secrets)
+    assert "retry_attempt=1/1" in caplog.text
+    assert "attempts=2" in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__
+    assert opener.calls == 2
+    assert sleeps == [0.5]
+
+
+@pytest.mark.parametrize(
+    "error_type", [RuntimeError, FileNotFoundError, http.client.HTTPException]
+)
+@pytest.mark.parametrize("failure_stage", ["open", "read"])
+def test_chat_client_does_not_retry_unrelated_errors(error_type, failure_stage) -> None:
+    error = error_type("unexpected local failure")
+    opener = _SequenceOpener([error], failure_stage)
+    sleeps: list[float] = []
+    client = ChatCompletionsClient(
+        api_url="https://classifier.invalid/v1/chat/completions",
+        model="model",
+        api_key="secret",
+        max_retries=2,
+        opener=opener,
+        sleeper=sleeps.append,
+    )
+
+    with pytest.raises(error_type) as caught:
+        client.complete([{"role": "user", "content": "hello"}])
+
+    assert caught.value is error
+    assert opener.calls == 1
+    assert sleeps == []
+    assert all(response.closed for response in opener.responses)
+
+
 def test_chat_client_sends_bounded_json_request() -> None:
     captured: dict[str, object] = {}
 
@@ -633,14 +840,21 @@ def test_chat_client_reports_context_limit_separately() -> None:
         client.complete([{"role": "user", "content": "hello"}])
 
 
-def test_chat_client_treats_404_as_configuration_error() -> None:
+@pytest.mark.parametrize("status", [401, 403, 404, 422])
+def test_chat_client_does_not_retry_configuration_errors(status) -> None:
+    attempts = 0
+    sleeps: list[float] = []
+    body = io.BytesIO(b"configuration error")
+
     def opener(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
         raise urllib.error.HTTPError(
             "https://classifier.invalid/v1/chat/completions",
-            404,
-            "missing",
+            status,
+            "configuration error",
             {},
-            io.BytesIO(b"not found"),
+            body,
         )
 
     client = ChatCompletionsClient(
@@ -648,10 +862,61 @@ def test_chat_client_treats_404_as_configuration_error() -> None:
         model="model",
         api_key="secret",
         opener=opener,
+        sleeper=sleeps.append,
     )
 
-    with pytest.raises(ClassificationConfigurationError, match="HTTP 404"):
+    with pytest.raises(ClassificationConfigurationError, match=f"HTTP {status}"):
         client.complete([{"role": "user", "content": "hello"}])
+
+    assert attempts == 1
+    assert sleeps == []
+    assert body.closed
+
+
+@pytest.mark.parametrize(
+    "status, expected_error, expected_message",
+    [
+        (400, ClassificationRequestError, "classifier_http_400"),
+        (422, ClassificationConfigurationError, "HTTP 422"),
+    ],
+)
+@pytest.mark.parametrize(
+    "read_error",
+    [http.client.IncompleteRead(b"partial", 100), OSError("response read failed")],
+)
+def test_chat_client_preserves_http_status_when_error_body_read_fails(
+    status, expected_error, expected_message, read_error
+) -> None:
+    attempts = 0
+    sleeps: list[float] = []
+    body = _HTTPResponse(b"", read_error=read_error)
+
+    def opener(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise urllib.error.HTTPError(
+            "https://classifier.invalid/v1/chat/completions",
+            status,
+            "request rejected",
+            {},
+            body,
+        )
+
+    client = ChatCompletionsClient(
+        api_url="https://classifier.invalid/v1/chat/completions",
+        model="model",
+        api_key="secret",
+        max_retries=2,
+        opener=opener,
+        sleeper=sleeps.append,
+    )
+
+    with pytest.raises(expected_error, match=expected_message):
+        client.complete([{"role": "user", "content": "hello"}])
+
+    assert attempts == 1
+    assert sleeps == []
+    assert body.closed
 
 
 def test_chat_client_retries_all_5xx_statuses() -> None:

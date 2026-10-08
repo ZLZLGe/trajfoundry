@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import io
 import sqlite3
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 import orjson
@@ -11,7 +13,10 @@ import pytest
 
 from trajfoundry.canonical import trajectory_id
 from trajfoundry.classification.classifier import TrajectoryClassifier
-from trajfoundry.classification.client import ClassificationConfigurationError
+from trajfoundry.classification.client import (
+    ChatCompletionsClient,
+    ClassificationConfigurationError,
+)
 from trajfoundry.classification.taxonomy import ScenarioTaxonomy
 from trajfoundry.label_jobs import (
     LabelJobError,
@@ -817,3 +822,128 @@ def test_invalid_model_output_still_writes_every_complete_trajectory(
         assert row["normalization_audit"]
         assert row["classification"]["status"] == "failed"
         assert row["classification"]["reason"] == "invalid_model_output"
+
+
+def test_network_exhaustion_publishes_failed_row_and_retries_only_it_on_rerun(
+    tmp_path: Path,
+) -> None:
+    client = _MemoryS3()
+    input_location = S3Location("bucket", "normalized/v005/dt=2026-09-14/")
+    output_location = S3Location("bucket", "classified/v001/dt=2026-09-14/")
+    manifest_bytes = _install_v4_input(client, input_location)
+    calls = {"earlier.json": 0, "later.json": 0, "missing.json": 0}
+    calls_lock = Lock()
+    recovered = False
+    decision = orjson.dumps(
+        {
+            "scenario_label_key": "toc|Shopping|购物",
+            "capability_labels": ["Tool Use"],
+        }
+    ).decode()
+
+    def opener(request, **_kwargs):
+        messages = orjson.loads(request.data)["messages"]
+        source = next(
+            source for source in calls if f"request {source}" in messages[-1]["content"]
+        )
+        with calls_lock:
+            calls[source] += 1
+        if source == "earlier.json" and not recovered:
+            raise http.client.RemoteDisconnected("private transport detail")
+        return io.BytesIO(
+            orjson.dumps({"choices": [{"message": {"content": decision}}]})
+        )
+
+    completion = ChatCompletionsClient(
+        api_url="https://classifier.invalid/v1/chat/completions",
+        model="classifier-test",
+        api_key="test-key",
+        max_retries=1,
+        opener=opener,
+        sleeper=lambda _delay: None,
+    )
+    classifier = TrajectoryClassifier(
+        client=completion,
+        taxonomy=_taxonomy(tmp_path),
+        input_manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+    )
+    state_path = tmp_path / "network-state.sqlite"
+
+    def published_rows(expected_counts: dict[str, int]) -> dict[str, Any]:
+        manifest = orjson.loads(
+            client.objects[
+                (output_location.bucket, output_location.key("manifest.json"))
+            ]
+        )
+        assert manifest["schema_version"] == "trajfoundry-classification-v1"
+        assert manifest["counts"] == expected_counts
+        rows = {}
+        for entry in manifest["files"]:
+            payload = client.objects[
+                (output_location.bucket, output_location.key(entry["path"]))
+            ]
+            assert entry["bytes"] == len(payload)
+            assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
+            if entry["kind"] == "trajectory":
+                row = orjson.loads(payload)
+                assert entry["classification_status"] == row["classification"]["status"]
+                rows[row["source"]] = row
+        assert set(rows) == set(calls)
+        return rows
+
+    result = _run_s3_label_job_with_client(
+        client,
+        input_location=input_location,
+        output_location=output_location,
+        classifier=classifier,
+        workspace=tmp_path,
+        state_path=state_path,
+        max_workers=2,
+    )
+
+    assert result.validation_valid
+    assert (
+        result.input_trajectories,
+        result.classified,
+        result.failed,
+        result.cache_hits,
+    ) == (3, 2, 1, 0)
+    assert calls == {"earlier.json": 2, "later.json": 1, "missing.json": 1}
+    first_rows = published_rows(
+        {"input_trajectories": 3, "classified": 2, "failed": 1, "cache_hits": 0}
+    )
+    failed_row = first_rows["earlier.json"]
+    assert failed_row["messages"]
+    assert failed_row["metadata"]["session_id"] == "session-A"
+    assert failed_row["normalization_audit"]
+    assert failed_row["classification"]["status"] == "failed"
+    assert failed_row["classification"]["reason"] == "network_retry_exhausted"
+    assert b"private transport detail" not in orjson.dumps(failed_row)
+    for source in ("later.json", "missing.json"):
+        assert first_rows[source]["classification"]["status"] == "accepted"
+
+    recovered = True
+    rerun = _run_s3_label_job_with_client(
+        client,
+        input_location=input_location,
+        output_location=output_location,
+        classifier=classifier,
+        workspace=tmp_path,
+        state_path=state_path,
+        max_workers=2,
+    )
+
+    assert rerun.validation_valid
+    assert (
+        rerun.input_trajectories,
+        rerun.classified,
+        rerun.failed,
+        rerun.cache_hits,
+    ) == (3, 3, 0, 2)
+    assert calls == {"earlier.json": 3, "later.json": 1, "missing.json": 1}
+    recovered_rows = published_rows(
+        {"input_trajectories": 3, "classified": 3, "failed": 0, "cache_hits": 2}
+    )
+    assert recovered_rows["earlier.json"]["classification"]["status"] == "accepted"
+    for source in ("later.json", "missing.json"):
+        assert recovered_rows[source] == first_rows[source]

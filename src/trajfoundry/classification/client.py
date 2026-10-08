@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import http.client
 import json
+import logging
 import random
 import time
 import urllib.error
@@ -15,6 +17,7 @@ from urllib.parse import urlsplit
 import orjson
 
 DEFAULT_MAX_OUTPUT_TOKENS = 4_096
+LOGGER = logging.getLogger(__name__)
 
 
 class ClassificationAPIError(RuntimeError):
@@ -50,7 +53,9 @@ def _is_context_limit_error(error: urllib.error.HTTPError) -> bool:
         return True
     try:
         detail = error.read(8192).decode("utf-8", errors="ignore").lower()
-    except OSError:
+    except (OSError, http.client.IncompleteRead):
+        # The status code remains authoritative if its explanatory body is cut
+        # short. Do not let a read failure bypass the caller's HTTP handling.
         return False
     if not detail:
         return False
@@ -187,11 +192,35 @@ class ChatCompletionsClient:
                     self._sleep_before_retry(attempt, _retry_after(error.headers))
                     continue
                 raise ClassificationRequestError(f"classifier_http_{status}") from error
-            except (urllib.error.URLError, TimeoutError) as error:
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                ConnectionError,
+                http.client.IncompleteRead,
+            ) as error:
+                # urllib can expose these directly while opening or reading a
+                # response. ConnectionError includes RemoteDisconnected, reset,
+                # abort, and broken pipe; do not catch unrelated OSError or all
+                # HTTPException subclasses as transient network failures.
                 if attempt == self.max_retries:
+                    LOGGER.warning(
+                        "classifier API network retries exhausted; "
+                        "attempts=%d error_type=%s",
+                        attempt + 1,
+                        type(error).__name__,
+                    )
+                    # Raw transport errors may contain URLs, credentials, or
+                    # response fragments. Keep them out of displayed tracebacks.
                     raise ClassificationRetryExhausted(
                         "network_retry_exhausted"
-                    ) from error
+                    ) from None
+                LOGGER.warning(
+                    "classifier API network failure; retrying "
+                    "retry_attempt=%d/%d error_type=%s",
+                    attempt + 1,
+                    self.max_retries,
+                    type(error).__name__,
+                )
                 self._sleep_before_retry(attempt, None)
             except (TypeError, ValueError, json.JSONDecodeError) as error:
                 if attempt == self.max_retries:

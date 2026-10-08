@@ -358,8 +358,20 @@ two tasks against the same cache/output prefix concurrently. Set the scheduler
 maximum concurrency to `1` per source and date.
 
 The classifier uses bounded concurrency (four requests in the example). HTTP
-429 and 5xx responses are retried; HTTP 404 and 422 indicate a bad endpoint or
-missing model configuration and fail the job. A response that is not valid JSON
+429 and 5xx responses are retried. Network timeouts, URL transport errors,
+remote disconnects, connection resets/aborts, broken pipes, and incomplete HTTP
+response bodies use the same bounded exponential backoff with jitter, whether
+they occur while opening the connection or reading a successful response.
+`max_retries=5` allows at most six attempts per client call; exhausted network
+retries mark that trajectory as failed with reason `network_retry_exhausted`,
+without aborting the batch or caching the failed result. Network retry logs
+include only attempt counts and exception types, not request/response contents
+or exception details. A retry may repeat a request already processed upstream;
+exactly-once inference or billing is not guaranteed. This transport-only fix
+does not change the classification cache namespace, model, or prompt.
+
+HTTP 401/403 and non-context HTTP 404/422 errors still fail the job as
+configuration errors. A response that is not valid JSON
 or violates the label contract receives two additional semantic retries,
 separate from the HTTP/network retries. Per-trajectory exhausted retries or
 invalid model output still produce the original trajectory with
