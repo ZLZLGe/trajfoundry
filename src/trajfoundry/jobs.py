@@ -432,17 +432,18 @@ def run_s3_job(
 ) -> JobResult:
     """Normalize an S3 prefix directly into a flat S3 output prefix.
 
-    Raw captures and JSONL output never pass through local staging files.  The
-    aggregation database is created in a unique workspace-local directory and is
-    deleted when this call returns or raises.  The root manifest is published
-    only after the complete candidate output passes remote validation. S3
-    credentials come from the fixed credential file by default; explicitly pass
-    ``credentials_path=None`` only when the standard AWS SDK chain is intended.
+    Raw captures are streamed from S3; aggregation state, compressed build
+    artifacts, and JSONL upload spool files use a unique workspace-local
+    directory that is deleted when this call returns or raises. The root
+    manifest is published only after the complete candidate output passes remote
+    validation. S3 credentials come from the fixed credential file by default;
+    explicitly pass ``credentials_path=None`` only when the standard AWS SDK
+    chain is intended.
     ``read_workers`` controls concurrent S3 GETs and ``parse_workers`` controls
     CPU-bound decode/adaptation workers; SQLite writes remain ordered in the
     coordinator process. ``read_prefetch_bytes`` bounds the total advertised
-    payload size retained by the S3 read queue. The temporary inventory and
-    SQLite state are created below ``workspace_parent`` and removed on exit.
+    payload size retained by the S3 read queue. Temporary files and SQLite state
+    are created below ``workspace_parent`` and removed on exit.
     """
 
     if input_format not in {"freerouter", "tokenplan", "sxf", "deepinfra"}:

@@ -241,12 +241,16 @@ state is read/write and concurrent NFS access can corrupt it. The directory
 must already exist and be writable by the Dolphin tenant. Size the local disk
 for the largest expected partition; the state is removed when the task exits.
 
-Only a unique temporary SQLite state directory is created below
-`workspace_parent`; source captures and normalized shards are not persisted
-locally. `run_s3_job()` removes this state on success and ordinary failure. A
-retry rebuilds it from the current S3 inventory and may run on a different
-worker. An abrupt worker termination can leave one stale `trajfoundry-state-*`
-directory, which can be reviewed and removed after confirming no task uses it.
+A unique temporary directory below `workspace_parent` holds SQLite state,
+compressed trajectory build artifacts, and upload spool files. These files
+bound memory use; they are not a persistent local copy of the normalized
+dataset or a cross-run checkpoint. `run_s3_job()` removes them on success and
+ordinary failure. A retry rebuilds them from the current S3 inventory and may
+run on a different worker. An abrupt worker termination can leave a stale
+`trajfoundry-state-*` directory, which can be reviewed and removed after
+confirming no task uses it. See
+[`disk-backed-normalization.md`](disk-backed-normalization.md) for the memory
+and disk behavior.
 
 Publication follows this order:
 
@@ -331,9 +335,20 @@ tokenizer-level limit; the system prompt and taxonomy are additional context.
 If the gateway still reports a context-limit error, the classifier reduces the
 character budget and retries up to five times.
 
+Revision `2026-10-08.1` uses prompt `v004-user-only-closed-set`: the model selects
+one complete scenario key verbatim from a flat list and only one or two unique
+capabilities. A final output reminder follows the delimited request data. The
+scenario catalog, capability labels, JSON user-request projection, and strict
+output validation are unchanged. The prompt does not guarantee valid or
+semantically correct results for every model; test the configured model on a
+small sample before a full run. This update does not change the default model
+or transport retry behavior.
+
 The classifier revision and independent strategy fingerprint are recorded in
 the output manifest and cache configuration hash. Changing the model, context
 budget, output limit, or prompt therefore creates a separate cache namespace.
+Results cached with the previous prompt are not reused by this revision; the
+old cache files are not deleted automatically.
 
 The default cache is a deterministic SQLite file below
 `workspace_parent/.trajfoundry-label-cache/`. For recovery across worker
