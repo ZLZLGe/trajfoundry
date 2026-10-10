@@ -294,8 +294,9 @@ retries up to five times.
 Classification uses bounded concurrency and a persistent SQLite cache under
 `workspace_parent/.trajfoundry-label-cache/` by default. Pass `state_path` to
 place that cache on a worker-local persistent volume. HTTP 429 and 5xx responses
-are retried with bounded exponential backoff; HTTP 404 and 422 fail the job as
-configuration errors. Candidate rows are completed locally before any output
+are retried with bounded exponential backoff; HTTP 404 is retried with the same
+budget and still fails the job as a configuration error if it persists, while
+HTTP 422 fails immediately. Candidate rows are completed locally before any output
 object is changed, and `manifest.json` is published last. Classification reads
 and validates the normalized input manifest, but treats its own output manifest
 as write-only. It lists existing top-level JSONL before model calls and removes

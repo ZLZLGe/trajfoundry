@@ -176,8 +176,24 @@ class ChatCompletionsClient:
                 if status in {400, 413, 422} and _is_context_limit_error(error):
                     error.close()
                     raise ClassificationContextLimitError from error
+                if status == 404:
+                    retry_after = _retry_after(error.headers)
+                    error.close()
+                    if attempt == self.max_retries:
+                        raise ClassificationConfigurationError(
+                            "classifier API configuration failed with HTTP 404"
+                        ) from error
+                    LOGGER.warning(
+                        "classifier API HTTP failure; retrying "
+                        "retry_attempt=%d/%d status=%d",
+                        attempt + 1,
+                        self.max_retries,
+                        status,
+                    )
+                    self._sleep_before_retry(attempt, retry_after)
+                    continue
                 error.close()
-                if status in {401, 403, 404, 422}:
+                if status in {401, 403, 422}:
                     raise ClassificationConfigurationError(
                         f"classifier API configuration failed with HTTP {status}"
                     ) from error

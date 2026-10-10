@@ -877,7 +877,7 @@ def test_chat_client_reports_context_limit_separately() -> None:
         client.complete([{"role": "user", "content": "hello"}])
 
 
-@pytest.mark.parametrize("status", [401, 403, 404, 422])
+@pytest.mark.parametrize("status", [401, 403, 422])
 def test_chat_client_does_not_retry_configuration_errors(status) -> None:
     attempts = 0
     sleeps: list[float] = []
@@ -908,6 +908,78 @@ def test_chat_client_does_not_retry_configuration_errors(status) -> None:
     assert attempts == 1
     assert sleeps == []
     assert body.closed
+
+
+def test_chat_client_retries_404_then_succeeds() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+    failed_body = io.BytesIO(b"not found")
+
+    def opener(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise urllib.error.HTTPError(
+                "https://classifier.invalid/v1/chat/completions",
+                404,
+                "not found",
+                {},
+                failed_body,
+            )
+        return _HTTPResponse(
+            orjson.dumps({"choices": [{"message": {"content": '{"ok": true}'}}]})
+        )
+
+    client = ChatCompletionsClient(
+        api_url="https://classifier.invalid/v1/chat/completions",
+        model="model",
+        api_key="secret",
+        max_retries=1,
+        opener=opener,
+        sleeper=sleeps.append,
+        jitter=lambda: 0.0,
+    )
+
+    assert client.complete([{"role": "user", "content": "hello"}]) == '{"ok": true}'
+    assert attempts == 2
+    assert sleeps == [0.5]
+    assert failed_body.closed
+
+
+def test_chat_client_persistent_404_still_fails_as_configuration_error() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+    bodies: list[io.BytesIO] = []
+
+    def opener(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        body = io.BytesIO(b"not found")
+        bodies.append(body)
+        raise urllib.error.HTTPError(
+            "https://classifier.invalid/v1/chat/completions",
+            404,
+            "not found",
+            {},
+            body,
+        )
+
+    client = ChatCompletionsClient(
+        api_url="https://classifier.invalid/v1/chat/completions",
+        model="model",
+        api_key="secret",
+        max_retries=2,
+        opener=opener,
+        sleeper=sleeps.append,
+        jitter=lambda: 0.0,
+    )
+
+    with pytest.raises(ClassificationConfigurationError, match="HTTP 404"):
+        client.complete([{"role": "user", "content": "hello"}])
+
+    assert attempts == 3
+    assert sleeps == [0.5, 1.0]
+    assert all(body.closed for body in bodies)
 
 
 @pytest.mark.parametrize(
