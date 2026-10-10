@@ -375,8 +375,13 @@ configuration errors. A response that is not valid JSON
 or violates the label contract receives two additional semantic retries,
 separate from the HTTP/network retries. Per-trajectory exhausted retries or
 invalid model output still produce the original trajectory with
-`classification.status="failed"`, allowing a later rerun to inspect and retry
-the failed population. Classification reads and validates the normalized input
+`classification.status="failed"`. The failure reason uses a stable diagnostic
+code: `invalid_model_output_json`, `invalid_model_output_fields`,
+`invalid_model_output_scenario_label`, or
+`invalid_model_output_capability_labels`; transport and context failures use
+`network_retry_exhausted` and `context_limit_exhausted`. No model response text
+is persisted. A later rerun can inspect and retry the failed population.
+Classification reads and validates the normalized input
 manifest, but does not read its own output manifest. It lists existing
 top-level JSONL before model calls, publishes the replacement manifest last,
 and removes unlisted JSONL only after publication. A cleanup error fails the

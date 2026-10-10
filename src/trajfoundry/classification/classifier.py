@@ -92,6 +92,13 @@ class CompletionClient(Protocol):
 class ModelDecisionError(ValueError):
     """The model returned syntactically or semantically invalid labels."""
 
+    def __init__(self, reason_code: str, message: str | None = None) -> None:
+        if message is None:
+            message = reason_code
+            reason_code = "invalid_model_output"
+        self.reason_code = reason_code
+        super().__init__(message)
+
 
 @dataclass(frozen=True, slots=True)
 class ClassificationAttempt:
@@ -287,26 +294,29 @@ class TrajectoryClassifier:
                     cacheable=False,
                 )
             except (ModelDecisionError, TaxonomyError, orjson.JSONDecodeError) as error:
+                reason_code = self._invalid_output_reason(error)
                 if semantic_attempts < self.semantic_retries:
                     semantic_attempts += 1
                     LOGGER.warning(
                         "classifier model output validation failed; retrying "
-                        "semantic_attempt=%d/%d error_type=%s",
+                        "semantic_attempt=%d/%d error_type=%s reason=%s",
                         semantic_attempts,
                         self.semantic_retries,
                         type(error).__name__,
+                        reason_code,
                     )
                     continue
                 LOGGER.warning(
                     "classifier model output validation failed after %d attempts; "
-                    "marking trajectory failed error_type=%s",
+                    "marking trajectory failed error_type=%s reason=%s",
                     semantic_attempts + 1,
                     type(error).__name__,
+                    reason_code,
                 )
                 return ClassificationAttempt(
                     classification={
                         "status": "failed",
-                        "reason": "invalid_model_output",
+                        "reason": reason_code,
                         **base,
                     },
                     cacheable=False,
@@ -329,33 +339,68 @@ class TrajectoryClassifier:
         try:
             value = orjson.loads(payload)
         except orjson.JSONDecodeError as error:
-            raise ModelDecisionError("model output is not JSON") from error
+            raise ModelDecisionError(
+                "invalid_model_output_json", "model output is not JSON"
+            ) from error
         if type(value) is not dict or set(value) != {
             "scenario_label_key",
             "capability_labels",
         }:
-            raise ModelDecisionError("model output has unsupported fields")
+            raise ModelDecisionError(
+                "invalid_model_output_fields", "model output has unsupported fields"
+            )
         key = value["scenario_label_key"]
         capabilities = value["capability_labels"]
         if type(key) is not str or not key:
-            raise ModelDecisionError("scenario_label_key must be a non-empty string")
-        self.taxonomy.expand_l1(key)
+            raise ModelDecisionError(
+                "invalid_model_output_scenario_label",
+                "scenario_label_key must be a non-empty string",
+            )
+        try:
+            self.taxonomy.expand_l1(key)
+        except TaxonomyError as error:
+            raise TaxonomyError("model output has an unknown scenario label") from error
         if type(capabilities) is not list or not capabilities:
-            raise ModelDecisionError("capability_labels must be non-empty")
+            raise ModelDecisionError(
+                "invalid_model_output_capability_labels",
+                "capability_labels must be non-empty",
+            )
         if len(capabilities) > 2:
             raise ModelDecisionError(
-                "capability_labels must contain at most two labels"
+                "invalid_model_output_capability_labels",
+                "capability_labels must contain at most two labels",
             )
         if any(type(label) is not str for label in capabilities):
-            raise ModelDecisionError("capability_labels must contain strings")
+            raise ModelDecisionError(
+                "invalid_model_output_capability_labels",
+                "capability_labels must contain strings",
+            )
         if len(set(capabilities)) != len(capabilities):
-            raise ModelDecisionError("capability_labels must be unique")
+            raise ModelDecisionError(
+                "invalid_model_output_capability_labels",
+                "capability_labels must be unique",
+            )
         if any(label not in CAPABILITY_LABELS for label in capabilities):
-            raise ModelDecisionError("capability_labels contains an unknown label")
+            raise ModelDecisionError(
+                "invalid_model_output_capability_labels",
+                "capability_labels contains an unknown label",
+            )
         return {
             "scenario_label_key": key,
             "capability_labels": capabilities,
         }
+
+    @staticmethod
+    def _invalid_output_reason(error: Exception) -> str:
+        """Return a stable diagnostic code without exposing model output."""
+
+        if isinstance(error, ModelDecisionError):
+            return error.reason_code
+        if isinstance(error, TaxonomyError):
+            return "invalid_model_output_scenario_label"
+        if isinstance(error, orjson.JSONDecodeError):
+            return "invalid_model_output_json"
+        return "invalid_model_output"
 
     def _build_system_prompt(self) -> str:
         # Present each stable key as one selectable value rather than repeating

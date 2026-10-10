@@ -382,9 +382,46 @@ def test_classifier_marks_unknown_model_labels_as_failed(
 
     assert not attempt.cacheable
     assert attempt.classification["status"] == "failed"
-    assert attempt.classification["reason"] == "invalid_model_output"
+    assert attempt.classification["reason"] == "invalid_model_output_scenario_label"
     assert attempt.classification["model_label"] == "unknown"
     assert attempt.classification["harness_label"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("response", "reason"),
+    [
+        ("not-json", "invalid_model_output_json"),
+        (
+            {
+                "scenario_label_key": "toc|Unknown|未知",
+                "capability_labels": ["Tool Use"],
+            },
+            "invalid_model_output_scenario_label",
+        ),
+        (
+            {
+                "scenario_label_key": "toc|Shopping|购物",
+                "capability_labels": ["Tool Use", "Tool Use"],
+            },
+            "invalid_model_output_capability_labels",
+        ),
+    ],
+)
+def test_classifier_reports_specific_invalid_output_reason(
+    tmp_path, response, reason
+) -> None:
+    classifier = TrajectoryClassifier(
+        client=_SequenceCompletion([response]),
+        taxonomy=_taxonomy(tmp_path),
+        input_manifest_sha256="a" * 64,
+        semantic_retries=0,
+    )
+
+    attempt = classifier.classify({"messages": []})
+
+    assert not attempt.cacheable
+    assert attempt.classification["status"] == "failed"
+    assert attempt.classification["reason"] == reason
 
 
 def test_classifier_retries_invalid_model_output_then_accepts(tmp_path) -> None:
@@ -427,7 +464,7 @@ def test_classifier_exhausts_semantic_retries_as_non_cacheable_failure(
 
     assert not attempt.cacheable
     assert attempt.classification["status"] == "failed"
-    assert attempt.classification["reason"] == "invalid_model_output"
+    assert attempt.classification["reason"] == "invalid_model_output_fields"
     assert client.calls == 3
 
 
@@ -525,7 +562,7 @@ def test_classifier_rejects_capability_counts_outside_one_or_two(
     attempt = classifier.classify({"messages": []})
 
     assert not attempt.cacheable
-    assert attempt.classification["reason"] == "invalid_model_output"
+    assert attempt.classification["reason"] == "invalid_model_output_capability_labels"
 
 
 def test_classifier_config_hash_includes_policy_catalog_and_prompt(tmp_path) -> None:

@@ -821,7 +821,7 @@ def test_invalid_model_output_still_writes_every_complete_trajectory(
         assert row["metadata"]["session_id"]
         assert row["normalization_audit"]
         assert row["classification"]["status"] == "failed"
-        assert row["classification"]["reason"] == "invalid_model_output"
+        assert row["classification"]["reason"] == "invalid_model_output_fields"
 
 
 def test_network_exhaustion_publishes_failed_row_and_retries_only_it_on_rerun(
