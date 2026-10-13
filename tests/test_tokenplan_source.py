@@ -5,6 +5,7 @@ import pytest
 from trajfoundry.models import MediaMapping
 from trajfoundry.providers.anthropic import parse_anthropic_capture
 from trajfoundry.providers.chat import parse_chat_capture
+from trajfoundry.providers.responses import parse_responses_capture
 from trajfoundry.sources.tokenplan import TokenPlanError, adapt_tokenplan_envelope
 
 
@@ -125,6 +126,146 @@ def test_adapt_tokenplan_envelope_uses_outer_identity_and_received_timestamp_as_
     assert adapted.capture["turn_id"] == "envelope-task"
     assert adapted.capture["user_id"] == "tokenplan-user"
     assert adapted.captured_at == "1970-01-01T00:00:01.000Z"
+
+
+@pytest.mark.parametrize(
+    "request_path", ["/v1/messages", "/v1/chat/completions", "/v1/responses"]
+)
+@pytest.mark.parametrize(
+    "request_metadata,envelope_session,expected_session",
+    [
+        ({}, "no_session_id", ""),
+        ({"metadata": {"session_id": "no_session_id"}}, "no_session_id", ""),
+        (
+            {"metadata": {"session_id": "no_session_id"}},
+            "envelope-real",
+            "envelope-real",
+        ),
+        ({"metadata": {"session_id": "body-real"}}, "no_session_id", "body-real"),
+        ({"metadata": {"session_id": "body-real"}}, "envelope-real", "body-real"),
+        (
+            {
+                "client_metadata": {"session_id": "no_session_id"},
+                "metadata": {"session_id": "body-real"},
+            },
+            "envelope-real",
+            "body-real",
+        ),
+        (
+            {
+                "metadata": {
+                    "session_id": "no_session_id",
+                    "x-codex-turn-metadata": '{"session_id":"encoded-real"}',
+                }
+            },
+            "envelope-real",
+            "encoded-real",
+        ),
+        (
+            {
+                "metadata": {
+                    "session_id": "no_session_id",
+                    "x-codex-turn-metadata": {"session_id": "encoded-real"},
+                }
+            },
+            "envelope-real",
+            "encoded-real",
+        ),
+        (
+            {
+                "metadata": {
+                    "session_id": "",
+                    "x-codex-turn-metadata": {"session_id": "encoded-real"},
+                }
+            },
+            "envelope-real",
+            "encoded-real",
+        ),
+        (
+            {
+                "metadata": {
+                    "session_id": "no_session_id",
+                    "user_id": '{"session_id":"encoded-real","user_id":"user-a"}',
+                }
+            },
+            "envelope-real",
+            "encoded-real",
+        ),
+        (
+            {"client_metadata": {"session_id": "body-real"}},
+            "no_session_id",
+            "body-real",
+        ),
+        (
+            {
+                "metadata": {
+                    "session_id": "no_session_id",
+                    "user_id": {"session_id": "unsupported-object-session"},
+                }
+            },
+            "envelope-real",
+            "envelope-real",
+        ),
+    ],
+)
+def test_tokenplan_session_sentinel_is_missing_and_real_request_identity_wins(
+    request_path: str,
+    request_metadata: dict,
+    envelope_session: str,
+    expected_session: str,
+) -> None:
+    request_body = {"model": "test-model", **request_metadata}
+    if request_path == "/v1/responses":
+        request_body["input"] = []
+        response_body = {"object": "response", "status": "completed", "output": []}
+        parser = parse_responses_capture
+        parser_options = {}
+    elif request_path == "/v1/chat/completions":
+        request_body["messages"] = []
+        response_body = {
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "done"},
+                }
+            ],
+        }
+        parser = parse_chat_capture
+        parser_options = {"response_is_normalized_final": True}
+    else:
+        request_body["messages"] = []
+        response_body = {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "done"}],
+            "stop_reason": "end_turn",
+        }
+        parser = parse_anthropic_capture
+        parser_options = {"response_is_normalized_final": True}
+    envelope = _envelope(
+        request_path=request_path,
+        request_body=request_body,
+        response_body=response_body,
+        stream=False,
+    )
+    envelope["metadata"]["session_id"] = envelope_session
+    envelope["metadata"]["source_key"] = "dt=2026-10-08/no_session_id/request.json"
+
+    adapted = adapt_tokenplan_envelope(envelope)
+    snapshot = parser(
+        adapted.capture,
+        source_path="dt=2026-10-08/no_session_id/request.json",
+        source_sha256="a" * 64,
+        **parser_options,
+    )
+
+    assert adapted.capture["request_body"] is request_body
+    assert snapshot.session_id == expected_session
+    assert "metadata_conflict" not in {issue.code for issue in snapshot.issues}
+    assert ("missing_session_id" in {issue.code for issue in snapshot.issues}) == (
+        not expected_session
+    )
 
 
 def test_source_user_id_precedes_anthropic_account_uuid_compatibility_value() -> None:

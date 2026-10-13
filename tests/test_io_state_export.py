@@ -398,11 +398,11 @@ def test_state_streams_session_and_missing_session_user_scopes(
                 state.put_snapshot(snapshot)
 
         assert list(state.aggregation_scopes()) == [
-            ("session", "no_session_id"),
             ("session", "session-1"),
             ("user", ""),
             ("user", "alice"),
             ("user", "bob"),
+            ("user", "ignored-user"),
             ("user", "no_user_id"),
         ]
         assert [
@@ -418,7 +418,7 @@ def test_state_streams_session_and_missing_session_user_scopes(
         assert [
             snapshot.source_path
             for snapshot in state.snapshots_for_aggregation_scope(
-                ("session", "no_session_id")
+                ("user", "ignored-user")
             )
         ] == ["literal-sentinel-session.json"]
         assert [
@@ -431,6 +431,40 @@ def test_state_streams_session_and_missing_session_user_scopes(
                 ("user", "no_user_id")
             )
         ] == ["literal-sentinel-user.json"]
+        with pytest.raises(ValueError, match="real session id"):
+            list(state.snapshots_for_aggregation_scope(("session", "no_session_id")))
+
+
+def test_legacy_literal_session_rows_use_missing_session_user_scope(
+    tmp_path: Path,
+) -> None:
+    with StateStore(tmp_path / "state.sqlite") as state:
+        for path, user, session in (
+            ("alice-empty", "alice", ""),
+            ("alice-literal", "alice", "no_session_id"),
+            ("bob-literal", "bob", "no_session_id"),
+        ):
+            snapshot = Snapshot(
+                source_path=path,
+                source_sha256="a" * 64,
+                session_id="",
+                thread_id="",
+                user_id=user,
+                provider="openai",
+                operation="responses",
+                outcome="success",
+            ).model_copy(update={"session_id": session})
+            state.put_snapshot(snapshot)
+
+        assert list(state.aggregation_scopes()) == [("user", "alice"), ("user", "bob")]
+        assert [
+            snapshot.source_path
+            for snapshot in state.snapshots_for_aggregation_scope(("user", "alice"))
+        ] == ["alice-empty", "alice-literal"]
+        assert [
+            snapshot.source_path
+            for snapshot in state.snapshots_for_aggregation_scope(("user", "bob"))
+        ] == ["bob-literal"]
 
 
 def test_state_updates_capture_user_id_with_snapshot_status(tmp_path: Path) -> None:

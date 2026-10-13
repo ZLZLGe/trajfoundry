@@ -13,6 +13,7 @@ from typing import Literal, Self, TypeAlias
 import zstandard
 
 from .canonical import trajectory_id as compute_trajectory_id
+from .identity import normalize_session_id
 from .json_codec import dumps, loads
 from .models import Snapshot, TrajectoryNode
 from .output_contract import parse_trajectory_record, project_trajectory
@@ -88,7 +89,7 @@ def _sorted_path_batches(paths: Iterable[str]) -> Iterator[list[str]]:
 
 
 def _has_synthesized_session(node: TrajectoryNode) -> bool:
-    if not node.metadata.session_id:
+    if not normalize_session_id(node.metadata.session_id):
         return True
     audit = node.normalization_audit
     return bool(
@@ -594,7 +595,7 @@ class StateStore:
                     'session' AS scope_kind,
                     snapshots.session_id AS scope_id
                 FROM snapshots
-                WHERE snapshots.session_id != ''
+                WHERE snapshots.session_id NOT IN ('', 'no_session_id')
                 GROUP BY snapshots.session_id
                 UNION ALL
                 SELECT
@@ -602,7 +603,7 @@ class StateStore:
                     captures.user_id AS scope_id
                 FROM captures
                 JOIN snapshots USING(source_path)
-                WHERE snapshots.session_id = ''
+                WHERE snapshots.session_id IN ('', 'no_session_id')
                 GROUP BY captures.user_id
             )
             ORDER BY scope_kind,scope_id
@@ -618,7 +619,7 @@ class StateStore:
 
         scope_kind, scope_id = scope
         if scope_kind == "session":
-            if not scope_id:
+            if not normalize_session_id(scope_id):
                 raise ValueError("session aggregation scope requires a real session id")
             rows = self.connection.execute(
                 """
@@ -634,7 +635,7 @@ class StateStore:
                 SELECT snapshots.payload FROM captures
                 JOIN snapshots USING(source_path)
                 WHERE captures.user_id=?
-                AND snapshots.session_id=''
+                AND snapshots.session_id IN ('', 'no_session_id')
                 ORDER BY snapshots.captured_at,snapshots.source_path
                 """,
                 (scope_id,),
@@ -983,7 +984,7 @@ class StateStore:
                     and issue.get("code") == "metadata_session_id_synthesized"
                     for issue in issues
                 )
-        return session_id, (not session_id or synthesized)
+        return session_id, (not normalize_session_id(session_id) or synthesized)
 
     @staticmethod
     def _set_sub_session_id_in_projection(value: object, sub_session_id: int) -> None:
@@ -1003,11 +1004,10 @@ class StateStore:
     def assign_sub_session_ids(self) -> int:
         """Number final, deduplicated branches within each real session.
 
-        Missing provider sessions are recognizable by their normalization
-        audit marker even though their published value is ``no_session_id``.
-        Those user-scoped fallback groups are not real session branches and
-        therefore always receive zero.  A literal provider session whose value
-        is ``no_session_id`` has no marker and is numbered normally.
+        Missing provider sessions, including literal ``no_session_id`` input
+        sentinels, are published as ``no_session_id`` with a normalization
+        audit marker. Those user-scoped fallback groups are not real session
+        branches and therefore always receive zero.
         """
 
         skipped = 0

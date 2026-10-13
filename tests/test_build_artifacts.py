@@ -10,7 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from trajfoundry.build_budget import BuildMemoryError
-from trajfoundry.canonical import canonical_json
+from trajfoundry.canonical import canonical_json, trajectory_id
 from trajfoundry.models import (
     AuditIssue,
     AuditTag,
@@ -23,6 +23,7 @@ from trajfoundry.models import (
     ToolDefinition,
     TrajectoryNode,
 )
+from trajfoundry.output_contract import project_trajectory
 from trajfoundry.pipeline import (
     _contributor_leaf_warnings,
     _estimate_root_working_bytes,
@@ -31,9 +32,16 @@ from trajfoundry.pipeline import (
     _materialize_root_worker,
     _merged_multimodal_file_mapping,
     _read_materialization_artifact,
+    _store_trajectory,
     _trajectory_from_leaf,
 )
-from trajfoundry.quality import check_tool_calls, estimate_tokens
+from trajfoundry.quality import (
+    StaleDerivedFieldsError,
+    check_tool_calls,
+    enrich_trajectory,
+    estimate_tokens,
+    validate_derived_fields,
+)
 from trajfoundry.state import StateStore, _compress_payload
 
 
@@ -136,6 +144,182 @@ def test_invalid_artifact_is_not_deleted_before_validation(tmp_path: Path) -> No
     with pytest.raises(ValidationError):
         _read_materialization_artifact(str(artifact))
     assert artifact.is_file()
+
+
+def test_stale_derived_artifact_is_rejected_by_storage(tmp_path: Path) -> None:
+    snapshot = _snapshot()
+    node = enrich_trajectory(_trajectory_from_leaf(snapshot, [snapshot]))
+    validate_derived_fields(node)
+    document = node.model_dump(mode="json")
+    document["total_rounds"] += 1
+    artifact = tmp_path / "stale.json.zst"
+    artifact.write_bytes(
+        _compress_payload(
+            canonical_json(
+                {
+                    "trajectory": document,
+                    "representative": {
+                        "source_path": snapshot.source_path,
+                        "source_sha256": snapshot.source_sha256,
+                        "captured_at": snapshot.captured_at,
+                    },
+                }
+            )
+        )
+    )
+    stale, representative = _read_materialization_artifact(str(artifact))
+    with StateStore(tmp_path / "state.sqlite") as state:
+        with pytest.raises(StaleDerivedFieldsError):
+            _store_trajectory(state, stale, representative, [])
+        assert list(state.iter_trajectories()) == []
+
+
+@pytest.mark.parametrize("mounted_child", [False, True], ids=["root", "subagent"])
+@pytest.mark.parametrize(
+    "call_id",
+    [
+        "password=fake",
+        '{"api_key":"fake-key"}',
+        "Authorization: Bearer fake-token",
+        "Cookie: session=fake",
+        "https://fake-user:fake-password@example.invalid/path",
+        "server=192.0.2.1 peer=2001:db8::1",
+        "password=[REDACTED]",
+        "x" * 1000 + " password=fake; " + "x" * 200,
+    ],
+    ids=[
+        "password",
+        "quoted-key",
+        "authorization",
+        "cookie",
+        "credential-url",
+        "network-addresses",
+        "already-redacted",
+        "truncated-detail",
+    ],
+)
+def test_worker_artifact_redacted_audit_survives_validation_and_storage(
+    tmp_path: Path, call_id: str, mounted_child: bool
+) -> None:
+    """Repeated model validation must not mutate quality-generated diagnostics."""
+
+    state_path = tmp_path / "state.sqlite"
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    affected_index = 1 if mounted_child else 0
+    affected = _snapshot(affected_index).model_copy(
+        update={
+            "response": [
+                Message(
+                    role="assistant",
+                    content="",
+                    reasoning_content="",
+                    tool_calls=[
+                        ToolCall(
+                            id=call_id,
+                            function=FunctionCall(name="lookup", arguments={}),
+                        )
+                    ],
+                )
+            ],
+            "tools": [ToolDefinition(name="lookup")],
+        }
+    )
+    snapshots = {affected_index: affected}
+    edges = {}
+    if mounted_child:
+        parent = _snapshot().model_copy(
+            update={
+                "history": [
+                    Message(role="user", content="delegate this task"),
+                    Message(
+                        role="assistant",
+                        content="",
+                        reasoning_content="",
+                        tool_calls=[
+                            ToolCall(
+                                id="spawn-1",
+                                function=FunctionCall(name="spawn_agent", arguments={}),
+                            )
+                        ],
+                    ),
+                    Message(
+                        role="tool",
+                        tool_call_id="spawn-1",
+                        name="spawn_agent",
+                        content="child started",
+                    ),
+                ],
+                "tools": [ToolDefinition(name="spawn_agent")],
+            }
+        )
+        snapshots[0] = parent
+        edges = {0: (("spawn-1", affected_index, ""),)}
+    with StateStore(state_path) as state:
+        for snapshot in snapshots.values():
+            state.put_snapshot(snapshot)
+    job = _MaterializationJob(
+        state_path=str(state_path),
+        root_index=0,
+        is_subagent=False,
+        leaves={
+            index: _MaterializationLeaf(
+                source_path=snapshot.source_path,
+                contributor_paths=(snapshot.source_path,),
+                issues=(),
+            )
+            for index, snapshot in snapshots.items()
+        },
+        graph_issues={},
+        edges_by_parent=edges,
+        origin_paths=tuple(snapshot.source_path for snapshot in snapshots.values()),
+        artifact_dir=str(artifact_dir),
+    )
+    # Exercise the production process boundary and on-disk JSON artifact, not
+    # a mocked worker returning the same already-validated Python object.
+    with ProcessPoolExecutor(
+        max_workers=1, mp_context=multiprocessing.get_context("spawn")
+    ) as pool:
+        _, artifact, _, origins = pool.submit(_materialize_root_worker, job).result()
+    assert isinstance(artifact, str)
+    node, representative = _read_materialization_artifact(artifact)
+    _, inline, _, _ = _materialize_root_worker(replace(job, artifact_dir=None))
+    assert isinstance(inline, TrajectoryNode)
+    validate_derived_fields(inline)
+    validate_derived_fields(node)
+    assert node.model_dump() == inline.model_dump()
+    affected_node = node.sub_agent_trajectory["spawn-1"] if mounted_child else node
+    assert affected_node.normalization_audit is not None
+    assert "missing_tool_result" in affected_node.normalization_audit.reason_codes
+    # Only audit diagnostics are redacted: source message/tool-call content is
+    # losslessly preserved even when an identifier resembles a credential.
+    assert affected_node.messages[-1].tool_calls[0].id == call_id
+    assert node.normalization_audit.tag == AuditTag.QUARANTINED
+    if mounted_child:
+        assert "subagent_quality_failure" in node.normalization_audit.reason_codes
+    with StateStore(state_path) as state:
+        _store_trajectory(
+            state,
+            node,
+            representative,
+            [
+                {
+                    "source_ref": snapshot.source_path,
+                    "sha256": snapshot.source_sha256,
+                    "captured_at": snapshot.captured_at,
+                }
+                for snapshot in snapshots.values()
+            ],
+        )
+    # Reopen the database so no in-process trust cache can bypass validation.
+    with StateStore(state_path) as state:
+        stored = list(state.iter_trajectories())
+    assert len(stored) == 1
+    identifier, stored_node, stored_origins = stored[0]
+    assert identifier == trajectory_id(inline)
+    assert project_trajectory(stored_node) == project_trajectory(inline)
+    assert {origin["source_ref"] for origin in stored_origins} == set(origins)
+    validate_derived_fields(stored_node)
 
 
 @pytest.mark.parametrize(

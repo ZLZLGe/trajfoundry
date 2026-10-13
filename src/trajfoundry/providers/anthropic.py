@@ -13,6 +13,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from trajfoundry.identity import normalize_session_id, request_session_id
 from trajfoundry.models import (
     AuditIssue,
     FunctionCall,
@@ -1507,9 +1508,9 @@ def _snapshot_base(
         headers = {}
     metadata = _request_metadata(request)
     session_id = (
-        _text(metadata.get("session_id"))
-        or _text(capture.get("session_id"))
-        or _text(headers.get("x-claude-code-session-id"))
+        request_session_id(request)
+        or normalize_session_id(capture.get("session_id"))
+        or normalize_session_id(headers.get("x-claude-code-session-id"))
     )
     explicit_thread_id = (
         _text(metadata.get("thread_id"))
@@ -1540,7 +1541,9 @@ def _snapshot_base(
     elif has_subagent_linkage:
         thread_id = f"__isolated_subagent__:{source_path}"
     else:
-        thread_id = _text(headers.get("x-claude-code-session-id")) or session_id
+        thread_id = (
+            normalize_session_id(headers.get("x-claude-code-session-id")) or session_id
+        )
     explicit_harness = _text(capture.get("harness")) or _text(metadata.get("harness"))
     harness = explicit_harness or (
         "claude-code" if _text(headers.get("x-claude-code-session-id")) else "unknown"

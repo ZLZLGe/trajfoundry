@@ -1026,7 +1026,9 @@ def test_sub_session_ids_follow_created_at_with_stable_hash_tiebreak(
     )
 
 
-def test_literal_no_session_id_is_numbered_as_a_real_session(tmp_path: Path) -> None:
+def test_literal_no_session_id_uses_zero_and_synthesized_session_audit(
+    tmp_path: Path,
+) -> None:
     snapshots = [
         Snapshot(
             source_path=f"literal-{index}.json",
@@ -1052,10 +1054,12 @@ def test_literal_no_session_id_is_numbered_as_a_real_session(tmp_path: Path) -> 
         _build_trajectories(state, stats)
         stored = list(state.iter_trajectories())
 
-    assert sorted(node.metadata.sub_session_id for _, node, _ in stored) == [0, 1]
+    assert len(stored) == 2
+    assert {node.metadata.session_id for _, node, _ in stored} == {"no_session_id"}
+    assert [node.metadata.sub_session_id for _, node, _ in stored] == [0, 0]
     assert all(
         "metadata_session_id_synthesized"
-        not in {
+        in {
             issue.code
             for issue in (
                 node.normalization_audit.issues if node.normalization_audit else []

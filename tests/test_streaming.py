@@ -2,6 +2,8 @@ import gc
 import weakref
 from typing import Literal
 
+import pytest
+
 from trajfoundry import streaming
 from trajfoundry.models import (
     AgentMessageEvidence,
@@ -456,18 +458,30 @@ def test_late_empty_snapshot_is_covered_by_existing_response() -> None:
     assert result.contributor_paths["long"] == ("empty", "long")
 
 
-def test_missing_session_uses_user_scope_and_can_merge_across_threads() -> None:
+@pytest.mark.parametrize("short_session", ["", "no_session_id"])
+@pytest.mark.parametrize("long_session", ["", "no_session_id"])
+def test_missing_session_uses_user_scope_and_can_merge_across_threads(
+    short_session: str, long_session: str
+) -> None:
     question = Message(role="user", content="q")
     answer = Message(role="assistant", content="a", reasoning_content="")
     short = snap("short-no-session", [question], [answer]).model_copy(
-        update={"session_id": "", "user_id": "user-a", "thread_id": "thread-1"}
+        update={
+            "session_id": short_session,
+            "user_id": "user-a",
+            "thread_id": "thread-1",
+        }
     )
     long = snap(
         "long-no-session",
         [question, answer, Message(role="user", content="next")],
         [Message(role="assistant", content="done", reasoning_content="")],
     ).model_copy(
-        update={"session_id": "", "user_id": "user-a", "thread_id": "thread-2"}
+        update={
+            "session_id": long_session,
+            "user_id": "user-a",
+            "thread_id": "thread-2",
+        }
     )
 
     result = streaming_prefix_leaves(item for item in (short, long))
@@ -479,17 +493,20 @@ def test_missing_session_uses_user_scope_and_can_merge_across_threads() -> None:
     )
 
 
-def test_missing_session_does_not_merge_different_users_or_known_sessions() -> None:
+@pytest.mark.parametrize("session_id", ["", "no_session_id"])
+def test_missing_session_does_not_merge_different_users_or_known_sessions(
+    session_id: str,
+) -> None:
     question = Message(role="user", content="q")
     answer = Message(role="assistant", content="a", reasoning_content="")
     base = snap("base", [question], [answer]).model_copy(
-        update={"session_id": "", "user_id": "user-a"}
+        update={"session_id": session_id, "user_id": "user-a"}
     )
     other_user = snap(
         "other-user",
         [question, answer, Message(role="user", content="next")],
         [Message(role="assistant", content="done", reasoning_content="")],
-    ).model_copy(update={"session_id": "", "user_id": "user-b"})
+    ).model_copy(update={"session_id": session_id, "user_id": "user-b"})
     known_session = snap(
         "known-session",
         [question, answer, Message(role="user", content="next")],
@@ -506,7 +523,7 @@ def test_missing_session_does_not_merge_different_users_or_known_sessions() -> N
     assert result.intermediate_paths == ()
 
 
-def test_public_identity_sentinel_strings_remain_explicit_internal_ids() -> None:
+def test_session_sentinel_means_missing_but_literal_user_id_remains_distinct() -> None:
     question = Message(role="user", content="q")
     answer = Message(role="assistant", content="a", reasoning_content="")
     short = snap("short", [question], [answer]).model_copy(
@@ -528,11 +545,11 @@ def test_public_identity_sentinel_strings_remain_explicit_internal_ids() -> None
     result = streaming_prefix_leaves([short, literal_user, literal_session])
 
     assert {leaf.source_path for leaf in result.leaves} == {
-        "short",
         "literal-user",
         "literal-session",
     }
-    assert result.intermediate_paths == ()
+    assert result.intermediate_paths == ("short",)
+    assert result.contributor_paths["literal-session"] == ("literal-session", "short")
 
 
 def test_explicit_request_id_session_is_a_real_session_scope() -> None:

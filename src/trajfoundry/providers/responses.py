@@ -15,6 +15,7 @@ from copy import deepcopy
 from typing import Any
 
 from trajfoundry.audit_codes import RESPONSES_UNSUPPORTED_CALL_EVIDENCE
+from trajfoundry.identity import normalize_session_id
 from trajfoundry.models import (
     AgentMessageEvidence,
     AuditIssue,
@@ -2043,6 +2044,17 @@ def _identity_metadata(
             )
             saw_codex_metadata = True
 
+    metadata = request.get("metadata")
+    if isinstance(metadata, Mapping):
+        encoded_user = metadata.get("user_id")
+        if isinstance(encoded_user, str):
+            try:
+                user_identity = _strict_json_loads(encoded_user)
+            except (TypeError, ValueError):
+                user_identity = None
+            if isinstance(user_identity, Mapping):
+                encoded_sources.append(("request_body.metadata.user_id", user_identity))
+
     # Headers are untrusted transport metadata. Read only the explicit identity
     # allowlist and retain only their decoded identity values.
     raw_headers = capture.get("request_headers")
@@ -2106,6 +2118,8 @@ def _identity_metadata(
         for source_name, source in all_sources:
             for key in keys:
                 value = source.get(key)
+                if key == "session_id":
+                    value = normalize_session_id(value)
                 if isinstance(value, str) and value:
                     values.append((f"{source_name}.{key}", value))
                     break
@@ -2250,12 +2264,10 @@ def parse_responses_capture(
     )
 
     identity, saw_codex_metadata = _identity_metadata(capture, request, issues)
-    capture_session = capture.get("session_id")
-    session_id = identity.get("session_id", "") or (
-        capture_session if isinstance(capture_session, str) else ""
-    )
+    capture_session = normalize_session_id(capture.get("session_id"))
+    session_id = identity.get("session_id", "") or capture_session
     if (
-        isinstance(capture_session, str)
+        capture_session
         and identity.get("session_id")
         and capture_session != identity["session_id"]
     ):

@@ -135,8 +135,10 @@ timestamp changes.
   request/thread labels; missing users use the shared `no_user_id` scope.
   `request_id` is never promoted to a session. Published metadata projects
   missing identities as `session_id="no_session_id"` and
-  `user_id="no_user_id"`; audit markers keep those synthesized values distinct
-  from provider IDs that literally use either sentinel string.
+  `user_id="no_user_id"`. A literal input `session_id="no_session_id"` also
+  means missing and uses the user-scoped fallback; it cannot override a real
+  request session. Missing-session outputs carry a synthesized-session audit
+  marker. Literal `user_id="no_user_id"` remains a distinct internal user ID.
 - Every root and mounted child contains `metadata.sub_session_id`. Divergent
   final branches of a real session are numbered `0..N` in stable creation-time
   order. A trajectory whose session was synthesized always uses `0`; its

@@ -174,3 +174,68 @@ def test_tokenplan_pipeline_includes_test_and_publishes_media_mapping(
     report = validate_output(output_root)
     assert report.valid
     assert report.counts["skipped_inputs"] == 0
+
+
+def test_tokenplan_literal_missing_sessions_merge_only_within_user(
+    tmp_path: Path,
+) -> None:
+    input_root = tmp_path / "input"
+    output_root = tmp_path / "output"
+    for name, user, is_long, session in (
+        ("alice-short", "alice", False, ""),
+        ("alice-long", "alice", True, "no_session_id"),
+        ("bob-short", "bob", False, "no_session_id"),
+        ("alice-known", "alice", False, "real-session"),
+    ):
+        envelope = _envelope(request_id=name)
+        envelope["metadata"]["source_user_id"] = user
+        envelope["metadata"]["session_id"] = "no_session_id" if session else ""
+        source_key = f"dt=2026-10-08/{user}/no_session_id/req_{name}.json"
+        envelope["metadata"]["source_key"] = source_key
+        request_body = envelope["client_request"]["capture"]["body"]
+        request_body["client_metadata"] = {"session_id": session, "thread_id": name}
+        if is_long:
+            request_body["messages"].extend(
+                [
+                    {"role": "assistant", "content": "done"},
+                    {"role": "user", "content": "next"},
+                ]
+            )
+        _write_json(input_root / source_key, envelope)
+
+    stats = normalize(
+        PipelineConfig(
+            input_root=input_root, input_format="tokenplan", output_root=output_root
+        )
+    )
+
+    assert stats.parsed == 4
+    assert stats.parse_failures == 0
+    assert stats.prefix_intermediates == 1
+    assert stats.stored_trajectories == 3
+    manifest = orjson.loads((output_root / "manifest.json").read_bytes())
+    records = [
+        orjson.loads((output_root / entry["path"]).read_bytes())
+        for entry in manifest["files"]
+        if entry["path"] != "lineage.jsonl"
+    ]
+    assert {row["metadata"]["source_file"] for row in records} == {
+        "req_alice-long.json",
+        "req_bob-short.json",
+        "req_alice-known.json",
+    }
+    assert {
+        (row["metadata"]["user_id"], row["metadata"]["session_id"]) for row in records
+    } == {
+        ("alice", "no_session_id"),
+        ("bob", "no_session_id"),
+        ("alice", "real-session"),
+    }
+    for row in records:
+        synthesized = row["metadata"]["session_id"] == "no_session_id"
+        assert row["metadata"]["sub_session_id"] == 0
+        assert (
+            "metadata_session_id_synthesized"
+            in {issue["code"] for issue in row["normalization_audit"]["issues"]}
+        ) == synthesized
+    assert validate_output(output_root).valid

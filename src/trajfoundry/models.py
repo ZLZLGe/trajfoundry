@@ -16,6 +16,8 @@ from pydantic import (
     model_validator,
 )
 
+from .identity import normalize_session_id
+
 _REDACTED = "[REDACTED]"
 _CREDENTIAL_KEY = r"""
     (?:
@@ -30,7 +32,9 @@ _QUOTED_CREDENTIAL = re.compile(
 )
 _UNQUOTED_CREDENTIAL = re.compile(
     rf"(?ix)(?P<prefix>[\"']?{_CREDENTIAL_KEY}[\"']?\s*[:=]\s*)"
-    r"[^,;\r\n}\]]+"
+    # Consume an existing marker in full, including its closing bracket.
+    # Still consume adjacent values: a marker must not bypass new secrets.
+    r"(?:\[REDACTED\]|[^,;\r\n}\]])+"
 )
 _AUTH_SCHEME = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=:-]+")
 _CREDENTIAL_URL = re.compile(r"(?i)(https?://)[^/\s:@]+:[^/\s@]+@")
@@ -53,12 +57,26 @@ def _redact_ip(match: re.Match[str]) -> str:
 
 
 def sanitize_diagnostic_detail(detail: str) -> str:
-    """Remove credentials and network identifiers from non-trajectory text.
+    """Canonically redact credentials and network identifiers in diagnostics.
 
     This function is intentionally scoped to audit diagnostics. Message bodies,
     reasoning, tool arguments, and tool results never pass through it.
+    Revalidation after JSON round trips must leave the result unchanged.
     """
 
+    value = detail
+    while True:
+        sanitized = _sanitize_diagnostic_detail_once(value)
+        if sanitized == value:
+            return sanitized
+        # Truncation can turn a partial token into a newly recognizable IP or
+        # credential. Settle these boundary effects before publishing a detail.
+        # Replacements remove original content; after the first pass the string
+        # is also bounded by the detail limit plus its truncation marker.
+        value = sanitized
+
+
+def _sanitize_diagnostic_detail_once(detail: str) -> str:
     value = _AUTH_SCHEME.sub(lambda match: f"{match.group(1)} {_REDACTED}", detail)
     value = _CREDENTIAL_URL.sub(rf"\1{_REDACTED}@", value)
     value = _QUOTED_CREDENTIAL.sub(
@@ -346,6 +364,13 @@ class Snapshot(StrictModel):
     termination: str = ""
     wire_complete: bool = False
     issues: list[AuditIssue] = Field(default_factory=list)
+
+    @field_validator("session_id", mode="before")
+    @classmethod
+    def normalize_session(cls, value: Any) -> Any:
+        # Only normalize the string sentinel; invalid types must still fail
+        # strict validation instead of silently becoming a missing identity.
+        return normalize_session_id(value) if isinstance(value, str) else value
 
 
 class QuarantineRecord(StrictModel):

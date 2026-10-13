@@ -25,14 +25,13 @@ def snapshot(path, history, response, **metadata):
     return Snapshot(
         source_path=path,
         source_sha256=path,
-        session_id="session",
-        thread_id="thread",
         provider="openai",
         operation="responses",
         outcome="success",
         history=history,
         response=response,
-    ).model_copy(update=metadata)
+        **{"session_id": "session", "thread_id": "thread", **metadata},
+    )
 
 
 def user(text):
@@ -125,7 +124,57 @@ def test_scope_isolation_and_missing_session_rules(tmp_path, short_fields, long_
     assert_matches_reference(items, tmp_path)
 
 
-def test_masked_session_compaction_and_custom_scope(tmp_path):
+@pytest.mark.parametrize("session_id", ["", "no_session_id"])
+def test_missing_session_user_scope_stays_separate_from_masked_and_real_sessions(
+    tmp_path, session_id
+):
+    q, a = user("q"), assistant("a")
+    masked = AuditIssue(
+        code="metadata_session_id_masked", stage="metadata", severity=Severity.WARNING
+    )
+    items = [
+        snapshot("short", [q], [a], session_id=session_id, user_id="alice"),
+        snapshot(
+            "long",
+            [q, a, user("next")],
+            [assistant("done")],
+            session_id=session_id,
+            user_id="alice",
+        ),
+        snapshot("other-user", [q], [a], session_id=session_id, user_id="bob"),
+        snapshot("real-session", [q], [a], session_id="real-session", user_id="alice"),
+        snapshot(
+            "masked-a",
+            [q],
+            [a],
+            session_id=session_id,
+            user_id="alice",
+            issues=[masked],
+        ),
+        snapshot(
+            "masked-b",
+            [q, a, user("next")],
+            [assistant("done")],
+            session_id=session_id,
+            user_id="alice",
+            issues=[masked],
+        ),
+    ]
+    assert_matches_reference(items, tmp_path)
+    with disk_prefix_leaves(items, tmp_path) as result:
+        assert set(result.intermediate_paths) == {"short"}
+        assert {leaf.source_path for leaf in result.leaves} == {
+            "long",
+            "other-user",
+            "real-session",
+            "masked-a",
+            "masked-b",
+        }
+        assert set(result.contributor_paths["long"]) == {"short", "long"}
+
+
+@pytest.mark.parametrize("session_id", ["", "no_session_id"])
+def test_masked_session_compaction_and_custom_scope(tmp_path, session_id):
     q, a = user("q"), assistant("a")
     masked = AuditIssue(
         code="metadata_session_id_masked", stage="metadata", severity=Severity.WARNING
@@ -139,7 +188,9 @@ def test_masked_session_compaction_and_custom_scope(tmp_path):
     long = snapshot("long", [q, a, user("next")], [assistant("done")])
     assert_matches_reference(
         [
-            item.model_copy(update={"session_id": "", "issues": [masked]})
+            Snapshot.model_validate(
+                {**item.model_dump(), "session_id": session_id, "issues": [masked]}
+            )
             for item in (short, long)
         ],
         tmp_path,

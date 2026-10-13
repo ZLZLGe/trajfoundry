@@ -17,6 +17,7 @@ from math import isfinite
 from pathlib import PurePath
 from typing import Any, Literal
 
+from ..identity import normalize_session_id, request_session_id
 from ..models import MediaMapping
 
 
@@ -123,6 +124,9 @@ def _first_identity(request_body: Mapping[str, Any], field: str) -> str:
     envelope identity is a fallback; the provider adapter remains the source
     of truth for identity extraction and conflict diagnostics.
     """
+
+    if field == "session_id":
+        return request_session_id(request_body)
 
     direct: list[Mapping[str, Any]] = []
     encoded: list[Mapping[str, Any]] = []
@@ -500,8 +504,8 @@ def adapt_tokenplan_envelope(value: object) -> AdaptedCapture:
         if isinstance(legacy_user, str)
         else ""
     )
-    envelope_session = _optional_string(
-        metadata.get("session_id"), path="metadata.session_id"
+    envelope_session = normalize_session_id(
+        _optional_string(metadata.get("session_id"), path="metadata.session_id")
     )
     envelope_task = _optional_string(metadata.get("task_id"), path="metadata.task_id")
     request_mapping = _mapping(request_body, path="client_request.capture.body")

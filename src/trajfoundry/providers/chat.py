@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from trajfoundry.identity import normalize_session_id
 from trajfoundry.models import (
     AuditIssue,
     FunctionCall,
@@ -320,6 +321,8 @@ def _identity_metadata(
         for source_name, source in sources:
             for key in keys:
                 value = source.get(key)
+                if key == "session_id":
+                    value = normalize_session_id(value)
                 if isinstance(value, str) and value:
                     values.append((f"{source_name}.{key}", value))
                     break
@@ -885,6 +888,8 @@ def parse_chat_capture(
         fallback = (
             _user_id_value(capture.get(field))
             if field == "user_id"
+            else normalize_session_id(capture.get(field))
+            if field == "session_id"
             else _text(capture.get(field))
         )
         if selected and fallback and selected != fallback:
