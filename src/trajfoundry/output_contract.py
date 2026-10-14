@@ -24,6 +24,7 @@ from .models import (
     TrajectoryNode,
     TypeMismatch,
 )
+from .quality import estimate_trajectory_tokens
 from .tool_names import is_spawn_tool_name
 
 
@@ -436,6 +437,7 @@ _NODE_REQUIRED = {
     "source",
     "total_rounds",
     "total_tool_calls",
+    "total_tokens",
     "tool_counts",
     "reasoning_total_tokens",
     "tool_defs_tag",
@@ -538,6 +540,7 @@ def _validate_node(
     *,
     top_level: bool,
     expected_sub_session_id: int | None = None,
+    allow_missing_total_tokens: bool = False,
 ) -> tuple[bool, int]:
     node = _object(value, path)
     required = _NODE_REQUIRED | (
@@ -546,6 +549,9 @@ def _validate_node(
     optional = _NODE_OPTIONAL - (
         {"completeness_tag", "completeness"} if top_level else set()
     )
+    if allow_missing_total_tokens:
+        required = required - {"total_tokens"}
+        optional = optional | {"total_tokens"}
     _keys(node, path, required=required, optional=optional)
     if not top_level and ({"completeness_tag", "completeness"} & node.keys()):
         _fail(path, "nested nodes must omit completeness fields")
@@ -568,6 +574,8 @@ def _validate_node(
         _fail(f"{path}/source", "must be a non-empty basename")
     for field in ("total_rounds", "total_tool_calls", "reasoning_total_tokens"):
         _integer(node[field], f"{path}/{field}")
+    if "total_tokens" in node:
+        _integer(node["total_tokens"], f"{path}/total_tokens")
     tool_counts = _object(node["tool_counts"], f"{path}/tool_counts")
     for name, count in tool_counts.items():
         _string(name, f"{path}/tool_counts key")
@@ -676,6 +684,7 @@ def _validate_node(
                     f"{path}/sub_agent_trajectory/{call_id}",
                     top_level=False,
                     expected_sub_session_id=sub_session_id,
+                    allow_missing_total_tokens=allow_missing_total_tokens,
                 )
             )
 
@@ -966,6 +975,7 @@ def _project_trajectory(
         "source": node.source,
         "total_rounds": node.total_rounds,
         "total_tool_calls": node.total_tool_calls,
+        "total_tokens": node.total_tokens,
         "tool_counts": dict(node.tool_counts),
         "reasoning_total_tokens": node.reasoning_total_tokens,
         "tool_defs_tag": node.tool_defs_tag,
@@ -1065,6 +1075,25 @@ def _with_legacy_sub_session_ids(value: object) -> object:
     return upgraded
 
 
+def _backfill_total_tokens(
+    node: TrajectoryNode, candidate: dict[str, Any]
+) -> dict[str, Any]:
+    """Upgrade only the new statistic, leaving all other legacy fields intact."""
+
+    upgraded = dict(candidate)
+    if "total_tokens" not in upgraded:
+        node.total_tokens = estimate_trajectory_tokens(node)
+        upgraded["total_tokens"] = node.total_tokens
+    if node.sub_agent_trajectory:
+        upgraded["sub_agent_trajectory"] = {
+            call_id: _backfill_total_tokens(
+                child, candidate["sub_agent_trajectory"][call_id]
+            )
+            for call_id, child in node.sub_agent_trajectory.items()
+        }
+    return upgraded
+
+
 def parse_trajectory_record(
     value: object, *, allow_legacy_metadata: bool = False
 ) -> TrajectoryNode:
@@ -1073,14 +1102,18 @@ def parse_trajectory_record(
     ``allow_legacy_metadata`` is limited to reading v2/v3 manifests whose
     trajectory metadata predates ``sub_session_id``. New records must publish
     the field explicitly.
+
+    Records predating ``total_tokens`` remain readable: only that missing
+    statistic is estimated independently for each node, without changing input.
     """
 
     candidate = _with_legacy_sub_session_ids(value) if allow_legacy_metadata else value
-    _validate_node(candidate, "$", top_level=True)
+    _validate_node(candidate, "$", top_level=True, allow_missing_total_tokens=True)
     try:
         node = TrajectoryNode.model_validate_json(dumps(candidate), strict=True)
     except (TypeError, orjson.JSONEncodeError, ValidationError) as error:
         raise OutputContractError("trajectory violates the typed model") from error
+    candidate = _backfill_total_tokens(node, candidate)
     if project_trajectory(node) != candidate:
         raise OutputContractError("trajectory is not in canonical output projection")
     return node

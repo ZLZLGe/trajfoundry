@@ -14,6 +14,7 @@ from typing import Any, Literal, Self
 import orjson
 
 from .canonical import trajectory_id
+from .feedback import feedback_fields, unix_ms
 from .io import file_sha256
 from .json_codec import dumps, loads
 from .models import QuarantineRecord, TrajectoryNode
@@ -178,6 +179,7 @@ class OutputSet:
         if max_shard_bytes <= 0:
             raise ValueError("max shard bytes must be positive")
         self.max_shard_bytes = max_shard_bytes
+        self._started_at_ms = unix_ms()
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
         # Remove leftovers from an interrupted/failed publication before any
@@ -275,6 +277,8 @@ class OutputSet:
         *,
         input_root: str,
         config_hash: str,
+        started_at_ms: int | None = None,
+        parse_failure_count: int = 0,
         input_format: Literal[
             "freerouter", "tokenplan", "sxf", "deepinfra"
         ] = "freerouter",
@@ -313,6 +317,20 @@ class OutputSet:
                 for path in files
             ],
         }
+        manifest.update(
+            feedback_fields(
+                self.stats,
+                total_bytes=sum(
+                    item["bytes"]
+                    for item in manifest["files"]
+                    if item["path"] != "lineage.jsonl"
+                ),
+                started_at_ms=self._started_at_ms
+                if started_at_ms is None
+                else started_at_ms,
+                parse_failure_count=parse_failure_count,
+            )
+        )
         manifest_bytes = dumps(manifest, sort_keys=True, indent=2)
         with self._manifest_tmp.open("wb") as handle:
             handle.write(manifest_bytes)

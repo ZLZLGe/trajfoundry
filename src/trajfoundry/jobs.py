@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from tempfile import TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import Any, Literal
 
 import orjson
 
 from .credentials import DEFAULT_S3_CREDENTIALS_PATH, load_s3_credentials
-from .json_codec import loads
+from .feedback import unix_ms
+from .json_codec import dumps, loads
 from .observability import memory_summary
 from .pipeline import PipelineConfig, PipelineStats, normalize, normalize_source
 from .s3 import S3CaptureSource, S3Location, create_s3_client, parse_s3_uri
@@ -161,6 +163,7 @@ def _run_s3_job_with_client(
     parse_workers: int = 16,
 ) -> JobResult:
     started_at = time.monotonic()
+    started_at_ms = unix_ms()
     LOGGER.info(
         "【任务开始】输入格式=%s，读取并发=%d，读取预取=%s，读取预取字节=%s，解析并发=%d，"
         "构建并发=%d，上传并发=%d，校验并发=%d",
@@ -260,6 +263,11 @@ def _run_s3_job_with_client(
         raise JobValidationError(output_location.uri, report)
 
     manifest_key = output_location.key("manifest.json")
+    # The published completion time includes data-file read-back validation.
+    manifest = loads(manifest_bytes)
+    manifest["started_at_ms"] = started_at_ms
+    manifest["completed_at_ms"] = max(started_at_ms, unix_ms())
+    manifest_bytes = dumps(manifest, sort_keys=True, indent=2)
     client.put_object(
         Bucket=output_location.bucket,
         Key=manifest_key,
@@ -336,6 +344,7 @@ def run_job(
     exception or an invalid published output propagates as a task failure.
     """
 
+    started_at_ms = unix_ms()
     if input_format not in {"freerouter", "tokenplan", "sxf", "deepinfra"}:
         raise ValueError(f"unsupported input format: {input_format!r}")
 
@@ -383,6 +392,23 @@ def run_job(
 
     if not report.valid:
         raise JobValidationError(output_path, report)
+
+    # Preserve the verified inventory; complete the batch clock after validation.
+    manifest_path = output_path / "manifest.json"
+    manifest = loads(manifest_path.read_bytes())
+    manifest["started_at_ms"] = started_at_ms
+    manifest["completed_at_ms"] = max(started_at_ms, unix_ms())
+    with NamedTemporaryFile(
+        dir=output_path, prefix=".manifest-feedback-", suffix=".tmp", delete=False
+    ) as handle:
+        pending_manifest = Path(handle.name)
+        try:
+            handle.write(dumps(manifest, sort_keys=True, indent=2))
+            handle.flush()
+            os.fsync(handle.fileno())
+            pending_manifest.replace(manifest_path)
+        finally:
+            pending_manifest.unlink(missing_ok=True)
 
     LOGGER.info(
         "TrajFoundry job complete: discovered=%d parsed=%d reused=%d "

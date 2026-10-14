@@ -72,7 +72,7 @@ from .tool_names import is_spawn_tool_name
 
 LOGGER = logging.getLogger(__name__)
 
-NORMALIZER_REVISION = "2026-10-08.1"
+NORMALIZER_REVISION = "2026-10-13.1"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 _INGEST_BATCH_ITEMS = 512
@@ -2049,6 +2049,7 @@ def _export(
     *,
     output: Any | None = None,
     input_root_label: str | None = None,
+    started_at_ms: int | None = None,
 ) -> Any:
     output = output or OutputSet(
         config.output_root,
@@ -2058,6 +2059,7 @@ def _export(
     last_progress_at = started_at
     processed_records = 0
     processed_trajectories = 0
+    parse_failure_count = 0
     total_records = state.capture_count()
     total_trajectories = state.trajectory_count()
 
@@ -2101,6 +2103,7 @@ def _export(
                 log_progress()
                 continue
             if status == "failed":
+                parse_failure_count += 1
                 reason_code = reason.partition(":")[0]
                 if reason_code not in {
                     "tokenplan_empty_envelope",
@@ -2146,6 +2149,8 @@ def _export(
             input_root=input_root_label or str(config.input_root),
             input_format=config.input_format,
             config_hash=configuration_hash,
+            started_at_ms=started_at_ms,
+            parse_failure_count=parse_failure_count,
         )
         log_progress(force=True)
         LOGGER.info(
@@ -2528,6 +2533,7 @@ def normalize_source(
     the ephemeral state from the immutable input inventory.
     """
 
+    started_at_ms = time.time_ns() // 1_000_000
     if input_format not in {"freerouter", "tokenplan", "sxf", "deepinfra"}:
         raise ValueError(f"unsupported input format: {input_format!r}")
     if max_shard_bytes <= 0:
@@ -2569,8 +2575,6 @@ def normalize_source(
                 parse_workers=parse_workers,
             )
         stats.ingest_seconds = time.monotonic() - stage_started_at
-        if stats.discovered == 0:
-            raise ValueError(f"capture source is empty: {source.label}")
         stage_started_at = time.monotonic()
         _build_trajectories(state, stats, build_workers=build_workers)
         stats.build_seconds = time.monotonic() - stage_started_at
@@ -2581,6 +2585,7 @@ def normalize_source(
             configuration_hash,
             output=output_factory(),
             input_root_label=source.label,
+            started_at_ms=started_at_ms,
         )
         stats.export_seconds = time.monotonic() - stage_started_at
         LOGGER.info(
@@ -2595,6 +2600,7 @@ def normalize_source(
 def normalize(config: PipelineConfig) -> PipelineStats:
     """Normalize a capture tree and atomically publish manifest-backed shards."""
 
+    started_at_ms = time.time_ns() // 1_000_000
     input_root = config.input_root.resolve()
     output_root = config.output_root.resolve()
     if not input_root.is_dir():
@@ -2646,7 +2652,12 @@ def normalize(config: PipelineConfig) -> PipelineStats:
         _build_trajectories(state, stats)
         stats.build_seconds = time.monotonic() - stage_started_at
         stage_started_at = time.monotonic()
-        _export(state, normalized_config, configuration_hash)
+        _export(
+            state,
+            normalized_config,
+            configuration_hash,
+            started_at_ms=started_at_ms,
+        )
         stats.export_seconds = time.monotonic() - stage_started_at
         LOGGER.info(
             "【阶段汇总】读取耗时=%.1f秒，构建耗时=%.1f秒，输出耗时=%.1f秒",

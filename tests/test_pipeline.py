@@ -964,6 +964,55 @@ def test_missing_session_prefixes_merge_by_user_across_threads(tmp_path: Path) -
     assert {row["source_ref"] for row in by_user["no_user_id"][1]} == {"anonymous.json"}
 
 
+@pytest.mark.parametrize("session_id", ["", "no_session_id"])
+def test_python_missing_session_still_merges_across_beijing_windows(
+    tmp_path: Path, session_id: str
+) -> None:
+    question = Message(role="user", content="question")
+    answer = Message(role="assistant", content="answer", reasoning_content="")
+    first = Snapshot(
+        source_path="first.json",
+        source_sha256="a" * 64,
+        session_id=session_id,
+        thread_id="first-thread",
+        user_id="alice",
+        captured_at="2026-10-13T07:59:59+08:00",
+        provider="openai",
+        operation="responses",
+        outcome="success",
+        history=[question],
+        response=[answer],
+        termination="completed",
+        wire_complete=True,
+    )
+    later = first.model_copy(
+        update={
+            "source_path": "later.json",
+            "source_sha256": "b" * 64,
+            "thread_id": "second-thread",
+            "captured_at": "2026-10-13T16:00:00+08:00",
+            "history": [question, answer, Message(role="user", content="next")],
+            "response": [
+                Message(role="assistant", content="done", reasoning_content="")
+            ],
+        }
+    )
+    with StateStore(tmp_path / "state.sqlite") as state:
+        for item in (later, first):
+            state.put_snapshot(item)
+        assert list(state.aggregation_scopes()) == [("user", "alice")]
+        stats = PipelineStats()
+        _build_trajectories(state, stats, build_workers=1)
+        stored = list(state.iter_trajectories())
+
+    assert stats.prefix_intermediates == 1
+    assert len(stored) == 1
+    _, node, origins = stored[0]
+    assert node.metadata.session_id == "no_session_id"
+    assert node.messages == [*later.history, *later.response]
+    assert {origin["source_ref"] for origin in origins} == {"first.json", "later.json"}
+
+
 def test_sub_session_ids_follow_created_at_with_stable_hash_tiebreak(
     tmp_path: Path,
 ) -> None:

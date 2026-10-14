@@ -7,9 +7,11 @@ from collections.abc import Iterable
 from typing import Any
 
 from .audit_codes import RESPONSES_UNSUPPORTED_CALL_EVIDENCE
+from .identity import normalize_session_id
 from .json_codec import dumps
 from .models import CompactionRecord, Message, Severity, TrajectoryNode
 from .output_contract import project_message, project_trajectory
+from .window_identity import sessionless_window
 
 
 def canonical_json(value: Any) -> bytes:
@@ -75,7 +77,14 @@ def _semantic_provider_evidence(
     }
 
 
-def semantic_payload(node: TrajectoryNode) -> dict[str, Any]:
+def semantic_payload(
+    node: TrajectoryNode, *, sessionless_window_hours: int = 0
+) -> dict[str, Any]:
+    if type(sessionless_window_hours) is not int or sessionless_window_hours not in (
+        0,
+        8,
+    ):
+        raise ValueError("sessionless_window_hours must be 0 or 8")
     # Use the same field projection as persisted and published trajectories.
     # Completeness is deliberately omitted because it is derived below the
     # semantic identity boundary.
@@ -106,6 +115,13 @@ def semantic_payload(node: TrajectoryNode) -> dict[str, Any]:
             ),
         },
     }
+    if sessionless_window_hours and (
+        not normalize_session_id(node.metadata.session_id)
+        or ("metadata_session_id_synthesized" in issue_codes)
+    ):
+        window = sessionless_window(node.metadata.created_at)
+        if window:
+            aggregation_identity["sessionless_window"] = window
     if "metadata_session_id_masked" in issue_codes:
         # A redacted session token is shared by unrelated captures. Preserve
         # source identity in the semantic hash so those captures cannot be
@@ -119,6 +135,7 @@ def semantic_payload(node: TrajectoryNode) -> dict[str, Any]:
         "completeness_tag",
         "total_rounds",
         "total_tool_calls",
+        "total_tokens",
         "tool_counts",
         "reasoning_total_tokens",
         "tool_defs_tag",
@@ -138,11 +155,19 @@ def semantic_payload(node: TrajectoryNode) -> dict[str, Any]:
     children = payload.get("sub_agent_trajectory")
     if isinstance(children, dict):
         payload["sub_agent_trajectory"] = {
-            call_id: semantic_payload((node.sub_agent_trajectory or {})[call_id])
+            call_id: semantic_payload(
+                (node.sub_agent_trajectory or {})[call_id],
+                sessionless_window_hours=sessionless_window_hours,
+            )
             for call_id in sorted(children)
         }
     return payload
 
 
-def trajectory_id(node: TrajectoryNode) -> str:
-    return hashlib.sha256(canonical_json(semantic_payload(node))).hexdigest()
+def trajectory_id(node: TrajectoryNode, *, sessionless_window_hours: int = 0) -> str:
+    """Hash using the writer's policy or an explicitly selected reader policy."""
+    return hashlib.sha256(
+        canonical_json(
+            semantic_payload(node, sessionless_window_hours=sessionless_window_hours)
+        )
+    ).hexdigest()

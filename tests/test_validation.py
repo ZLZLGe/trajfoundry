@@ -73,6 +73,11 @@ def _refresh_manifest_entry(root: Path, relative: str) -> None:
             entry["bytes"] = target.stat().st_size
             entry["sha256"] = file_sha256(target)
             break
+    manifest["total_bytes"] = sum(
+        entry["bytes"]
+        for entry in manifest["files"]
+        if entry["path"] != "lineage.jsonl"
+    )
     manifest_path.write_bytes(orjson.dumps(manifest, option=orjson.OPT_SORT_KEYS))
 
 
@@ -192,6 +197,9 @@ def test_validate_output_checks_manifest_counts(tmp_path: Path) -> None:
     manifest_path = tmp_path / "manifest.json"
     manifest = orjson.loads(manifest_path.read_bytes())
     manifest["counts"]["accepted"] = 99
+    # Keep new aliases internally consistent to exercise observed row counts.
+    manifest["accepted_trajectory_count"] = 99
+    manifest["record_count"] = 99 + manifest["quarantined_trajectory_count"]
     manifest_path.write_bytes(orjson.dumps(manifest))
 
     report = validate_output(tmp_path)
@@ -328,6 +336,17 @@ def test_validate_output_accepts_v2_manifest_with_skip_defaults(tmp_path: Path) 
             }
         )
     manifest["schema_version"] = "trajfoundry-v2"
+    for key in (
+        "status",
+        "started_at_ms",
+        "completed_at_ms",
+        "total_bytes",
+        "record_count",
+        "accepted_trajectory_count",
+        "quarantined_trajectory_count",
+        "parse_failure_count",
+    ):
+        manifest.pop(key)
     manifest.pop("input_format")
     manifest["files"] = legacy_files
     manifest["counts"]["input_files"] = 3
@@ -422,7 +441,7 @@ def test_export_preserves_required_null_server_result(tmp_path: Path) -> None:
     ]
     output = OutputSet(tmp_path)
     output.stats.input_files = 1
-    output.write_trajectory(node, [_origin("server.json")])
+    output.write_trajectory(enrich_trajectory(node), [_origin("server.json")])
     output.close(input_root="/input", config_hash="config")
 
     row = orjson.loads(_manifest_path(tmp_path, "/accepted/trajectories-").read_bytes())
@@ -442,7 +461,7 @@ def test_validate_output_rejects_missing_server_result_key(tmp_path: Path) -> No
     ]
     output = OutputSet(tmp_path)
     output.stats.input_files = 1
-    output.write_trajectory(node, [_origin("server.json")])
+    output.write_trajectory(enrich_trajectory(node), [_origin("server.json")])
     output.close(input_root="/input", config_hash="config")
     _mutate_accepted(tmp_path, lambda row: row["server_tool_calls"][0].pop("result"))
 

@@ -292,6 +292,8 @@ def _stage_manifest_entry(
     entry: _ManifestEntry,
     stage_root: Path,
     start_order: int,
+    *,
+    sessionless_window_hours: int = 0,
 ) -> list[_StagedTrajectory]:
     response = client.get_object(
         Bucket=input_location.bucket,
@@ -350,7 +352,9 @@ def _stage_manifest_entry(
         staged.append(
             _StagedTrajectory(
                 path=staged_path,
-                stable_hash=trajectory_id(node),
+                stable_hash=trajectory_id(
+                    node, sessionless_window_hours=sessionless_window_hours
+                ),
                 session_id=session_id,
                 session_synthesized=_session_is_synthesized(value),
                 created_at=created_at,
@@ -695,6 +699,9 @@ def _run_s3_label_job_with_client(
     if not input_report.valid:
         detail = input_report.errors[0] if input_report.errors else "unknown error"
         raise LabelJobError(f"normalized input failed validation: {detail}")
+    sessionless_window_hours = orjson.loads(manifest_bytes).get(
+        "sessionless_window_hours"
+    ) or 0
     # Verify output listing access before any model calls. Existing flat objects
     # remain in place until the replacement manifest has been published. Do not
     # read the old output manifest: some S3-compatible stores return AccessDenied
@@ -726,6 +733,7 @@ def _run_s3_label_job_with_client(
                     entry,
                     stage_root,
                     len(staged),
+                    sessionless_window_hours=sessionless_window_hours,
                 )
             )
         assigned = _assign_output_paths(staged)
@@ -811,6 +819,7 @@ def _run_s3_label_job_with_client(
             raise LabelJobError("classification candidate counts do not reconcile")
         output_manifest = {
             "schema_version": "trajfoundry-classification-v1",
+            **({"sessionless_window_hours": 8} if sessionless_window_hours else {}),
             "created_at": datetime.now(UTC).isoformat(),
             "input_root": input_location.uri,
             "input_manifest_sha256": manifest_sha256,

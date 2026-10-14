@@ -479,16 +479,33 @@ def test_run_s3_job_recovers_after_post_cleanup_failure(
     assert (bucket, f"{output_prefix}{old_path}") not in client.objects
 
 
-def test_run_s3_job_rejects_empty_input_without_writing_output(
+def test_run_s3_job_publishes_successful_empty_manifest(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     client = _MemoryS3Client()
 
-    with pytest.raises(ValueError, match="capture source is empty"):
-        _run(monkeypatch, tmp_path, client)
+    result = _run(monkeypatch, tmp_path, client)
 
-    assert not any(call[0] == "put_object" for call in client.calls)
+    manifest = orjson.loads(
+        client.objects[
+            (
+                "agent-trajectory",
+                "lakehouse/free-router/normalized/v002/dt=2026-09-09/manifest.json",
+            )
+        ]
+    )
+    assert result.validation.valid
+    assert manifest["status"] == "SUCCEEDED"
+    assert manifest["record_count"] == manifest["total_bytes"] == 0
+    assert manifest["accepted_trajectory_count"] == 0
+    assert manifest["quarantined_trajectory_count"] == 0
+    assert manifest["parse_failure_count"] == 0
+    assert manifest["started_at_ms"] <= manifest["completed_at_ms"]
+    assert not any(
+        key.endswith(".jsonl") and key != "lineage.jsonl"
+        for key in (entry["path"] for entry in manifest["files"])
+    )
     assert client.closed
 
 
@@ -516,14 +533,17 @@ def test_run_s3_job_loads_default_credentials_and_closes_client(
     monkeypatch.setattr(jobs, "load_s3_credentials", _load)
     monkeypatch.setattr(jobs, "create_s3_client", _create)
 
-    with pytest.raises(ValueError, match="capture source is empty"):
-        jobs.run_s3_job(
-            "s3://bucket/input/",
-            "s3://bucket/output/",
-            "freerouter",
-            "http://s3.example.invalid",
-            workspace_parent=tmp_path,
-        )
+    result = jobs.run_s3_job(
+        "s3://bucket/input/",
+        "s3://bucket/output/",
+        "freerouter",
+        "http://s3.example.invalid",
+        workspace_parent=tmp_path,
+    )
+    manifest = orjson.loads(client.objects[("bucket", "output/manifest.json")])
+    assert result.validation.valid
+    assert manifest["status"] == "SUCCEEDED"
+    assert manifest["record_count"] == manifest["total_bytes"] == 0
 
     assert loaded_paths == [jobs.DEFAULT_S3_CREDENTIALS_PATH]
     assert client_kwargs == [

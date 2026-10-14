@@ -112,3 +112,26 @@ def test_run_job_raises_with_validation_report(monkeypatch: pytest.MonkeyPatch) 
 def test_run_job_rejects_unknown_input_format(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="unsupported input format"):
         jobs.run_job(tmp_path / "input", tmp_path / "output", "unknown")  # type: ignore[arg-type]
+
+
+def test_run_job_feedback_clock_includes_validation(tmp_path, monkeypatch):
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    output_root = tmp_path / "output"
+    clock = [1000]
+    original_validate = jobs.validate_output
+
+    def validate_and_advance(root):
+        report = original_validate(root)
+        clock[0] = 9000
+        return report
+
+    monkeypatch.setattr(jobs, "unix_ms", lambda: clock[0])
+    monkeypatch.setattr(jobs, "validate_output", validate_and_advance)
+    result = jobs.run_job(input_root, output_root)
+    manifest = orjson.loads((output_root / "manifest.json").read_bytes())
+    assert result.validation.valid
+    assert manifest["started_at_ms"] == 1000
+    assert manifest["completed_at_ms"] == 9000
+    assert original_validate(output_root).valid
+    assert not list(output_root.glob(".manifest-feedback-*"))

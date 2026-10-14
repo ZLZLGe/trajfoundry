@@ -14,6 +14,7 @@ from typing import Any, BinaryIO, Literal, Self
 
 from .canonical import trajectory_id
 from .export import SCHEMA_VERSION, ExportStats, trajectory_filename
+from .feedback import feedback_fields, unix_ms
 from .json_codec import dumps
 from .models import QuarantineRecord, TrajectoryNode
 from .output_contract import project_trajectory
@@ -217,6 +218,7 @@ class S3OutputSet:
         if max_pending is not None and max_pending <= 0:
             raise ValueError("max pending must be positive")
         self.max_shard_bytes = max_shard_bytes
+        self._started_at_ms = unix_ms()
         self._client = client
         self.location = location
         self.max_workers = max_workers
@@ -422,6 +424,8 @@ class S3OutputSet:
         *,
         input_root: str,
         config_hash: str,
+        started_at_ms: int | None = None,
+        parse_failure_count: int = 0,
         input_format: Literal[
             "freerouter", "tokenplan", "sxf", "deepinfra"
         ] = "freerouter",
@@ -440,6 +444,14 @@ class S3OutputSet:
             raise
 
         manifest = {
+            **feedback_fields(
+                self.stats,
+                total_bytes=sum(item.bytes for item in self._trajectory_objects),
+                started_at_ms=(
+                    self._started_at_ms if started_at_ms is None else started_at_ms
+                ),
+                parse_failure_count=parse_failure_count,
+            ),
             "schema_version": SCHEMA_VERSION,
             "created_at": datetime.now(UTC).isoformat(),
             "input_root": input_root,

@@ -100,6 +100,9 @@ timestamp changes.
 
 ## Normalization rules
 
+Batch feedback fields, node-local token estimates, and the Python/Spark grouping
+boundaries are described in [production feedback](docs/production-feedback.md).
+
 - Supported endpoints: OpenAI-compatible Responses and Anthropic Messages,
   plus OpenAI-compatible Chat Completions. Streamed and non-streamed responses
   are supported; SXF SSE bodies are decoded before provider parsing. TokenPlan's

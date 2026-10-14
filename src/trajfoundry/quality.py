@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator
@@ -14,6 +15,7 @@ from .audit_codes import (
     PRIMARY_MOUNT_DIAGNOSTIC_CODES,
     RESPONSES_UNSUPPORTED_CALL_EVIDENCE,
 )
+from .json_codec import dumps
 from .models import (
     AuditIssue,
     AuditTag,
@@ -35,6 +37,142 @@ def estimate_tokens(text: str) -> int:
     """Cheap, deterministic approximation; never use for billing."""
 
     return sum(1 for _ in _TOKEN_PATTERN.finditer(text))
+
+
+_NON_TEXT_TYPES = frozenset(
+    {
+        "image",
+        "image_url",
+        "input_image",
+        "output_image",
+        "computer_screenshot",
+        "audio",
+        "input_audio",
+        "output_audio",
+        "video",
+        "input_video",
+        "file",
+        "input_file",
+        "output_file",
+        "document",
+        "image_generation_call_output",
+        "compaction",
+        "encrypted_content",
+        "redacted_thinking",
+    }
+)
+_OPAQUE_FIELDS = frozenset({"encrypted_content", "file_data", "b64_json"})
+_PAYLOAD_MARKER = re.compile(
+    r'"(?:' + "|".join(sorted(_OPAQUE_FIELDS)) + r')"\s*:|'
+    r'"type"\s*:\s*"(?:' + "|".join(sorted(_NON_TEXT_TYPES)) + r')"'
+)
+_DATA_URI = re.compile(r"data:[^\s\"'<>;,]*;base64,[A-Za-z0-9+/=\r\n]+", re.IGNORECASE)
+_MEDIA_TAG = re.compile(
+    r"<(image|audio|video)\b[^>]*>.*?</\1\s*>", re.DOTALL | re.IGNORECASE
+)
+_JSON_START = re.compile(r"[{\[]")
+_JSON_DECODER = json.JSONDecoder()
+_OMITTED_PAYLOAD = object()
+
+
+def _visible_token_value(value: Any) -> Any:
+    """Strip explicit media/opaque payloads without guessing from text size."""
+
+    if isinstance(value, str):
+        return _visible_token_text(value)
+    if isinstance(value, dict):
+        kind = value.get("type")
+        if isinstance(kind, str) and kind in _NON_TEXT_TYPES:
+            return _OMITTED_PAYLOAD
+        kept = {}
+        for key, item in value.items():
+            if key in _OPAQUE_FIELDS:
+                continue
+            visible = _visible_token_value(item)
+            if visible is not _OMITTED_PAYLOAD:
+                kept[key] = visible
+        return kept if kept or not value else _OMITTED_PAYLOAD
+    if isinstance(value, list):
+        kept = [
+            visible
+            for item in value
+            if (visible := _visible_token_value(item)) is not _OMITTED_PAYLOAD
+        ]
+        return kept if kept or not value else _OMITTED_PAYLOAD
+    return value
+
+
+def _visible_token_text(text: str) -> str:
+    # Adapters retain non-text blocks as JSON embedded in otherwise plain text,
+    # including adjacent blocks without a newline in Chat/Anthropic captures.
+    # Leave ordinary prose/code unchanged; decode only when payload markers occur.
+    if not _PAYLOAD_MARKER.search(text):
+        return _DATA_URI.sub(" ", _MEDIA_TAG.sub(" ", text))
+    pieces: list[str] = []
+    cursor = 0
+    search_from = 0
+    while match := _JSON_START.search(text, search_from):
+        try:
+            value, end = _JSON_DECODER.raw_decode(text, match.start())
+        except (ValueError, RecursionError):
+            search_from = match.end()
+            continue
+        visible = _visible_token_value(value)
+        if visible is _OMITTED_PAYLOAD or visible != value:
+            pieces.append(text[cursor : match.start()])
+            pieces.append(
+                " "
+                if visible is _OMITTED_PAYLOAD
+                else dumps(visible, sort_keys=True).decode("utf-8")
+            )
+            cursor = end
+        search_from = end
+    pieces.append(text[cursor:])
+    return _DATA_URI.sub(" ", _MEDIA_TAG.sub(" ", "".join(pieces)))
+
+
+def _value_tokens(value: Any) -> int:
+    visible = _visible_token_value(value)
+    if visible is _OMITTED_PAYLOAD:
+        return 0
+    text = (
+        visible
+        if isinstance(visible, str)
+        else dumps(visible, sort_keys=True).decode("utf-8")
+    )
+    return estimate_tokens(text)
+
+
+def estimate_trajectory_tokens(node: TrajectoryNode) -> int:
+    """Estimate this node's content once, excluding mounted child transcripts.
+
+    This uses unicode-word-v1, not provider usage/billing tokens. Count visible
+    message text/reasoning, tool names/arguments/results and local instructions
+    and definitions. JSON arguments/schemas/results use compact sorted JSON.
+    Raw reasoning records duplicate reasoning_content and may contain encrypted
+    payloads; those, agent/compaction sidecars, IDs and audit metadata are omitted.
+    """
+
+    total = _value_tokens(node.instructions)
+    for definition in node.tools:
+        total += _value_tokens(definition.name)
+        total += _value_tokens(definition.description)
+        total += _value_tokens(definition.parameters)
+    for message in node.messages:
+        total += _value_tokens(message.content)
+        total += _value_tokens(message.reasoning_content or "")
+        if message.role == "tool":
+            total += _value_tokens(message.name or "")
+        for call in message.tool_calls or []:
+            total += _value_tokens(call.function.name)
+            total += _value_tokens(call.function.arguments)
+    for call in node.server_tool_calls:
+        total += _value_tokens(call.name)
+        total += _value_tokens(call.arguments)
+        # Hosted image generation returns raw base64, outside a media block.
+        if call.result is not None and call.name != "image_generation":
+            total += _value_tokens(call.result)
+    return total
 
 
 def _json_type(value: Any) -> str:
@@ -557,6 +695,7 @@ def enrich_trajectory(
         "sub_agent_trajectory": children or None,
         "total_rounds": total_rounds,
         "total_tool_calls": sum(counts.values()),
+        "total_tokens": estimate_trajectory_tokens(node),
         "tool_counts": dict(sorted(counts.items())),
         "reasoning_total_tokens": reasoning_tokens,
         "tool_defs_tag": tool_defs_tag,

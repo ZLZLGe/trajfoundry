@@ -302,6 +302,7 @@ class TrajectoryNode(StrictModel):
     source: str
     total_rounds: int = 0
     total_tool_calls: int = 0
+    total_tokens: int = Field(default=0, ge=0)
     tool_counts: dict[str, int] = Field(default_factory=dict)
     reasoning_total_tokens: int = 0
     tool_defs_tag: Literal["complete", "incomplete", "complete_with_incomplete_sub"] = (
