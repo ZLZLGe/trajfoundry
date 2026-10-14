@@ -71,6 +71,68 @@ def test_prefix_chain_and_divergent_leaves_in_every_input_order(tmp_path):
         assert_matches_reference(items, tmp_path)
 
 
+def assert_prefix_regression(items, directory, cache_bytes, expected_paths):
+    expected = streaming_prefix_leaves(items)
+    assert {leaf.source_path for leaf in expected.leaves} == expected_paths
+    with disk_prefix_leaves(
+        items, directory, lookup_cache_bytes=cache_bytes
+    ) as actual:
+        assert tuple(actual.leaves) == expected.leaves
+        assert tuple(actual.intermediate_paths) == expected.intermediate_paths
+        assert {
+            path: tuple(values) for path, values in actual.contributor_paths.items()
+        } == expected.contributor_paths
+
+
+@pytest.mark.parametrize("cache_bytes", [0, 128 * 1024**2])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_prefix_coverage_at_twenty_thousand_node_boundary(
+    tmp_path, cache_bytes, reverse
+):
+    # This exact four-request shape exposed Spark's deferred UPDATE-before-
+    # INSERT bug. A fills 20,000 trie nodes including the scope root; B-long
+    # covers B-short, then C closes that branch. Python inserts immediately,
+    # and must remain independent of node count, cache eviction and input order.
+    history = [user("a"), *[user("x") for _ in range(19_997)]]
+    metadata = {"session_id": "", "user_id": "u", "wire_complete": True}
+    items = [
+        snapshot("A", history, [user("x")], **metadata),
+        snapshot("B-short", [], [user("b")], **metadata),
+        snapshot("B-long", [user("b")], [user("z")], **metadata),
+        snapshot("C", [], [user("c")], **metadata),
+    ]
+    if reverse:
+        items.reverse()
+    assert_prefix_regression(
+        items, tmp_path, cache_bytes, {"A", "B-long", "C"}
+    )
+
+
+@pytest.mark.parametrize("cache_bytes", [0, 128 * 1024**2])
+def test_many_short_histories_preserve_prefix_coverage(tmp_path, cache_bytes):
+    # Cross the same node boundary with ordinary history lengths, not a single
+    # giant request: each group must retain only its longest capture while
+    # preserving all four source contributors.
+    items = [
+        snapshot(
+            f"group-{group:04d}-length-{length}",
+            [user(f"g{group:04d}"), *[user("x") for _ in range(length - 2)]],
+            [user("x")],
+            session_id="",
+            user_id="u",
+            wire_complete=True,
+        )
+        for group in range(400)
+        for length in (121, 123, 125, 127)
+    ]
+    assert_prefix_regression(
+        items,
+        tmp_path,
+        cache_bytes,
+        {f"group-{group:04d}-length-127" for group in range(400)},
+    )
+
+
 def test_equal_empty_and_history_only_transcripts(tmp_path):
     q, a = user("q"), assistant("a")
     items = [
