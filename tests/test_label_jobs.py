@@ -392,6 +392,7 @@ def test_v004_job_classifies_accepted_and_quarantined_into_flat_files(
         assert output_manifest[field] == getattr(classifier, field)
     assert output_manifest["classification_policy"]["scenario_count"] == 1
     assert output_manifest["classification_policy"]["capability_max"] == 2
+    assert output_manifest["classification_policy"]["subject_count"] == 1
     trajectory_files = [
         entry for entry in output_manifest["files"] if entry["kind"] == "trajectory"
     ]
@@ -432,10 +433,17 @@ def test_v004_job_classifies_accepted_and_quarantined_into_flat_files(
     assert completion.calls == 3
 
 
-def test_invalid_cached_l2_shape_is_rejected_and_reclassified(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "field,stale_labels",
+    [
+        ("scenario_labels", ["购物", "生活"]),
+        ("subject_labels", ["地球与环境科学", "生命科学"]),
+    ],
+)
+def test_invalid_cached_labels_are_rejected_and_reclassified(
+    tmp_path: Path, field: str, stale_labels: list[str]
 ) -> None:
-    """A stale accepted cache row must not bypass the L1 output contract."""
+    """A stale accepted cache row must not bypass label cardinality checks."""
 
     client = _MemoryS3()
     input_location = S3Location("bucket", "normalized/v004/dt=2026-09-14/")
@@ -447,7 +455,7 @@ def test_invalid_cached_l2_shape_is_rejected_and_reclassified(
         taxonomy=_taxonomy(tmp_path),
         input_manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
     )
-    state_path = tmp_path / "stale-l2-state.sqlite"
+    state_path = tmp_path / "stale-label-state.sqlite"
 
     first = _run_s3_label_job_with_client(
         client,
@@ -466,10 +474,7 @@ def test_invalid_cached_l2_shape_is_rejected_and_reclassified(
             "SELECT cache_key, result FROM classifications ORDER BY cache_key LIMIT 1"
         ).fetchone()
         stale = orjson.loads(result)
-        stale["scenario_labels"] = [
-            stale["scenario_labels"][0],
-            stale["scenario_labels"][0],
-        ]
+        stale[field] = stale_labels
         connection.execute(
             "UPDATE classifications SET result = ? WHERE cache_key = ?",
             (orjson.dumps(stale), cache_key),

@@ -1,8 +1,9 @@
 # 轨迹分类 v2：处理规则与字段说明
 
-本说明对应分类器 `2026-11-09.1`、Prompt `v005-toolcall-scenario-capability-subject` 和输出格式 `trajfoundry-classification-v2`。
+本说明对应分类器 `2026-11-09.2`、Prompt `v006-toolcall-scenario-capability-subject` 和输出格式 `trajfoundry-classification-v2`。
 分类目录来自[智能体数据分类](https://aicarrier.feishu.cn/wiki/U9qfw9wJzilQNykzjvscCOfWnJn)，本次读取的文档修订号为 130。
 代码中的 `src/trajfoundry/classification/taxonomy.json` 是发布时固定的目录快照；运行中不访问飞书，也不会随文档编辑自动改变。
+学科按本次确认的规则严格单选；跨学科任务也只保留一个主要学科。
 
 ## 一、哪些轨迹会分类
 
@@ -26,8 +27,8 @@
     "scenario_labels": ["IT互联网"],
     "capability_labels": ["代码与程序化操作", "评估与验证"],
     "subject_labels": ["计算机与人工智能"],
-    "classifier_revision": "2026-11-09.1",
-    "prompt_version": "v005-toolcall-scenario-capability-subject",
+    "classifier_revision": "2026-11-09.2",
+    "prompt_version": "v006-toolcall-scenario-capability-subject",
     "taxonomy_sha256": "<64位小写SHA-256>"
   }
 }
@@ -38,7 +39,7 @@
 | `status` | 字符串 | `accepted` 分类成功；`skipped` 按规则跳过；`failed` 单条分类失败。 |
 | `scenario_labels` | 字符串数组 | 从 90 个场景中选且只选 1 个，名称严格与目录一致。 |
 | `capability_labels` | 字符串数组 | 从 10 个能力中选 1–2 个，不重复，以任务的主要能力为先。 |
-| `subject_labels` | 字符串数组 | 从 25 个选项中选择一个或多个有直接依据的学科，不重复。没有明确学科时为 `["通用（非学科）"]`，此项不能与其他学科同时出现。文档没有规定具体学科最多选两项，本实现不额外加这个限制。 |
+| `subject_labels` | 字符串数组，长度固定为 1 | 从 25 个选项中只选一个主要学科。跨学科任务也只选与用户主要目标最相关的一项；没有明确学科时为 `["通用（非学科）"]`。保留数组形式，但不允许输出多个学科。 |
 | `classifier_revision` | 字符串 | 分类实现版本，用于区分不同时期的处理规则。只在成功对象中出现。 |
 | `prompt_version` | 字符串 | 提示词版本。只在成功对象中出现。 |
 | `taxonomy_sha256` | 字符串 | 完整分类目录的内容摘要，包含三类标签、描述及典型任务。只在成功对象中出现。 |
@@ -118,7 +119,7 @@ manifest 是本次输出的文件清单与运行说明，不是一条轨迹。�
 | `scenario_count` | `1` | 必须选择一个场景。 |
 | `capability_min` | `1` | 最少选择一个能力。 |
 | `capability_max` | `2` | 最多选择两个能力。 |
-| `subject_min` | `1` | 最少选择一个学科选项；每个选项至多出现一次。 |
+| `subject_count` | `1` | 必须且只能选择一个主要学科选项。 |
 | `generic_subject` | `通用（非学科）` | 没有明确学科归属时使用的选项。 |
 | `generic_subject_exclusive` | `true` | 通用选项只能单独使用。 |
 
@@ -181,6 +182,8 @@ manifest 不把自身列入 `files`，也不对自身计算嵌套摘要。完整
 ## 四、缓存、发布和调度
 
 分类缓存位于 Worker 本地 `workspace_parent/.trajfoundry-label-cache/`，以轨迹内容、输入 manifest 摘要和分类配置摘要共同生成缓存键。只缓存校验成功的标签；失败记录在下次运行重试，跳过记录直接重新检查。截断诊断仅保存在本地缓存中，用于 manifest 汇总，不会重新出现在轨迹分类对象里。更换 Worker 可能没有本地缓存，应按重新调用模型估算耗时。
+
+分类器 `2026-11-09.2` 将学科收紧为单选，更新版本、提示词和策略后会使用新的缓存命名空间。此前多学科结果不会直接复用；模型若返回多个学科，按标签校验失败重试，不会静默截取第一个。
 
 所有候选行在本地完成后才开始上传；轨迹和 lineage 回读校验后，最后写 manifest。旧输出未列入新清单的顶层 JSONL 会在新 manifest 发布后清理。上传过程中同名文件可能先于新 manifest 改变，读取方应核验文件摘要，并禁止两个作业同时写同一输出分区。输入输出目录不能重叠。
 

@@ -270,8 +270,8 @@ the full row is emitted with `classification={"status":"skipped",
 "skip_reason":"no_toolcall"}` and no model request is made.
 
 Eligible rows are classified into one of 90 scenarios, one or two of 10
-capabilities, and one or more of 25 subject options. Labels are exact Chinese
-catalog names. The generic subject `通用（非学科）` must stand alone. Accepted
+capabilities, and exactly one primary subject from 25 options. Labels are exact
+Chinese catalog names. The generic subject `通用（非学科）` must stand alone. Accepted
 classification objects contain only `status`, `scenario_labels`,
 `capability_labels`, `subject_labels`, `classifier_revision`, `prompt_version`,
 and `taxonomy_sha256`. Failed objects contain only `status` and a safe `reason`.

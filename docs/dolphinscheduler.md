@@ -309,7 +309,7 @@ Legacy generation shards and flat v4 input remain supported. The complete
 row is preserved whether classification succeeds, fails or is skipped.
 Rows whose normalized `total_tool_calls` are zero across the entire trajectory
 tree skip model inference. Eligible rows receive one scenario, one or two
-capabilities and non-empty subject labels from the new taxonomy.
+capabilities and exactly one primary subject from the new taxonomy.
 
 The [field reference](classification.md) documents every classification and
 manifest field, retry reason, count and cache rule. Test a small partition

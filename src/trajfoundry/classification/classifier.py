@@ -25,8 +25,8 @@ from .input_projection import (
 from .input_projection import VERSION as PROJECTION_VERSION
 from .taxonomy import GENERIC_SUBJECT_LABEL, ScenarioTaxonomy
 
-CLASSIFIER_REVISION = "2026-11-09.1"
-PROMPT_VERSION = "v005-toolcall-scenario-capability-subject"
+CLASSIFIER_REVISION = "2026-11-09.2"
+PROMPT_VERSION = "v006-toolcall-scenario-capability-subject"
 DEFAULT_MAX_CONTEXT_CHARS = 600_000
 DEFAULT_SEMANTIC_RETRIES = 2
 MAX_CONTEXT_REDUCTIONS = 5
@@ -36,7 +36,7 @@ CLASSIFICATION_POLICY = {
     "scenario_count": 1,
     "capability_min": 1,
     "capability_max": 2,
-    "subject_min": 1,
+    "subject_count": 1,
     "generic_subject": GENERIC_SUBJECT_LABEL,
     "generic_subject_exclusive": True,
 }
@@ -180,12 +180,7 @@ class TrajectoryClassifier:
         catalogs = (
             ("scenario_labels", self.taxonomy.scenario_names, 1, 1),
             ("capability_labels", self.taxonomy.capability_names, 1, 2),
-            (
-                "subject_labels",
-                self.taxonomy.subject_names,
-                1,
-                len(self.taxonomy.subject_names),
-            ),
+            ("subject_labels", self.taxonomy.subject_names, 1, 1),
         )
         for field, allowed, minimum, maximum in catalogs:
             labels = value[field]
@@ -277,7 +272,7 @@ class TrajectoryClassifier:
                         + "\nUSER_REQUESTS_END\n\n"
                         "FINAL OUTPUT CHECK: Return exactly scenario_labels, capability_labels, "
                         "subject_labels as JSON arrays of existing catalog names. "
-                        "One scenario, one or two unique capabilities, one or more unique subjects. "
+                        "One scenario, one or two unique capabilities, exactly one primary subject. "
                         "通用（非学科） must be selected alone. No extra fields or explanations."
                     ),
                 },
@@ -342,10 +337,11 @@ class TrajectoryClassifier:
             "main task's best matching catalog entry using its group, description and examples.\n"
             "capability_labels: ONE or TWO distinct capability names, supported directly by "
             "the requests. Choose the smallest sufficient set; rank by centrality if more apply.\n"
-            "subject_labels: a non-empty array of distinct subject names. Select only "
-            "disciplines explicitly required by the task, without inferring them solely from "
-            "the scenario. If there is no clear disciplinary subject, return "
-            '["通用（非学科）"] alone; never mix it with specific disciplines.\n'
+            "subject_labels: an array containing exactly ONE primary subject name. Choose "
+            "the discipline most central to the user's main task, supported directly by "
+            "the requests. For interdisciplinary tasks, choose the single best matching "
+            "discipline; do not add secondary subjects or infer one solely from the scenario. "
+            'If there is no clear disciplinary subject, return ["通用（非学科）"] alone.\n'
             "Copy catalog names verbatim. No invented, translated, abbreviated or recombined "
             "labels. Descriptions and examples guide selection and must not appear in the output. "
             "Output only JSON, with no Markdown, explanations or additional fields.\n\n"

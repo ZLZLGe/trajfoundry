@@ -287,6 +287,12 @@ def test_missing_or_bad_tool_counter_is_an_input_error(count):
         ),
         ("capability_labels", [{}], "capability_labels"),
         ("subject_labels", [], "subject_labels"),
+        ("subject_labels", ["地球与环境科学", "生命科学"], "subject_labels"),
+        (
+            "subject_labels",
+            ["数学与统计学", "计算机与人工智能", "物理学"],
+            "subject_labels",
+        ),
         (
             "subject_labels",
             [GENERIC_SUBJECT_LABEL, "计算机与人工智能"],
@@ -309,13 +315,17 @@ def test_classifier_rejects_out_of_catalog_or_invalid_label_combinations(
     }
 
 
-def test_subjects_can_span_multiple_explicit_disciplines():
-    attempt = _classifier(
-        _Completion(
-            _decision(subject_labels=["数学与统计学", "计算机与人工智能", "物理学"])
-        )
-    ).classify(_trajectory())
+def test_multiple_subjects_retry_to_one_primary_subject():
+    client = _SequenceCompletion(
+        [
+            _decision(subject_labels=["地球与环境科学", "生命科学"]),
+            _decision(subject_labels=["生命科学"]),
+        ]
+    )
+    attempt = _classifier(client).classify(_trajectory())
     assert attempt.cacheable
+    assert client.calls == 2
+    assert attempt.classification["subject_labels"] == ["生命科学"]
 
 
 @pytest.mark.parametrize(
