@@ -269,9 +269,13 @@ def check_tool_calls(
                     missing_required.append(name)
 
             mismatched: list[TypeMismatch] = []
-            for name, value in arguments.items():
+            # Tool arguments are persisted through a sorted-key JSON
+            # projection.  Keep derived mismatch diagnostics in the same
+            # canonical order so validation is stable after a disk roundtrip.
+            for name in sorted(arguments):
                 if name not in properties:
                     continue
+                value = arguments[name]
                 declared = _declared_types(properties[name])
                 if not _matches_type(value, declared):
                     mismatched.append(

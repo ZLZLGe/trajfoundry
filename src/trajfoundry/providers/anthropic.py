@@ -1564,6 +1564,7 @@ def _snapshot_base(
         "request_id": _text(capture.get("request_id")),
         "model": _text(request.get("model")),
         "user_id": "",
+        "end_user_id": _text(capture.get("end_user_id")),
         "harness": harness,
         "instructions": "",
         "termination": "",

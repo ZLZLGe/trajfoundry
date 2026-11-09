@@ -620,6 +620,7 @@ def _validate_node(
             "source_type",
             "specific_source",
         },
+        optional={"end_user_id"},
     )
     source_file = _string(
         metadata["source_file"], f"{path}/metadata/source_file", nonempty=True
@@ -644,6 +645,8 @@ def _validate_node(
     _integer(metadata["line_no"], f"{path}/metadata/line_no")
     for field in ("created_at", "model", "user_id", "session_id"):
         _string(metadata[field], f"{path}/metadata/{field}")
+    if "end_user_id" in metadata:
+        _string(metadata["end_user_id"], f"{path}/metadata/end_user_id")
     sub_session_id = _integer(
         metadata["sub_session_id"], f"{path}/metadata/sub_session_id"
     )
@@ -1017,6 +1020,8 @@ def _project_trajectory(
         },
         "normalization_audit": _project_audit(node.normalization_audit),
     }
+    if node.metadata.end_user_id:
+        result["metadata"]["end_user_id"] = node.metadata.end_user_id
     if node.multimodal_file_mapping:
         result["multimodal_file_mapping"] = [
             _project_media_mapping(mapping) for mapping in node.multimodal_file_mapping

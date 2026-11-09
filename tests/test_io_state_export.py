@@ -13,14 +13,17 @@ from trajfoundry.io import JsonlShardWriter, load_capture
 from trajfoundry.models import (
     AuditTag,
     CompactionRecord,
+    FunctionCall,
     MediaMapping,
     Message,
     Metadata,
     NormalizationAudit,
     Snapshot,
+    ToolCall,
+    ToolDefinition,
     TrajectoryNode,
 )
-from trajfoundry.quality import enrich_trajectory
+from trajfoundry.quality import enrich_trajectory, validate_derived_fields
 from trajfoundry.state import StateStore
 from trajfoundry.validation import validate_output
 
@@ -607,6 +610,93 @@ def test_empty_published_session_is_synthesized_for_sub_session_assignment(
     assert len(restored) == 2
     assert all(item.metadata.session_id == "" for _, item, _ in restored)
     assert all(item.metadata.sub_session_id == 0 for _, item, _ in restored)
+
+
+def test_derived_fields_survive_serialization_and_sub_session_assignment(
+    tmp_path: Path,
+) -> None:
+    def node(source: str, content: str, created_at: str) -> TrajectoryNode:
+        return enrich_trajectory(
+            TrajectoryNode(
+                messages=[
+                    Message(role="user", content=content),
+                    Message(
+                        role="assistant",
+                        content="",
+                        reasoning_content="checking the request",
+                        tool_calls=[
+                            ToolCall(
+                                id="call-1",
+                                function=FunctionCall(
+                                    name="lookup",
+                                    arguments={"zeta": 1, "alpha": 2},
+                                ),
+                            )
+                        ],
+                    ),
+                    Message(
+                        role="tool",
+                        content="matched",
+                        tool_call_id="call-1",
+                        name="lookup",
+                    ),
+                    Message(role="assistant", content="done", reasoning_content=""),
+                ],
+                tools=[
+                    ToolDefinition(
+                        name="lookup",
+                        parameters={
+                            "type": "object",
+                            "properties": {
+                                "alpha": {"type": "string"},
+                                "zeta": {"type": "string"},
+                            },
+                        },
+                    )
+                ],
+                source=source,
+                metadata=Metadata(
+                    source_file=source,
+                    session_id="shared-session",
+                    user_id="source-user",
+                    end_user_id="distinct-end-user",
+                    created_at=created_at,
+                ),
+                normalization_audit=NormalizationAudit(tag=AuditTag.PASS),
+            )
+        )
+
+    items = [
+        node("first.json", "first request", "2026-09-03T00:00:00Z"),
+        node("second.json", "second request", "2026-09-03T00:01:00Z"),
+    ]
+    with StateStore(tmp_path / "state.sqlite") as state:
+        for item in items:
+            identifier = trajectory_id(item)
+            state.put_trajectory(
+                identifier,
+                item,
+                representative_key=item.metadata.source_file,
+                source_ref=item.metadata.source_file,
+                sha256="a" * 64,
+                captured_at=item.metadata.created_at,
+                disposition=item.normalization_audit.tag.value,
+                reason_codes=item.normalization_audit.reason_codes,
+            )
+
+        assert state.assign_sub_session_ids() == 0
+        restored = list(state.iter_trajectories())
+
+    assert [item.metadata.sub_session_id for _, item, _ in restored] == [0, 1]
+    for _, item, _ in restored:
+        validate_derived_fields(item)
+        assert item.tool_call_check.mismatches[0].type_mismatch is not None
+        assert [
+            mismatch.arg
+            for mismatch in item.tool_call_check.mismatches[0].type_mismatch
+        ] == ["alpha", "zeta"]
+        assert item.metadata.user_id == "source-user"
+        assert item.metadata.end_user_id == "distinct-end-user"
 
 
 def test_sub_session_assignment_skips_noncanonical_row_and_renumbers_survivors(

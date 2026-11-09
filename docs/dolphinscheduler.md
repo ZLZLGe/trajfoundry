@@ -291,102 +291,36 @@ retrying; do not start another same-date instance in parallel.
 
 ### Independent classification workflow
 
-Classification is a separate task and must use a normalized root as its input;
-it never calls normalization. Use
-[`dolphinscheduler_label_s3_node.py`](../examples/dolphinscheduler_label_s3_node.py)
-with parameters such as:
+Use the [v2 Python node](../examples/dolphinscheduler_label_s3_node.py) in a
+separate workflow. The node uses Worker-local `/tmp`, the existing protected
+S3 credential file and Worker-side `CLASSIFIER_API_KEY`. It explicitly selects
+`deepseek-v4.1-flash`, 20 workers, 20 additional transport retries and a
+180-second request timeout.
 
-| Parameter | Example |
+| Parameter | Meaning |
 | --- | --- |
-| `input_uri` | `s3://agent-trajectory/lakehouse/token-plan/normalized/v004/dt=2026-09-14/` |
-| `output_uri` | `s3://agent-trajectory/lakehouse/token-plan/classified/v001/dt=2026-09-14/` |
-| `endpoint_url` | `http://d-ceph-ssd-inside.pjlab.org.cn` |
-| `workspace_parent` | `/tmp` |
+| `input_uri` | One normalized partition containing `manifest.json`. |
+| `output_uri` | A new classified output partition, for example `classified/v002/dt=YYYY-MM-DD/`. |
+| `endpoint_url` | Existing S3 service endpoint. |
+| `classifier_api_url` | Existing DeepSeek service URL ending in `/chat/completions`. |
 
-The input must be the directory containing `manifest.json`; do not pass an
-`accepted`, `quarantine`, or `generations` child. Both strict and quarantined
-complete trajectories are classified. v004 generation shards and the current
-flat v4 contract are supported. Output is flat and contains each complete
-normalized row plus its top-level `classification` object. Accepted rows have
-exactly one L1 scenario label and one or two capability labels.
+Do not pass an `accepted`, `quarantine` or `generations` child as input.
+Legacy generation shards and flat v4 input remain supported. The complete
+row is preserved whether classification succeeds, fails or is skipped.
+Rows whose normalized `total_tool_calls` are zero across the entire trajectory
+tree skip model inference. Eligible rows receive one scenario, one or two
+capabilities and non-empty subject labels from the new taxonomy.
 
-The worker process uses the approved GLM configuration by default:
+The [field reference](classification.md) documents every classification and
+manifest field, retry reason, count and cache rule. Test a small partition
+before backfilling, and serialize backfill tasks so multiple 20-worker jobs do
+not multiply the intended API concurrency. Never run two writers for the same
+output partition or use a live SQLite cache on NFS. Worker-local caches may be
+lost on worker replacement.
 
-```text
-model=glm-5.3-flash
-api_url=https://token.pjlab.org.cn/v1/chat/completions
-```
-
-Only the API key must be supplied through the worker secret mechanism:
-
-```text
-CLASSIFIER_API_KEY=<secret>
-```
-
-Inject `CLASSIFIER_API_KEY` through the platform's protected secret mechanism
-or the worker service environment. Never put it in workflow parameters,
-`rawScript`, source control, or task logs. A key pasted into chat or another
-uncontrolled channel must be rotated before use.
-
-The classifier defaults to a 600,000-character serialized trajectory context
-budget (`max_context_chars`) and a 4,096-token output limit. The character
-budget is a conservative envelope for a 256K-token model rather than a
-tokenizer-level limit; the system prompt and taxonomy are additional context.
-If the gateway still reports a context-limit error, the classifier reduces the
-character budget and retries up to five times.
-
-Revision `2026-10-08.1` uses prompt `v004-user-only-closed-set`: the model selects
-one complete scenario key verbatim from a flat list and only one or two unique
-capabilities. A final output reminder follows the delimited request data. The
-scenario catalog, capability labels, JSON user-request projection, and strict
-output validation are unchanged. The prompt does not guarantee valid or
-semantically correct results for every model; test the configured model on a
-small sample before a full run. This update does not change the default model
-or transport retry behavior.
-
-The classifier revision and independent strategy fingerprint are recorded in
-the output manifest and cache configuration hash. Changing the model, context
-budget, output limit, or prompt therefore creates a separate cache namespace.
-Results cached with the previous prompt are not reused by this revision; the
-old cache files are not deleted automatically.
-
-The default cache is a deterministic SQLite file below
-`workspace_parent/.trajfoundry-label-cache/`. For recovery across worker
-restarts, point `state_path` at a worker-local persistent volume and pin retries
-to that worker or volume. Do not place a live SQLite cache on NFS and do not run
-two tasks against the same cache/output prefix concurrently. Set the scheduler
-maximum concurrency to `1` per source and date.
-
-The classifier uses bounded concurrency (four requests in the example). HTTP
-404, 429, and 5xx responses are retried. Network timeouts, URL transport errors,
-remote disconnects, connection resets/aborts, broken pipes, and incomplete HTTP
-response bodies use the same bounded exponential backoff with jitter, whether
-they occur while opening the connection or reading a successful response.
-`max_retries=5` allows at most six attempts per client call; exhausted network
-retries mark that trajectory as failed with reason `network_retry_exhausted`,
-without aborting the batch or caching the failed result. Network retry logs
-include only attempt counts and exception types, not request/response contents
-or exception details. A retry may repeat a request already processed upstream;
-exactly-once inference or billing is not guaranteed. This transport-only fix
-does not change the classification cache namespace, model, or prompt.
-
-HTTP 404 uses the same bounded retry budget and, if it persists, fails the job
-as a configuration error. HTTP 401/403/422 still fail immediately as
-configuration errors. A response that is not valid JSON
-or violates the label contract receives two additional semantic retries,
-separate from the HTTP/network retries. Per-trajectory exhausted retries or
-invalid model output still produce the original trajectory with
-`classification.status="failed"`. The failure reason uses a stable diagnostic
-code: `invalid_model_output_json`, `invalid_model_output_fields`,
-`invalid_model_output_scenario_label`, or
-`invalid_model_output_capability_labels`; transport and context failures use
-`network_retry_exhausted` and `context_limit_exhausted`. No model response text
-is persisted. A later rerun can inspect and retry the failed population.
-Classification reads and validates the normalized input
-manifest, but does not read its own output manifest. It lists existing
-top-level JSONL before model calls, publishes the replacement manifest last,
-and removes unlisted JSONL only after publication. A cleanup error fails the
-task, so a retry can recover an interrupted post-manifest cleanup.
+The shared environment imports the active editable checkout, so changes take
+effect on the next task run. The node logs `trajfoundry.__file__` and
+`CLASSIFIER_REVISION` at startup; verify both before starting a backfill.
 
 ## Updating the project
 

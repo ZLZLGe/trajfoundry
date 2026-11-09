@@ -72,7 +72,7 @@ from .tool_names import is_spawn_tool_name
 
 LOGGER = logging.getLogger(__name__)
 
-NORMALIZER_REVISION = "2026-10-13.1"
+NORMALIZER_REVISION = "2026-11-09.1"
 DEFAULT_INPUT = Path("/data/回流轨迹/data_feedback_des")
 DEFAULT_OUTPUT = Path("/data/trajfoundry")
 _INGEST_BATCH_ITEMS = 512
@@ -834,6 +834,7 @@ def _trajectory_from_leaf(
             created_at=leaf.captured_at,
             model=leaf.model,
             user_id=leaf.user_id or "no_user_id",
+            end_user_id=leaf.end_user_id,
             session_id=session_id or "no_session_id",
             source_type=source_type,
             specific_source=specific_source,

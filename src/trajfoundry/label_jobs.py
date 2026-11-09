@@ -19,16 +19,13 @@ import orjson
 from .canonical import trajectory_id
 from .classification.cache import ClassificationCache
 from .classification.classifier import (
-    CAPABILITY_LABELS,
     CLASSIFICATION_POLICY,
     CLASSIFIER_REVISION,
     DEFAULT_MAX_CONTEXT_CHARS,
     DEFAULT_MAX_OUTPUT_TOKENS,
-    PROJECTION_NAME,
-    PROJECTION_VERSION,
     PROMPT_VERSION,
-    TRUNCATION_STRATEGY,
     TrajectoryClassifier,
+    has_tool_calls,
 )
 from .classification.client import ChatCompletionsClient
 from .classification.taxonomy import DEFAULT_TAXONOMY_PATH, ScenarioTaxonomy
@@ -45,7 +42,7 @@ _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 _SYNTHESIZED_SESSION_CODE = "metadata_session_id_synthesized"
 _READ_CHUNK_BYTES = 1024 * 1024
 DEFAULT_CLASSIFIER_API_URL = "https://token.pjlab.org.cn/v1/chat/completions"
-DEFAULT_CLASSIFIER_MODEL = "glm-5.3-flash"
+DEFAULT_CLASSIFIER_MODEL = "deepseek-v4.1-flash"
 
 
 class LabelJobError(RuntimeError):
@@ -60,6 +57,7 @@ class LabelJobResult:
     classified: int
     failed: int
     cache_hits: int
+    skipped_no_toolcall: int = 0
     validation_valid: bool = True
 
 
@@ -535,109 +533,12 @@ def _validate_classification(
 ) -> None:
     assert item.sub_session_id is not None
     _validate_sub_session_inheritance(value, item.sub_session_id)
-    classification = value.get("classification")
-    if type(classification) is not dict:
-        raise LabelJobError("classified trajectory has no classification object")
-    common = {
-        "status",
-        "model_label",
-        "harness_label",
-        "classifier_revision",
-        "prompt_version",
-        "taxonomy_sha256",
-        "catalog_sha256",
-        "policy_sha256",
-        "prompt_sha256",
-        "strategy_fingerprint",
-        "config_hash",
-        "input_manifest_sha256",
-        "context_truncated",
-        "input_projection",
-        "input_projection_version",
-        "user_turn_count",
-        "original_user_chars",
-        "sent_user_chars",
-        "truncation_strategy",
-    }
-    status = classification.get("status")
-    expected_keys = (
-        common | {"scenario_labels", "capability_labels"}
-        if status == "accepted"
-        else common | {"reason"}
-    )
-    if status not in {"accepted", "failed"} or set(classification) != expected_keys:
-        raise LabelJobError("classification object violates its status contract")
-    if classification["classifier_revision"] != classifier.classifier_revision:
-        raise LabelJobError("classification revision does not match the job")
-    if classification["prompt_version"] != classifier.prompt_version:
-        raise LabelJobError("classification prompt version does not match the job")
-    if classification["taxonomy_sha256"] != classifier.taxonomy.sha256:
-        raise LabelJobError("classification taxonomy does not match the job")
-    if classification["catalog_sha256"] != classifier.catalog_sha256:
-        raise LabelJobError("classification catalog does not match the job")
-    if classification["policy_sha256"] != classifier.policy_sha256:
-        raise LabelJobError("classification policy does not match the job")
-    if classification["prompt_sha256"] != classifier.prompt_sha256:
-        raise LabelJobError("classification prompt digest does not match the job")
-    if classification["strategy_fingerprint"] != classifier.strategy_fingerprint:
-        raise LabelJobError("classification strategy does not match the job")
-    if classification["config_hash"] != classifier.config_hash:
-        raise LabelJobError("classification config does not match the job")
-    if classification["input_manifest_sha256"] != classifier.input_manifest_sha256:
-        raise LabelJobError("classification input manifest does not match the job")
-    if type(classification["context_truncated"]) is not bool:
-        raise LabelJobError("classification context_truncated must be a boolean")
-    if classification["input_projection"] != PROJECTION_NAME:
-        raise LabelJobError("classification input projection does not match the job")
-    if classification["input_projection_version"] != PROJECTION_VERSION:
-        raise LabelJobError("classification input projection version does not match the job")
-    if classification["truncation_strategy"] != TRUNCATION_STRATEGY:
-        raise LabelJobError("classification truncation strategy does not match the job")
-    for field in ("user_turn_count", "original_user_chars", "sent_user_chars"):
-        if type(classification[field]) is not int or classification[field] < 0:
-            raise LabelJobError(f"classification {field} must be non-negative")
-    expected_model = value.get("model") or "unknown"
-    expected_harness = value.get("harness") or "unknown"
-    if classification["model_label"] != expected_model:
-        raise LabelJobError("classification model_label does not match trajectory")
-    if classification["harness_label"] != expected_harness:
-        raise LabelJobError("classification harness_label does not match trajectory")
-    if status == "failed":
-        if type(classification["reason"]) is not str or not classification["reason"]:
-            raise LabelJobError("failed classification must contain a reason")
-        return
-    labels = classification["scenario_labels"]
-    capabilities = classification["capability_labels"]
-    # The classifier deliberately emits one first-level scenario label while
-    # retaining the historical outer-list shape for downstream consumers.
-    # Requiring the exact L1 object shape here prevents stale L2 cache rows or
-    # model responses with extra taxonomy fields from being published.
-    if type(labels) is not list or len(labels) != 1:
-        raise LabelJobError(
-            "accepted classification must contain exactly one scenario label"
-        )
-    label = labels[0]
-    expected_l1_keys = {"key", "split", "domain_l1_en", "domain_l1_zh"}
-    if (
-        type(label) is not dict
-        or set(label) != expected_l1_keys
-        or any(type(label[field]) is not str or not label[field] for field in label)
-    ):
-        raise LabelJobError("classification scenario label is not a valid L1 object")
     try:
-        expected_label = classifier.taxonomy.expand_l1(label["key"])
-    except (AttributeError, TypeError, ValueError) as error:
-        raise LabelJobError("classification scenario label is invalid") from error
-    if expected_label != label:
-        raise LabelJobError("classification scenario label does not match taxonomy")
-    if (
-        type(capabilities) is not list
-        or not 1 <= len(capabilities) <= 2
-        or any(type(label) is not str for label in capabilities)
-        or len(set(capabilities)) != len(capabilities)
-        or any(label not in CAPABILITY_LABELS for label in capabilities)
-    ):
-        raise LabelJobError("classification capability labels are invalid")
+        classifier.validate_classification(
+            value.get("classification"), eligible=has_tool_calls(value)
+        )
+    except ValueError as error:
+        raise LabelJobError("classification violates the current contract") from error
 
 
 def _load_and_classify(
@@ -645,7 +546,7 @@ def _load_and_classify(
     *,
     classifier: TrajectoryClassifier,
     cache: ClassificationCache,
-) -> tuple[bytes, str, bool]:
+) -> tuple[bytes, str, bool, bool]:
     value = orjson.loads(item.path.read_bytes())
     if type(value) is not dict:
         raise LabelJobError("staged trajectory is not an object")
@@ -653,30 +554,45 @@ def _load_and_classify(
         raise LabelJobError("normalized input must not contain classification")
     assert item.sub_session_id is not None
     _set_sub_session_id(value, item.sub_session_id)
-    cache_key = _classification_cache_key(
-        item.stable_hash,
-        input_manifest_sha256=classifier.input_manifest_sha256,
-        config_hash=classifier.config_hash,
+    eligible = has_tool_calls(value)
+    cache_hit = context_truncated = False
+    classification = None
+    cache_key = (
+        _classification_cache_key(
+            item.stable_hash,
+            input_manifest_sha256=classifier.input_manifest_sha256,
+            config_hash=classifier.config_hash,
+        )
+        if eligible
+        else None
     )
-    classification = cache.get(cache_key)
-    cache_hit = classification is not None
-    if classification is not None:
-        value["classification"] = classification
+    # Ineligible trajectories bypass both the API and successful-result cache.
+    cached = cache.get(cache_key) if cache_key is not None else None
+    if cached is not None:
+        context_truncated = cached.pop("context_truncated", None)
         try:
-            _validate_classification(value, item=item, classifier=classifier)
-        except (LabelJobError, TypeError, ValueError):
-            value.pop("classification", None)
-            classification = None
-            cache_hit = False
+            if type(context_truncated) is not bool:
+                raise ValueError("cached truncation metadata is invalid")
+            classifier.validate_classification(cached, eligible=True)
+        except ValueError:
+            context_truncated = False
+        else:
+            classification = cached
+            cache_hit = True
     if classification is None:
         attempt = classifier.classify(value)
         classification = attempt.classification
+        context_truncated = attempt.context_truncated
+        classifier.validate_classification(classification, eligible=eligible)
         if attempt.cacheable:
-            cache.put(cache_key, classification)
+            assert cache_key is not None
+            cache.put(
+                cache_key, {**classification, "context_truncated": context_truncated}
+            )
     value["classification"] = classification
     _validate_classification(value, item=item, classifier=classifier)
     payload = orjson.dumps(value, option=orjson.OPT_SORT_KEYS) + b"\n"
-    return payload, str(classification["status"]), cache_hit
+    return payload, str(classification["status"]), cache_hit, context_truncated
 
 
 def _run_s3_label_job_with_client(
@@ -699,9 +615,9 @@ def _run_s3_label_job_with_client(
     if not input_report.valid:
         detail = input_report.errors[0] if input_report.errors else "unknown error"
         raise LabelJobError(f"normalized input failed validation: {detail}")
-    sessionless_window_hours = orjson.loads(manifest_bytes).get(
-        "sessionless_window_hours"
-    ) or 0
+    sessionless_window_hours = (
+        orjson.loads(manifest_bytes).get("sessionless_window_hours") or 0
+    )
     # Verify output listing access before any model calls. Existing flat objects
     # remain in place until the replacement manifest has been published. Do not
     # read the old output manifest: some S3-compatible stores return AccessDenied
@@ -753,10 +669,12 @@ def _run_s3_label_job_with_client(
         classified = 0
         failed = 0
         cache_hits = 0
+        skipped_no_toolcall = 0
+        context_truncated_count = 0
         candidates: list[tuple[_StagedTrajectory, Path, str]] = []
         with ClassificationCache(cache_file) as cache:
 
-            def worker(item: _StagedTrajectory) -> tuple[bytes, str, bool]:
+            def worker(item: _StagedTrajectory) -> tuple[bytes, str, bool, bool]:
                 return _load_and_classify(item, classifier=classifier, cache=cache)
 
             with ThreadPoolExecutor(
@@ -767,13 +685,16 @@ def _run_s3_label_job_with_client(
                 for offset in range(0, len(assigned), window):
                     batch = assigned[offset : offset + window]
                     for item, result in zip(batch, executor.map(worker, batch)):
-                        payload, status, cache_hit = result
+                        payload, status, cache_hit, context_truncated = result
                         candidate = candidate_root / item.output_path
                         candidate.write_bytes(payload)
                         candidates.append((item, candidate, status))
                         cache_hits += int(cache_hit)
+                        context_truncated_count += int(context_truncated)
                         if status == "accepted":
                             classified += 1
+                        elif status == "skipped":
+                            skipped_no_toolcall += 1
                         else:
                             failed += 1
 
@@ -815,11 +736,15 @@ def _run_s3_label_job_with_client(
                 "kind": "lineage",
             }
         )
-        if len(candidates) != classified + failed:
+        if len(candidates) != classified + failed + skipped_no_toolcall:
             raise LabelJobError("classification candidate counts do not reconcile")
         output_manifest = {
-            "schema_version": "trajfoundry-classification-v1",
-            **({"sessionless_window_hours": 8} if sessionless_window_hours else {}),
+            "schema_version": "trajfoundry-classification-v2",
+            **(
+                {"sessionless_window_hours": sessionless_window_hours}
+                if sessionless_window_hours
+                else {}
+            ),
             "created_at": datetime.now(UTC).isoformat(),
             "input_root": input_location.uri,
             "input_manifest_sha256": manifest_sha256,
@@ -827,17 +752,16 @@ def _run_s3_label_job_with_client(
             "classifier_revision": classifier.classifier_revision,
             "prompt_version": classifier.prompt_version,
             "taxonomy_sha256": classifier.taxonomy.sha256,
-            "catalog_sha256": classifier.catalog_sha256,
-            "policy_sha256": classifier.policy_sha256,
             "prompt_sha256": classifier.prompt_sha256,
-            "strategy_fingerprint": classifier.strategy_fingerprint,
-            "classifier_model": classifier.client.model,
+            "config": {**classifier.request_config, "max_workers": max_workers},
             "config_hash": classifier.config_hash,
             "counts": {
                 "input_trajectories": len(assigned),
                 "classified": classified,
                 "failed": failed,
                 "cache_hits": cache_hits,
+                "skipped_no_toolcall": skipped_no_toolcall,
+                "context_truncated": context_truncated_count,
             },
             "files": sorted(files, key=lambda entry: str(entry["path"])),
         }
@@ -888,10 +812,11 @@ def _run_s3_label_job_with_client(
 
     LOGGER.info(
         "TrajFoundry classification complete: input=%d classified=%d failed=%d "
-        "cache_hits=%d validation=passed",
+        "skipped_no_toolcall=%d cache_hits=%d validation=passed",
         len(assigned),
         classified,
         failed,
+        skipped_no_toolcall,
         cache_hits,
     )
     return LabelJobResult(
@@ -899,6 +824,7 @@ def _run_s3_label_job_with_client(
         classified=classified,
         failed=failed,
         cache_hits=cache_hits,
+        skipped_no_toolcall=skipped_no_toolcall,
     )
 
 
@@ -915,15 +841,15 @@ def run_s3_label_job(
     state_path: str | Path | None = None,
     taxonomy_path: str | Path = DEFAULT_TAXONOMY_PATH,
     credentials_path: str | Path | None = DEFAULT_S3_CREDENTIALS_PATH,
-    max_workers: int = 4,
-    max_retries: int = 5,
-    request_timeout_seconds: float = 120.0,
+    max_workers: int = 20,
+    max_retries: int = 20,
+    request_timeout_seconds: float = 180.0,
     max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> LabelJobResult:
     """Classify every complete normalized trajectory under one S3 root.
 
-    The approved GLM endpoint and model are used by default. The endpoint and
+    The configured DeepSeek endpoint and model are used by default. The endpoint and
     model may be overridden explicitly for a controlled test. The API key is
     supplied explicitly or through ``CLASSIFIER_API_KEY``; it is never included
     in logging, manifests, cache keys, or exception messages.

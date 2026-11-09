@@ -504,6 +504,9 @@ def adapt_tokenplan_envelope(value: object) -> AdaptedCapture:
         if isinstance(legacy_user, str)
         else ""
     )
+    end_user = _optional_string(
+        metadata.get("end_user_id"), path="metadata.end_user_id"
+    )
     envelope_session = normalize_session_id(
         _optional_string(metadata.get("session_id"), path="metadata.session_id")
     )
@@ -532,6 +535,8 @@ def adapt_tokenplan_envelope(value: object) -> AdaptedCapture:
         capture["turn_id"] = envelope_task
     if envelope_user:
         capture["user_id"] = envelope_user
+    if end_user:
+        capture["end_user_id"] = end_user
 
     multimodal_file_mapping = _multimodal_file_mapping(
         request,

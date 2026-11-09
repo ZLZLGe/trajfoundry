@@ -1006,6 +1006,7 @@ def parse_chat_capture(
         request_id=_text(capture.get("request_id")),
         model=model,
         user_id=user_id,
+        end_user_id=_text(capture.get("end_user_id")),
         harness=harness,
         instructions="",
         history=history,

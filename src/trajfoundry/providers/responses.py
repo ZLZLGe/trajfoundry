@@ -35,6 +35,12 @@ class ResponsesAdapterError(ValueError):
     """Raised when a value is not a Responses capture at all."""
 
 
+def _text(value: Any) -> str:
+    """Return a string identity value without coercing non-string data."""
+
+    return value if isinstance(value, str) else ""
+
+
 _CLIENT_CALL_TYPES = {
     "apply_patch_call",
     "computer_call",
@@ -2368,6 +2374,7 @@ def parse_responses_capture(
         request_id=request_id if isinstance(request_id, str) else "",
         model=model,
         user_id=user_id,
+        end_user_id=_text(capture.get("end_user_id")),
         harness=harness,
         instructions=instructions,
         history=history,

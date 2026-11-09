@@ -301,6 +301,25 @@ def test_compaction_projection_is_lossless_and_round_trips() -> None:
     assert project_trajectory(restored) == projected
 
 
+def test_end_user_id_is_optional_metadata_and_round_trips() -> None:
+    node = _trajectory().model_copy(
+        update={
+            "metadata": Metadata(
+                source_file="source.json",
+                user_id="source-user",
+                end_user_id="end-user",
+            )
+        }
+    )
+
+    projected = project_trajectory(node)
+    restored = parse_trajectory_record(projected)
+
+    assert projected["metadata"]["user_id"] == "source-user"
+    assert projected["metadata"]["end_user_id"] == "end-user"
+    assert restored.metadata.end_user_id == "end-user"
+
+
 def test_compaction_items_is_a_required_array_on_every_node() -> None:
     assert SCHEMA_VERSION == "trajfoundry-v4"
 

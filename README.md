@@ -3,7 +3,7 @@
 TrajFoundry normalizes desensitized Freerouter and DeepInfra captures, TokenPlan
 feedback envelopes, and SXF `.jsonl.zst` capture streams into deterministic,
 auditable trajectory JSONL. A separate classification job can add scenario,
-capability, model, and harness labels to already-normalized trajectories. It is
+capability, and subject labels to already-normalized trajectories. It is
 an independent project: it does not import, write to, or depend on AutoData or
 DataHarness.
 
@@ -16,6 +16,8 @@ confirmed project-level extensions and overrides:
   trajectory and are not converted into a message;
 - every node includes `instructions`, `normalization_audit`, and metadata for
   model, user/session identity, and normalized source classification;
+- optional `metadata.end_user_id` preserves the terminal user's identity when
+  supplied by the source, separately from the source account's `user_id`;
 - Responses reasoning items are preserved in `assistant.reasoning`, while
   Anthropic thinking blocks remain in `assistant.reasoning_details`.
 - Responses `agent_message` items are not promoted to a conversational role;
@@ -97,6 +99,9 @@ changed captures, removes deleted sources from state, rebuilds global
 deduplication, and republishes the output. Trajectory JSONL files and lineage are
 deterministic for the same inputs and configuration; only the manifest creation
 timestamp changes.
+
+Normalizer revision `2026-11-09.1` reparses cached captures on the first resume
+after upgrading so newly preserved `end_user_id` values are included.
 
 ## Normalization rules
 
@@ -258,60 +263,41 @@ replacement manifest is published; inability to remove them fails the run.
 ## Trajectory classification
 
 Classification is independent from normalization. `run_s3_label_job()` reads a
-normalized root manifest, processes every complete trajectory it references
-(strict, quarantined, and orphan roots), and writes a second flat dataset. It
-never invokes or changes the normalization pipeline. v004 shard input remains
-readable; current v4 flat input is also supported.
+normalized partition manifest (legacy v3 shards or flat v4) and preserves every
+complete root trajectory, including quarantined roots. It checks each node's
+normalized `total_tool_calls`: if the root and all descendants have zero calls,
+the full row is emitted with `classification={"status":"skipped",
+"skip_reason":"no_toolcall"}` and no model request is made.
 
-Each output row is the complete normalized row plus one top-level
-`classification` object. Successful results contain exactly one first-level
-scenario label, one or two fixed capability labels, and model/harness labels
-copied from the trajectory. The scenario label has the fields `key`, `split`,
-`domain_l1_en`, and `domain_l1_zh`; it does not expose a second-level taxonomy
-ID. A model or request failure still writes the complete row with
-`classification.status="failed"` and a bounded reason code. No `trajectory_id`
-is added to a trajectory row.
+Eligible rows are classified into one of 90 scenarios, one or two of 10
+capabilities, and one or more of 25 subject options. Labels are exact Chinese
+catalog names. The generic subject `通用（非学科）` must stand alone. Accepted
+classification objects contain only `status`, `scenario_labels`,
+`capability_labels`, `subject_labels`, `classifier_revision`, `prompt_version`,
+and `taxonomy_sha256`. Failed objects contain only `status` and a safe `reason`.
+Model and harness identity remain in the original trajectory fields.
 
-The bundled scenario taxonomy is versioned by content hash. The model returns
-one L1 `scenario_label_key` and one or two capability names; TrajFoundry
-validates them against the derived L1 catalog. The scheduler defaults to the
-approved `glm-5.3-flash` endpoint at
-`https://token.pjlab.org.cn/v1/chat/completions`; callers may override the URL
-and model explicitly for a controlled test. `CLASSIFIER_API_KEY` remains a
-worker-side secret and is never written to source, results, or logs.
+The model receives only cleaned user requests from the root trajectory's own
+messages. Assistant/tool/system/developer messages and connected sub-agent
+branches are excluded. The default budget remains 600,000 serialized input
+characters plus the system prompt, with 4,096 output tokens reserved; this is
+not a tokenizer-level guarantee. Gateway context-limit errors shrink the
+character budget up to five times.
 
-The model receives a projection containing cleaned `role=user` requests only.
-Assistant, tool, system, developer, and harness-generated context is excluded
-from the model input. The projection uses only the current trajectory's own
-`messages`; connected `sub_agent_trajectory` branches are not included. The
-complete normalized row is still preserved in the output, and the
-classification object records the projection and truncation metadata.
+The scheduler template explicitly selects `deepseek-v4.1-flash`, 20 workers,
+20 additional transport retries and a 180-second request timeout. Configure the
+existing DeepSeek Chat Completions URL and supply `CLASSIFIER_API_KEY` through
+the worker secret mechanism. SQLite cache state stays on Worker-local disk.
+Only validated successful results are cached, isolated by input and taxonomy,
+prompt, model, policy and request configuration. New v2 runs cannot reuse old
+classification cache results.
 
-The default serialized trajectory context budget is 600,000 characters via
-`max_context_chars`; this is a conservative character envelope for the
-256K-token classifier, not a tokenizer-level limit. The system prompt and
-taxonomy consume additional model context, and the request reserves 4,096
-output tokens. The limit can be overridden explicitly when the configured
-model gateway supports a larger or smaller request. If the gateway still
-reports a context-limit error, the classifier reduces the character budget and
-retries up to five times.
-
-Classification uses bounded concurrency and a persistent SQLite cache under
-`workspace_parent/.trajfoundry-label-cache/` by default. Pass `state_path` to
-place that cache on a worker-local persistent volume. HTTP 429 and 5xx responses
-are retried with bounded exponential backoff; HTTP 404 is retried with the same
-budget and still fails the job as a configuration error if it persists, while
-HTTP 422 fails immediately. Candidate rows are completed locally before any output
-object is changed, and `manifest.json` is published last. Classification reads
-and validates the normalized input manifest, but treats its own output manifest
-as write-only. It lists existing top-level JSONL before model calls and removes
-unlisted JSONL only after the replacement manifest is published; a cleanup
-failure is recoverable on retry.
-
-The output manifest and classification rows carry the classifier revision plus
-independent policy, catalog, prompt, and strategy fingerprints. These values
-are part of the cache configuration hash, so results from a different model or
-context budget are not reused after a deployment change.
+The v2 output manifest records run settings and aggregate truncation statistics
+once, with file hashes and separate successful/failed/skipped counts. Candidate
+rows are validated before upload; the manifest is published last. Use a new
+output version and one writer per output partition. See the complete
+[field reference and migration guide](docs/classification.md), including every
+manifest field, and the [scheduler template](examples/dolphinscheduler_label_s3_node.py).
 
 ## Development
 

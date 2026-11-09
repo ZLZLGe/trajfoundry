@@ -128,6 +128,32 @@ def test_adapt_tokenplan_envelope_uses_outer_identity_and_received_timestamp_as_
     assert adapted.captured_at == "1970-01-01T00:00:01.000Z"
 
 
+def test_tokenplan_keeps_end_user_id_separate_from_source_user_id() -> None:
+    adapted = adapt_tokenplan_envelope(
+        _envelope(
+            request_body={"model": "claude-test", "messages": []},
+            metadata={
+                "request_id": "request-1",
+                "source_user_id": "source-user",
+                "end_user_id": "end-user",
+                "session_id": "no_session_id",
+                "received_at_ms": 1000,
+                "completed_at_ms": None,
+                "http_status_code": 200,
+                "data_quality": {
+                    "client_request_complete": True,
+                    "client_response_complete": True,
+                    "all_attachments_available": True,
+                    "truncated": False,
+                },
+            },
+        )
+    )
+
+    assert adapted.capture["user_id"] == "source-user"
+    assert adapted.capture["end_user_id"] == "end-user"
+
+
 @pytest.mark.parametrize(
     "request_path", ["/v1/messages", "/v1/chat/completions", "/v1/responses"]
 )

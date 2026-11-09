@@ -25,9 +25,12 @@ from trajfoundry.label_jobs import (
 )
 from trajfoundry.models import (
     AuditIssue,
+    FunctionCall,
     Message,
     Metadata,
     Severity,
+    ToolCall,
+    ToolDefinition,
     TrajectoryNode,
 )
 from trajfoundry.output_contract import parse_trajectory_record, project_trajectory
@@ -88,31 +91,15 @@ class _Completion:
         self.calls += 1
         return orjson.dumps(
             {
-                "scenario_label_key": "toc|Shopping|购物",
-                "capability_labels": ["Tool Use"],
+                "scenario_labels": ["购物"],
+                "capability_labels": ["工具操作与自动化"],
+                "subject_labels": ["通用（非学科）"],
             }
         ).decode()
 
 
-def _taxonomy(tmp_path: Path) -> ScenarioTaxonomy:
-    path = tmp_path / "taxonomy.json"
-    path.write_bytes(
-        orjson.dumps(
-            [
-                {
-                    "id": 10026,
-                    "split": "toc",
-                    "domain_l1_en": "Shopping",
-                    "domain_l1_zh": "购物",
-                    "domain_l2_en": "General E-commerce",
-                    "domain_l2_zh": "综合电商",
-                    "domain_path_en": "Shopping > General E-commerce",
-                    "domain_path_zh": "购物->综合电商",
-                }
-            ]
-        )
-    )
-    return ScenarioTaxonomy.load(path)
+def _taxonomy(_tmp_path: Path) -> ScenarioTaxonomy:
+    return ScenarioTaxonomy.load()
 
 
 def _trajectory(
@@ -122,14 +109,40 @@ def _trajectory(
     created_at: str,
     synthesized: bool = False,
     complete: bool = True,
+    with_toolcall: bool = True,
 ) -> dict[str, Any]:
     messages = [Message(role="user", content=f"request {source}")]
+    if with_toolcall:
+        messages.extend(
+            [
+                Message(
+                    role="assistant",
+                    content="",
+                    reasoning_content="",
+                    tool_calls=[
+                        ToolCall(
+                            id="call-1",
+                            function=FunctionCall(name="lookup", arguments={}),
+                        )
+                    ],
+                ),
+                Message(
+                    role="tool", tool_call_id="call-1", name="lookup", content="result"
+                ),
+            ]
+        )
     if complete:
         messages.append(Message(role="assistant", content="done", reasoning_content=""))
     node = enrich_trajectory(
         TrajectoryNode(
             messages=messages,
-            tools=[],
+            tools=[
+                ToolDefinition(
+                    name="lookup", description="Lookup", parameters={"type": "object"}
+                )
+            ]
+            if with_toolcall
+            else [],
             model="model-under-test",
             harness="codex",
             source=source,
@@ -170,9 +183,14 @@ def _entry(path: str, payload: bytes) -> dict[str, Any]:
     }
 
 
-def _install_v004_input(client: _MemoryS3, location: S3Location) -> bytes:
+def _install_v004_input(
+    client: _MemoryS3, location: S3Location, *, without_toolcalls=()
+) -> bytes:
     later = _trajectory(
-        "later.json", session_id="session-A", created_at="2026-09-14T02:00:00Z"
+        "later.json",
+        session_id="session-A",
+        created_at="2026-09-14T02:00:00Z",
+        with_toolcall="later.json" not in without_toolcalls,
     )
     sessionless = _trajectory(
         "missing.json",
@@ -180,9 +198,13 @@ def _install_v004_input(client: _MemoryS3, location: S3Location) -> bytes:
         created_at="2026-09-14T03:00:00Z",
         synthesized=True,
         complete=False,
+        with_toolcall="missing.json" not in without_toolcalls,
     )
     earlier = _trajectory(
-        "earlier.json", session_id="session-A", created_at="2026-09-14T01:00:00Z"
+        "earlier.json",
+        session_id="session-A",
+        created_at="2026-09-14T01:00:00Z",
+        with_toolcall="earlier.json" not in without_toolcalls,
     )
     accepted_path = "generations/" + "a" * 32 + "/accepted/trajectories-00000.jsonl"
     quarantine_path = "generations/" + "a" * 32 + "/quarantine/trajectories-00000.jsonl"
@@ -250,9 +272,15 @@ def _install_v004_input(client: _MemoryS3, location: S3Location) -> bytes:
 
 
 def _install_v4_input(
-    client: _MemoryS3, location: S3Location, *, sessionless_window_hours: int = 0
+    client: _MemoryS3,
+    location: S3Location,
+    *,
+    sessionless_window_hours: int = 0,
+    without_toolcalls=(),
 ) -> bytes:
-    legacy_manifest = orjson.loads(_install_v004_input(client, location))
+    legacy_manifest = orjson.loads(
+        _install_v004_input(client, location, without_toolcalls=without_toolcalls)
+    )
     rows: list[dict[str, Any]] = []
     lineage = b""
     for entry in legacy_manifest["files"]:
@@ -320,7 +348,7 @@ def test_v004_job_classifies_accepted_and_quarantined_into_flat_files(
     stale_path = "old-session_sub_0.jsonl"
     old_manifest = orjson.dumps(
         {
-            "schema_version": "trajfoundry-classification-v1",
+            "schema_version": "trajfoundry-classification-v2",
             "files": [{"path": stale_path}],
         }
     )
@@ -358,16 +386,11 @@ def test_v004_job_classifies_accepted_and_quarantined_into_flat_files(
         client.objects[(output_location.bucket, output_location.key("manifest.json"))]
     )
     for field in (
-        "catalog_sha256",
-        "policy_sha256",
         "prompt_sha256",
-        "strategy_fingerprint",
         "config_hash",
     ):
         assert output_manifest[field] == getattr(classifier, field)
-    assert output_manifest["classification_policy"]["scenario_selection"] == (
-        "exactly_one_l1"
-    )
+    assert output_manifest["classification_policy"]["scenario_count"] == 1
     assert output_manifest["classification_policy"]["capability_max"] == 2
     trajectory_files = [
         entry for entry in output_manifest["files"] if entry["kind"] == "trajectory"
@@ -466,7 +489,7 @@ def test_invalid_cached_l2_shape_is_rejected_and_reclassified(
     assert completion.calls == 4
 
 
-def test_strategy_fingerprint_is_part_of_cache_namespace(tmp_path: Path) -> None:
+def test_prompt_is_part_of_cache_namespace(tmp_path: Path) -> None:
     client = _MemoryS3()
     input_location = S3Location("bucket", "normalized/v004/dt=2026-09-14/")
     output_location = S3Location("bucket", "classified/v001/dt=2026-09-14/")
@@ -492,9 +515,8 @@ def test_strategy_fingerprint_is_part_of_cache_namespace(tmp_path: Path) -> None
     assert first_completion.calls == 3
 
     class AlternateStrategyClassifier(TrajectoryClassifier):
-        @property
-        def strategy_fingerprint(self) -> str:
-            return "b" * 64
+        def _build_system_prompt(self) -> str:
+            return super()._build_system_prompt() + " revised prompt"
 
     second_completion = _Completion()
     second_classifier = AlternateStrategyClassifier(
@@ -577,7 +599,7 @@ def test_output_manifest_is_write_only_on_first_classification_run(
     published_manifest = orjson.loads(
         client.objects[(output_location.bucket, output_manifest_key)]
     )
-    assert published_manifest["schema_version"] == "trajfoundry-classification-v1"
+    assert published_manifest["schema_version"] == "trajfoundry-classification-v2"
 
 
 def test_post_publication_delete_failure_is_recoverable_on_rerun(
@@ -591,7 +613,7 @@ def test_post_publication_delete_failure_is_recoverable_on_rerun(
     client.objects[(output_location.bucket, output_location.key(stale_path))] = b"old\n"
     old_manifest = orjson.dumps(
         {
-            "schema_version": "trajfoundry-classification-v1",
+            "schema_version": "trajfoundry-classification-v2",
             "files": [{"path": stale_path}],
         }
     )
@@ -622,7 +644,7 @@ def test_post_publication_delete_failure_is_recoverable_on_rerun(
     published_manifest = orjson.loads(
         client.objects[(output_location.bucket, output_location.key("manifest.json"))]
     )
-    assert published_manifest["schema_version"] == "trajfoundry-classification-v1"
+    assert published_manifest["schema_version"] == "trajfoundry-classification-v2"
     assert published_manifest != orjson.loads(old_manifest)
     assert (output_location.bucket, output_location.key(stale_path)) in client.objects
     assert completion.calls == 3
@@ -810,7 +832,8 @@ def test_invalid_model_output_still_writes_every_complete_trajectory(
             return orjson.dumps(
                 {
                     "scenario_label_ids": [99999],
-                    "capability_labels": ["Tool Use"],
+                    "capability_labels": ["工具操作与自动化"],
+                    "subject_labels": ["通用（非学科）"],
                 }
             ).decode()
 
@@ -867,8 +890,9 @@ def test_network_exhaustion_publishes_failed_row_and_retries_only_it_on_rerun(
     recovered = False
     decision = orjson.dumps(
         {
-            "scenario_label_key": "toc|Shopping|购物",
-            "capability_labels": ["Tool Use"],
+            "scenario_labels": ["购物"],
+            "capability_labels": ["工具操作与自动化"],
+            "subject_labels": ["通用（非学科）"],
         }
     ).decode()
 
@@ -906,8 +930,12 @@ def test_network_exhaustion_publishes_failed_row_and_retries_only_it_on_rerun(
                 (output_location.bucket, output_location.key("manifest.json"))
             ]
         )
-        assert manifest["schema_version"] == "trajfoundry-classification-v1"
-        assert manifest["counts"] == expected_counts
+        assert manifest["schema_version"] == "trajfoundry-classification-v2"
+        assert manifest["counts"] == {
+            **expected_counts,
+            "skipped_no_toolcall": 0,
+            "context_truncated": 0,
+        }
         rows = {}
         for entry in manifest["files"]:
             payload = client.objects[
@@ -978,3 +1006,176 @@ def test_network_exhaustion_publishes_failed_row_and_retries_only_it_on_rerun(
     assert recovered_rows["earlier.json"]["classification"]["status"] == "accepted"
     for source in ("later.json", "missing.json"):
         assert recovered_rows[source] == first_rows[source]
+
+
+@pytest.mark.parametrize(
+    "without_toolcalls",
+    [("later.json",), ("earlier.json", "later.json", "missing.json")],
+)
+@pytest.mark.parametrize("installer", [_install_v004_input, _install_v4_input])
+def test_no_tool_rows_pass_through_without_model_calls_or_cache_entries(
+    tmp_path: Path, without_toolcalls: tuple[str, ...], installer
+) -> None:
+    client = _MemoryS3()
+    source = S3Location("bucket", "normalized/dt=2026-09-14/")
+    output = S3Location("bucket", "classified/v2/dt=2026-09-14/")
+    manifest_bytes = installer(client, source, without_toolcalls=without_toolcalls)
+    originals = {}
+    for entry in orjson.loads(manifest_bytes)["files"]:
+        if entry["path"].endswith(".jsonl") and not entry["path"].endswith(
+            "lineage.jsonl"
+        ):
+            for line in client.objects[
+                (source.bucket, source.key(entry["path"]))
+            ].splitlines():
+                row = orjson.loads(line)
+                originals[row["source"]] = row
+    completion = _Completion()
+    classifier = TrajectoryClassifier(
+        client=completion,
+        taxonomy=_taxonomy(tmp_path),
+        input_manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+    )
+    state = tmp_path / "filtered.sqlite"
+    eligible = 3 - len(without_toolcalls)
+    for rerun in (False, True):
+        result = _run_s3_label_job_with_client(
+            client,
+            input_location=source,
+            output_location=output,
+            classifier=classifier,
+            workspace=tmp_path,
+            state_path=state,
+            max_workers=2,
+        )
+        assert result.input_trajectories == 3
+        assert result.classified == eligible
+        assert result.skipped_no_toolcall == len(without_toolcalls)
+        assert result.failed == 0
+        assert result.cache_hits == (eligible if rerun else 0)
+        assert completion.calls == eligible
+        manifest = orjson.loads(
+            client.objects[(output.bucket, output.key("manifest.json"))]
+        )
+        assert manifest["counts"] == {
+            "input_trajectories": 3,
+            "classified": eligible,
+            "failed": 0,
+            "skipped_no_toolcall": len(without_toolcalls),
+            "cache_hits": eligible if rerun else 0,
+            "context_truncated": 0,
+        }
+        assert manifest["config"]["max_workers"] == 2
+        for entry in manifest["files"]:
+            if entry["kind"] != "trajectory":
+                continue
+            payload = client.objects[(output.bucket, output.key(entry["path"]))]
+            assert len(payload) == entry["bytes"]
+            assert hashlib.sha256(payload).hexdigest() == entry["sha256"]
+            row = orjson.loads(payload)
+            classification = row.pop("classification")
+            expected = originals[row["source"]]
+            expected["metadata"]["sub_session_id"] = row["metadata"]["sub_session_id"]
+            assert row == expected
+            if row["source"] in without_toolcalls:
+                assert classification == {
+                    "status": "skipped",
+                    "skip_reason": "no_toolcall",
+                }
+            else:
+                assert classification["status"] == "accepted"
+                assert "model_label" not in classification
+        with sqlite3.connect(state) as connection:
+            assert (
+                connection.execute("SELECT COUNT(*) FROM classifications").fetchone()[0]
+                == eligible
+            )
+
+
+def test_mixed_accepted_failed_skipped_counts_reconcile(tmp_path: Path) -> None:
+    class MixedCompletion(_Completion):
+        def complete(self, messages):
+            if "request earlier.json" in messages[-1]["content"]:
+                from trajfoundry.classification.client import ClassificationRequestError
+
+                raise ClassificationRequestError("classifier_http_400")
+            return super().complete(messages)
+
+    client = _MemoryS3()
+    source = S3Location("bucket", "normalized/")
+    output = S3Location("bucket", "classified/")
+    manifest_bytes = _install_v004_input(
+        client, source, without_toolcalls=("missing.json",)
+    )
+    classifier = TrajectoryClassifier(
+        client=MixedCompletion(),
+        taxonomy=_taxonomy(tmp_path),
+        input_manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+    )
+    result = _run_s3_label_job_with_client(
+        client,
+        input_location=source,
+        output_location=output,
+        classifier=classifier,
+        workspace=tmp_path,
+        state_path=tmp_path / "mixed.sqlite",
+        max_workers=2,
+    )
+    assert (result.classified, result.failed, result.skipped_no_toolcall) == (1, 1, 1)
+    manifest = orjson.loads(
+        client.objects[(output.bucket, output.key("manifest.json"))]
+    )
+    statuses = {}
+    for entry in manifest["files"]:
+        if entry["kind"] == "trajectory":
+            row = orjson.loads(
+                client.objects[(output.bucket, output.key(entry["path"]))]
+            )
+            statuses[row["classification"]["status"]] = row["classification"]
+    assert set(statuses) == {"accepted", "failed", "skipped"}
+    assert statuses["failed"] == {"status": "failed", "reason": "classifier_http_400"}
+
+
+def test_manifest_truncation_count_survives_cache_hits(tmp_path: Path) -> None:
+    class ReducedCompletion(_Completion):
+        reduced = False
+
+        def complete(self, messages):
+            from trajfoundry.classification.client import (
+                ClassificationContextLimitError,
+            )
+
+            if not self.reduced:
+                self.reduced = True
+                raise ClassificationContextLimitError()
+            return super().complete(messages)
+
+    client = _MemoryS3()
+    source = S3Location("bucket", "normalized/")
+    output = S3Location("bucket", "classified/")
+    manifest_bytes = _install_v004_input(client, source)
+    classifier = TrajectoryClassifier(
+        client=ReducedCompletion(),
+        taxonomy=_taxonomy(tmp_path),
+        input_manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+    )
+    for _ in range(2):
+        _run_s3_label_job_with_client(
+            client,
+            input_location=source,
+            output_location=output,
+            classifier=classifier,
+            workspace=tmp_path,
+            state_path=tmp_path / "truncated.sqlite",
+            max_workers=1,
+        )
+        manifest = orjson.loads(
+            client.objects[(output.bucket, output.key("manifest.json"))]
+        )
+        assert manifest["counts"]["context_truncated"] == 1
+        for entry in manifest["files"]:
+            if entry["kind"] == "trajectory":
+                row = orjson.loads(
+                    client.objects[(output.bucket, output.key(entry["path"]))]
+                )
+                assert "context_truncated" not in row["classification"]
